@@ -13,7 +13,15 @@ find_package(zstd REQUIRED)
 
 add_executable(lhi src/main.cpp)
 
-target_include_directories(lhi PRIVATE src)
+find_path(XXHASH_INC xxhash.h
+    HINTS "$ENV{CONDA_PREFIX}" "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo"
+    PATH_SUFFIXES include REQUIRED)
+find_library(XXHASH_LIB xxhash
+    HINTS "$ENV{CONDA_PREFIX}" "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo"
+    PATH_SUFFIXES lib REQUIRED)
+
+target_include_directories(lhi PRIVATE src ${XXHASH_INC})
+target_link_libraries(lhi PRIVATE ${XXHASH_LIB})
 
 # zstd: handle both config-mode and find-module results
 if(TARGET zstd::libzstd_shared)

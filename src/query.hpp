@@ -46,7 +46,7 @@ struct LHIReader {
         if (std::fread(&fh, sizeof(fh), 1, f) != 1)
             throw std::runtime_error("short header");
         if (std::memcmp(fh.magic, MAGIC, 8) != 0)
-            throw std::runtime_error("bad magic — not an LHI v2 file");
+            throw std::runtime_error("bad magic — not an LHI v3 file");
         if (fh.version != FORMAT_VERSION)
             throw std::runtime_error("unsupported version " + std::to_string(fh.version));
         n_blocks = fh.n_blocks;

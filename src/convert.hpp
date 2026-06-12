@@ -2,6 +2,7 @@
 #include "format.hpp"
 #include "cigar.hpp"
 #include "aa.hpp"
+#include <xxhash.h>
 #include <zstd.h>
 #include <unordered_map>
 #include <string>
@@ -22,7 +23,7 @@ struct ConvertOptions {
     int    zstd_level  = 3;
     size_t block_recs  = 50000;
     float  min_pident  = 0.0f;
-    double max_evalue  = 1.0;   // default: keep all (blastx was run with -e 1e-8)
+    double max_evalue  = 1.0;
     bool   verbose     = false;
 };
 
@@ -30,38 +31,31 @@ struct ConvertOptions {
 //   qseqid qstart qend qlen qstrand sseqid sstart send slen pident evalue cigar qseq_translated full_qseq
 //     0      1     2    3     4       5      6      7    8     9     10     11         12            13
 namespace col {
-    constexpr int qseqid = 0, qstart = 1, qend = 2, qlen = 3, qstrand = 4;
-    constexpr int sseqid = 5, sstart = 6, send = 7, slen = 8;
-    constexpr int pident = 9, evalue = 10, cigar = 11, qseq_aa = 12;
-    // col 13 = full_qseq (nt contig) — deliberately not read
+    constexpr int qseqid   = 0, qstart = 1, qend = 2, qlen = 3, qstrand = 4;
+    constexpr int sseqid   = 5, sstart = 6, send  = 7, slen = 8;
+    constexpr int pident   = 9, evalue = 10, cigar = 11, qseq_aa = 12;
+    constexpr int full_qseq = 13;  // nt contig — hashed (xxh3-128), not stored
 }
 
-// Extract HOG id from sseqid: "panbarley.bpgv2|N0.HOG0047149" → "N0.HOG0047149"
 inline std::string extract_hog(std::string_view sv) {
     auto p = sv.rfind('|');
     return std::string(p != std::string_view::npos ? sv.substr(p + 1) : sv);
 }
 
-// qstrand "+" / "-" + cigar reading frame → signed frame ±1..±3
-// Diamond blastx reports frame implicitly via qstart<qend vs qstart>qend for nt coords.
-// We encode strand in sign of qframe: + = positive, - = negative.
-inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart, uint32_t qend) {
-    // reading frame = (qstart-1) % 3 + 1 (1-based, on the strand)
+inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart) {
     uint32_t base = (qstart > 0 ? qstart - 1 : 0);
     int frame = static_cast<int>(base % 3) + 1;
     int sign  = (qstrand.empty() || qstrand[0] != '-') ? 1 : -1;
     return static_cast<int8_t>(sign * frame);
 }
 
-// Parse double with strtod — handles subnormals that stod throws on
 inline double parse_double(std::string_view sv) {
     char buf[64];
     size_t n = std::min(sv.size(), sizeof(buf) - 1);
     std::memcpy(buf, sv.data(), n);
     buf[n] = '\0';
     char* end;
-    double v = std::strtod(buf, &end);
-    return v;  // subnormals return the actual value, not an exception
+    return std::strtod(buf, &end);
 }
 
 class BlockWriter {
@@ -109,16 +103,16 @@ public:
         for (auto& r : records_) serialize_record(raw_buf_, r);
 
         BlockHeader bh{};
-        bh.block_type    = uint8_t(BlockType::Alignments);
-        bh.n_records     = uint32_t(records_.size());
-        bh.min_hog_idx   = UINT32_MAX;
-        bh.max_hog_idx   = 0;
-        bh.min_sstart    = UINT32_MAX;
-        bh.max_send      = 0;
-        bh.min_pident    = 100.0f;
-        bh.max_pident    = 0.0f;
-        bh.min_evalue_log = 0.0f;    // worst (log closest to 0)
-        bh.max_evalue_log = -300.0f; // best (most negative log)
+        bh.block_type     = uint8_t(BlockType::Alignments);
+        bh.n_records      = uint32_t(records_.size());
+        bh.min_hog_idx    = UINT32_MAX;
+        bh.max_hog_idx    = 0;
+        bh.min_sstart     = UINT32_MAX;
+        bh.max_send       = 0;
+        bh.min_pident     = 100.0f;
+        bh.max_pident     = 0.0f;
+        bh.min_evalue_log = 0.0f;
+        bh.max_evalue_log = -300.0f;
 
         for (auto& r : records_) {
             bh.min_hog_idx    = std::min(bh.min_hog_idx,  r.hog_idx);
@@ -128,8 +122,8 @@ public:
             bh.min_pident     = std::min(bh.min_pident,   r.pident);
             bh.max_pident     = std::max(bh.max_pident,   r.pident);
             float el = evalue_log(r.evalue);
-            bh.min_evalue_log = std::max(bh.min_evalue_log, el);  // worst = max
-            bh.max_evalue_log = std::min(bh.max_evalue_log, el);  // best = min
+            bh.min_evalue_log = std::max(bh.min_evalue_log, el);
+            bh.max_evalue_log = std::min(bh.max_evalue_log, el);
         }
         records_.clear();
 
@@ -197,11 +191,11 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
         ++lineno;
         if (line.empty() || line[0] == '#') continue;
 
-        // Split 14 fields on tab — stop after field 13 (don't read full_qseq)
-        std::array<std::string_view, 13> f;
+        // Parse all 14 tab-separated fields; full_qseq is field[13]
+        std::array<std::string_view, 14> f;
         size_t fi = 0;
         const char* p = line.data(), *ep = p + line.size(), *fp = p;
-        while (p <= ep && fi < 13) {
+        while (p <= ep && fi < 14) {
             if (p == ep || *p == '\t') {
                 f[fi++] = {fp, size_t(p - fp)};
                 fp = p + 1;
@@ -213,6 +207,8 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
                 std::cerr << "skip line " << lineno << ": " << fi << " fields\n";
             ++bw.n_skipped; continue;
         }
+        // field[13] may be absent (older diamond without full_qseq) — hash becomes all-zero
+        bool has_nt = (fi == 14 && !f[col::full_qseq].empty());
 
         float  pident = static_cast<float>(parse_double(f[col::pident]));
         double ev     = parse_double(f[col::evalue]);
@@ -220,11 +216,10 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
         if (pident < opts.min_pident) { ++bw.n_skipped; continue; }
         if (ev     > opts.max_evalue) { ++bw.n_skipped; continue; }
 
-        uint32_t sstart, send, slen, qstart, qend, qlen;
+        uint32_t sstart, send, qstart, qend, qlen;
         try {
             sstart = uint32_t(std::stoul(std::string(f[col::sstart])));
             send   = uint32_t(std::stoul(std::string(f[col::send])));
-            slen   = uint32_t(std::stoul(std::string(f[col::slen])));
             qstart = uint32_t(std::stoul(std::string(f[col::qstart])));
             qend   = uint32_t(std::stoul(std::string(f[col::qend])));
             qlen   = uint32_t(std::stoul(std::string(f[col::qlen])));
@@ -240,14 +235,28 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
         r.contig_idx = bw.intern_contig(std::string(f[col::qseqid]));
         r.sstart     = sstart;
         r.send       = send;
-        r.slen       = slen;
         r.qstart     = qstart;
         r.qend       = qend;
         r.qlen       = qlen;
         r.pident     = pident;
         r.evalue     = ev;
-        r.qframe     = make_qframe(f[col::qstrand], qstart, qend);
-        r.aas        = cigar_to_aas(f[col::cigar], f[col::qseq_aa], sstart, send);
+        r.qframe     = make_qframe(f[col::qstrand], qstart);
+
+        // xxh3-128 of full_qseq — pointer-lossless fingerprint
+        if (has_nt) {
+            XXH128_hash_t h = XXH3_128bits(f[col::full_qseq].data(), f[col::full_qseq].size());
+            // store as LE bytes: low 8 bytes first
+            uint64_t lo = h.low64, hi = h.high64;
+            for (int i = 0; i < 8; ++i) { r.nt_hash[i]   = uint8_t(lo >> (8*i)); }
+            for (int i = 0; i < 8; ++i) { r.nt_hash[8+i] = uint8_t(hi >> (8*i)); }
+        } else {
+            std::memset(r.nt_hash, 0, 16);
+        }
+
+        // CIGAR parse — lossless: aas[] + inserts[]
+        auto ar     = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
+        r.aas       = std::move(ar.aas);
+        r.inserts   = std::move(ar.inserts);
 
         ++bw.n_written;
         bw.add(std::move(r));
@@ -261,6 +270,7 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
     FileHeader fh{};
     std::memcpy(fh.magic, MAGIC, 8);
     fh.version  = FORMAT_VERSION;
+    fh.flags    = FLAG_VALUE_LOSSLESS;
     fh.n_blocks = uint32_t(2 + bw.n_blocks());
     std::fwrite(&fh, sizeof(fh), 1, fout);
 

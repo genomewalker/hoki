@@ -159,10 +159,9 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/stl_vector.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/stl_bvector.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/vector.tcc \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/span \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/array \
   /maps/projects/fernandezguerra/apps/repos/lhi/src/cigar.hpp \
   /maps/projects/fernandezguerra/apps/repos/lhi/src/aa.hpp \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/array \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/cmath \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/x86_64-conda-linux-gnu/sysroot/usr/include/math.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/x86_64-conda-linux-gnu/sysroot/usr/include/bits/math-vector.h \
@@ -189,12 +188,7 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/tr1/poly_hermite.tcc \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/tr1/poly_laguerre.tcc \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/tr1/riemann_zeta.tcc \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/stdexcept \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/exception \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/exception_ptr.h \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/cxxabi_init_exception.h \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/typeinfo \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/nested_exception.h \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include/xxhash.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include/zstd.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include/zstd_errors.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/unordered_map \
@@ -208,6 +202,11 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/iostream \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/ostream \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/ios \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/exception \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/exception_ptr.h \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/cxxabi_init_exception.h \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/typeinfo \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/nested_exception.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/ios_base.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/ext/atomicity.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/x86_64-conda-linux-gnu/bits/gthr.h \
@@ -228,6 +227,7 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/locale_classes.tcc \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/system_error \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/x86_64-conda-linux-gnu/bits/error_constants.h \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/stdexcept \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/streambuf \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/streambuf.tcc \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/basic_ios.h \
@@ -248,8 +248,6 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/x86_64-conda-linux-gnu/bits/basic_file.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/x86_64-conda-linux-gnu/bits/c++io.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/fstream.tcc \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/sstream \
-  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/sstream.tcc \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/filesystem \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/fs_fwd.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/chrono.h \
@@ -266,6 +264,8 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/locale_conv.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/iomanip \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/quoted_string.h \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/sstream \
+  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/sstream.tcc \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/codecvt \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/ext/concurrence.h \
   /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/shared_ptr.h \
@@ -334,6 +334,8 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/x86_64-conda-linux-gnu/sysroot/usr/include/wctype.h:
 
+/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/stdexcept:
+
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/allocated_ptr.h:
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/iomanip:
@@ -378,6 +380,12 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/ios_base.h:
 
+/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/nested_exception.h:
+
+/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/cxxabi_init_exception.h:
+
+/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/exception_ptr.h:
+
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/ostream:
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/node_handle.h:
@@ -392,13 +400,7 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include/zstd.h:
 
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/nested_exception.h:
-
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/cxxabi_init_exception.h:
-
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/exception_ptr.h:
-
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/stdexcept:
+/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include/xxhash.h:
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/tr1/riemann_zeta.tcc:
 
@@ -666,8 +668,6 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/x86_64-conda-linux-gnu/sysroot/usr/include/bits/errno.h:
 
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/span:
-
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/stddef.h:
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/x86_64-conda-linux-gnu/sysroot/usr/include/bits/types/error_t.h:
@@ -714,9 +714,9 @@ CMakeFiles/lhi.dir/src/main.cpp.o: /maps/projects/fernandezguerra/apps/repos/lhi
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/stl_algobase.h:
 
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/hashtable.h:
-
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/typeinfo:
+
+/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/hashtable.h:
 
 /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/gcc/x86_64-conda-linux-gnu/14.3.0/include/c++/bits/hash_bytes.h:
 
