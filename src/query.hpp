@@ -240,10 +240,10 @@ inline void query_varnt(const std::string& lhi_path, const QueryOptions& opts) {
                 if (opts.pos && hog_pos != opts.pos) continue;
                 if (opts.variant_aa != AA_UNK && o.obs_aa != opts.variant_aa) continue;
                 char aac = (o.obs_aa < 20) ? AA_ALPHA[o.obs_aa] : 'X';
+                char cdn[3]; unpack_codon(o.packed_codon, cdn);
                 std::printf("%s\t%u\t%c\t%c%c%c\t%.2f\t%g\n",
                     rdr.contig_strings[vr.contig_idx].c_str(),
-                    hog_pos, aac,
-                    char(o.codon[0]), char(o.codon[1]), char(o.codon[2]),
+                    hog_pos, aac, cdn[0], cdn[1], cdn[2],
                     vr.pident, vr.evalue);
             }
         }

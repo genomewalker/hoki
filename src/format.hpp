@@ -276,24 +276,36 @@ inline int deserialize_variant(const uint8_t* p, const uint8_t* end, VariantReco
 //
 //  varint   contig_idx
 //  varint   hog_idx
-//  uint24   sstart          HOG coverage extent (for tiling gap detection)
+//  uint24   sstart          HOG coverage extent (tiling gap detection)
 //  uint24   send
-//  uint32   qstart          nt coords in contig (for tiling + codon offset)
+//  uint32   qstart          nt coords in contig (tiling + codon offset)
 //  uint32   qend
-//  uint32   qlen            contig total nt length
-//  int8     qframe          ±1..±3
+//  uint32   qlen
+//  int8     qframe
 //  float32  pident
 //  float64  evalue
 //  varint   n_obs
-//  per obs (6 bytes):
-//    uint16  hog_offset     hog_pos - sstart (fits u16; max HOG ~60K)
-//    uint8   obs_aa         encoded (0-19)
-//    uint8   codon[3]       raw nt bytes (A/C/G/T/N) from full_qseq in reading direction
+//  per obs (~3 bytes typical):
+//    varint  delta_offset    hog_pos delta from previous obs (first = hog_pos - sstart)
+//    uint8   obs_aa          encoded (0-19)
+//    uint8   packed_codon    2-bit per nt: bits[7:6]=nt0, [5:4]=nt1, [3:2]=nt2  A=0,C=1,G=2,T=3
+
+// 2-bit codon pack/unpack (ACGTN → ACGT, N rounds to T)
+inline uint8_t pack_codon(const uint8_t* c) {
+    auto e = [](uint8_t n) -> uint8_t {
+        switch(n) { case 'A':return 0; case 'C':return 1; case 'G':return 2; default:return 3; }
+    };
+    return uint8_t((e(c[0])<<6)|(e(c[1])<<4)|(e(c[2])<<2));
+}
+inline void unpack_codon(uint8_t pk, char* out) {
+    constexpr char B[] = {'A','C','G','T'};
+    out[0]=B[(pk>>6)&3]; out[1]=B[(pk>>4)&3]; out[2]=B[(pk>>2)&3];
+}
 
 struct VarNTObs {
-    uint16_t hog_offset;
+    uint32_t hog_offset;  // in-memory: absolute offset from sstart
     uint8_t  obs_aa;
-    uint8_t  codon[3];
+    uint8_t  packed_codon;
 };
 
 struct VarNTRecord {
@@ -319,13 +331,12 @@ inline void serialize_varnt(std::vector<uint8_t>& b, const VarNTRecord& r) {
     write_f32(b, r.pident);
     write_f64(b, r.evalue);
     write_varint(b, uint32_t(r.vars.size()));
+    uint32_t prev = 0;
     for (auto& v : r.vars) {
-        b.push_back(uint8_t(v.hog_offset & 0xFF));
-        b.push_back(uint8_t(v.hog_offset >> 8));
+        write_varint(b, v.hog_offset - prev);
+        prev = v.hog_offset;
         b.push_back(v.obs_aa);
-        b.push_back(v.codon[0]);
-        b.push_back(v.codon[1]);
-        b.push_back(v.codon[2]);
+        b.push_back(v.packed_codon);
     }
 }
 
@@ -334,8 +345,7 @@ inline int deserialize_varnt(const uint8_t* p, const uint8_t* end, VarNTRecord& 
     int n;
     n = read_varint(p, end, &r.contig_idx); p += n;
     n = read_varint(p, end, &r.hog_idx);    p += n;
-    // fixed: 3+3+4+4+4+1+4+8 = 31 bytes
-    if (p + 31 > end) return 0;
+    if (p + 31 > end) return 0;  // 3+3+4+4+4+1+4+8
     r.sstart = read_u24(p); p+=3;
     r.send   = read_u24(p); p+=3;
     r.qstart = read_u32(p); p+=4;
@@ -347,13 +357,15 @@ inline int deserialize_varnt(const uint8_t* p, const uint8_t* end, VarNTRecord& 
     uint32_t n_vars = 0;
     n = read_varint(p, end, &n_vars); p += n;
     r.vars.resize(n_vars);
+    uint32_t cur = 0;
     for (auto& v : r.vars) {
-        if (p + 6 > end) return 0;
-        v.hog_offset = uint16_t(p[0]) | (uint16_t(p[1]) << 8); p+=2;
-        v.obs_aa  = *p++;
-        v.codon[0] = *p++;
-        v.codon[1] = *p++;
-        v.codon[2] = *p++;
+        uint32_t delta = 0;
+        n = read_varint(p, end, &delta); p += n;
+        cur += delta;
+        v.hog_offset  = cur;
+        if (p + 2 > end) return 0;
+        v.obs_aa       = *p++;
+        v.packed_codon = *p++;
     }
     return int(p - s);
 }

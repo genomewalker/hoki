@@ -432,15 +432,11 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
                     c0 = tmp3[0]; c1 = tmp3[1]; c2 = tmp3[2];
                 }
 
-                uint32_t hog_offset = sstart + i - sstart;  // = i
-                if (hog_offset > 0xFFFF) continue;
-
+                uint8_t raw3[3] = {c0, c1, c2};
                 VarNTObs obs;
-                obs.hog_offset = uint16_t(hog_offset);
-                obs.obs_aa     = obs_aa;
-                obs.codon[0]   = c0;
-                obs.codon[1]   = c1;
-                obs.codon[2]   = c2;
+                obs.hog_offset   = i;   // offset from sstart
+                obs.obs_aa       = obs_aa;
+                obs.packed_codon = pack_codon(raw3);
                 vr.vars.push_back(obs);
             }
             if (!vr.vars.empty()) vntw.add(std::move(vr));
