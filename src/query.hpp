@@ -165,4 +165,44 @@ inline void query_position(const std::string& lhi_path, const QueryOptions& opts
     }
 }
 
+inline void query_variants(const std::string& lhi_path, const QueryOptions& opts) {
+    LHIReader rdr(lhi_path);
+    rdr.load_dicts();
+
+    uint32_t hog_idx = rdr.find_hog(opts.hog_id);
+    if (hog_idx == UINT32_MAX) {
+        std::cerr << "HOG " << opts.hog_id << " not in " << lhi_path << "\n";
+        return;
+    }
+
+    std::printf("contig_id\thog_pos\tobs_aa\tpident\tevalue\n");
+
+    BlockHeader bh; std::vector<uint8_t> raw;
+    while (rdr.read_block(bh, raw)) {
+        if (BlockType(bh.block_type) != BlockType::Variants) continue;
+        if (bh.min_hog_idx > hog_idx || bh.max_hog_idx < hog_idx) continue;
+        if (bh.min_sstart > opts.pos  || bh.max_send   < opts.pos)  continue;
+
+        const uint8_t* p = raw.data(), *end = p + raw.size();
+        VariantRecord vr;
+        while (p < end) {
+            int n = deserialize_variant(p, end, vr);
+            if (n <= 0) break;
+            p += n;
+            if (vr.hog_idx != hog_idx) continue;
+            if (vr.pident < opts.min_pident) continue;
+            if (vr.evalue > opts.max_evalue) continue;
+            if (opts.pos < vr.sstart || opts.pos > vr.send) continue;
+            for (auto& o : vr.obs) {
+                if (o.hog_pos != opts.pos) continue;
+                if (opts.variant_aa != AA_UNK && o.obs_aa != opts.variant_aa) continue;
+                char aac = (o.obs_aa < 20) ? AA_ALPHA[o.obs_aa] : 'X';
+                std::printf("%s\t%u\t%c\t%.2f\t%g\n",
+                    rdr.contig_strings[vr.contig_idx].c_str(),
+                    o.hog_pos, aac, vr.pident, vr.evalue);
+            }
+        }
+    }
+}
+
 } // namespace lhi

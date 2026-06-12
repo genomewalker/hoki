@@ -32,7 +32,8 @@ enum class BlockType : uint8_t {
     ContigDict = 1,
     Alignments = 2,
     Pileup     = 3,
-    NT         = 4,  // optional: 2-bit+zstd full_qseq per record, keyed by contig_idx
+    NT         = 4,
+    Variants   = 5,  // sparse: only M-position (hog_pos, obs_aa) pairs per record
 };
 
 #pragma pack(push, 1)
@@ -202,6 +203,68 @@ inline int deserialize_record(const uint8_t* p, const uint8_t* end, AlignmentRec
         uint8_t ni = *p++;
         if (p + ni > end) return 0;
         ins.aas.assign(p, p+ni); p+=ni;
+    }
+    return int(p - s);
+}
+
+// ── Variant record (sparse observation, --saav mode) ─────────────────────────
+// On-disk layout inside compressed Variants block:
+//
+//  varint   contig_idx
+//  varint   hog_idx
+//  uint24   sstart          first HOG position covered by this alignment
+//  uint24   send            last HOG position covered
+//  float32  pident
+//  float64  evalue
+//  varint   n_obs           M positions with a valid (non-UNK) AA
+//  [n_obs × 4 bytes]:
+//    uint24   hog_pos
+//    uint8    obs_aa         encoded (0-19)
+//
+// sstart/send let queries distinguish "not covered" from "covers but matches ref".
+
+struct VariantObs {
+    uint32_t hog_pos;
+    uint8_t  obs_aa;
+};
+
+struct VariantRecord {
+    uint32_t contig_idx;
+    uint32_t hog_idx;
+    uint32_t sstart, send;
+    float    pident;
+    double   evalue;
+    std::vector<VariantObs> obs;
+};
+
+inline void serialize_variant(std::vector<uint8_t>& b, const VariantRecord& r) {
+    write_varint(b, r.contig_idx);
+    write_varint(b, r.hog_idx);
+    write_u24(b, r.sstart);
+    write_u24(b, r.send);
+    write_f32(b, r.pident);
+    write_f64(b, r.evalue);
+    write_varint(b, uint32_t(r.obs.size()));
+    for (auto& o : r.obs) { write_u24(b, o.hog_pos); b.push_back(o.obs_aa); }
+}
+
+inline int deserialize_variant(const uint8_t* p, const uint8_t* end, VariantRecord& r) {
+    const uint8_t* s = p;
+    int n;
+    n = read_varint(p, end, &r.contig_idx); p += n;
+    n = read_varint(p, end, &r.hog_idx);    p += n;
+    if (p + 18 > end) return 0;  // 3+3+4+8
+    r.sstart = read_u24(p); p+=3;
+    r.send   = read_u24(p); p+=3;
+    r.pident = read_f32(p); p+=4;
+    r.evalue = read_f64(p); p+=8;
+    uint32_t n_obs = 0;
+    n = read_varint(p, end, &n_obs); p += n;
+    r.obs.resize(n_obs);
+    for (auto& o : r.obs) {
+        if (p + 4 > end) return 0;
+        o.hog_pos = read_u24(p); p+=3;
+        o.obs_aa  = *p++;
     }
     return int(p - s);
 }

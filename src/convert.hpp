@@ -25,6 +25,7 @@ struct ConvertOptions {
     float  min_pident  = 0.0f;
     double max_evalue  = 1.0;
     bool   verbose     = false;
+    bool   saav_only   = false;  // write Variant blocks only (no full AA arrays)
 };
 
 // diamond blastx outfmt 6 column indices (0-based):
@@ -143,6 +144,60 @@ public:
     size_t n_blocks() const { return n_blocks_; }
 };
 
+class VariantBlockWriter {
+    std::vector<uint8_t>   raw_buf_;
+    std::vector<VariantRecord> records_;
+    std::FILE* out_;
+    ConvertOptions opts_;
+    size_t n_blocks_ = 0;
+
+public:
+    VariantBlockWriter(std::FILE* out, ConvertOptions opts) : out_(out), opts_(opts) {}
+
+    void add(VariantRecord&& r) {
+        records_.push_back(std::move(r));
+        if (records_.size() >= opts_.block_recs) flush();
+    }
+
+    void flush() {
+        if (records_.empty()) return;
+        raw_buf_.clear();
+        for (auto& r : records_) serialize_variant(raw_buf_, r);
+
+        BlockHeader bh{};
+        bh.block_type  = uint8_t(BlockType::Variants);
+        bh.n_records   = uint32_t(records_.size());
+        bh.min_hog_idx = UINT32_MAX; bh.max_hog_idx = 0;
+        bh.min_sstart  = UINT32_MAX; bh.max_send    = 0;
+        bh.min_pident  = 100.0f;     bh.max_pident  = 0.0f;
+        bh.min_evalue_log = 0.0f;    bh.max_evalue_log = -300.0f;
+        for (auto& r : records_) {
+            bh.min_hog_idx    = std::min(bh.min_hog_idx, r.hog_idx);
+            bh.max_hog_idx    = std::max(bh.max_hog_idx, r.hog_idx);
+            bh.min_sstart     = std::min(bh.min_sstart,  r.sstart);
+            bh.max_send       = std::max(bh.max_send,    r.send);
+            bh.min_pident     = std::min(bh.min_pident,  r.pident);
+            bh.max_pident     = std::max(bh.max_pident,  r.pident);
+            float el = evalue_log(r.evalue);
+            bh.min_evalue_log = std::max(bh.min_evalue_log, el);
+            bh.max_evalue_log = std::min(bh.max_evalue_log, el);
+        }
+        records_.clear();
+
+        size_t bound = ZSTD_compressBound(raw_buf_.size());
+        std::vector<uint8_t> cbuf(bound);
+        size_t csz = ZSTD_compress(cbuf.data(), bound, raw_buf_.data(), raw_buf_.size(), opts_.zstd_level);
+        if (ZSTD_isError(csz))
+            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
+        bh.raw_sz = uint32_t(raw_buf_.size()); bh.compressed_sz = uint32_t(csz);
+        std::fwrite(&bh, sizeof(bh), 1, out_);
+        std::fwrite(cbuf.data(), 1, csz, out_);
+        ++n_blocks_;
+    }
+
+    size_t n_blocks() const { return n_blocks_; }
+};
+
 inline void write_dict_block(std::FILE* out, BlockType type,
                               const std::vector<std::string>& strings, int zstd_level) {
     std::string raw;
@@ -170,11 +225,15 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
     std::unordered_map<std::string, uint32_t> hog_dict, contig_dict;
     std::vector<std::string> hog_strings, contig_strings;
 
-    std::string tmp_path = out_path + ".blocks.tmp";
-    std::FILE* tmp = std::fopen(tmp_path.c_str(), "wb");
+    std::string tmp_path  = out_path + ".blocks.tmp";
+    std::string vtmp_path = out_path + ".vblocks.tmp";
+    std::FILE* tmp  = std::fopen(tmp_path.c_str(), "wb");
     if (!tmp) throw std::runtime_error("cannot open tmp: " + tmp_path);
+    std::FILE* vtmp = opts.saav_only ? std::fopen(vtmp_path.c_str(), "wb") : nullptr;
+    if (opts.saav_only && !vtmp) throw std::runtime_error("cannot open vtmp: " + vtmp_path);
 
-    BlockWriter bw(tmp, hog_dict, contig_dict, hog_strings, contig_strings, opts);
+    BlockWriter        bw(tmp,  hog_dict, contig_dict, hog_strings, contig_strings, opts);
+    VariantBlockWriter vw(vtmp ? vtmp : tmp, opts);
 
     std::istream* in = &std::cin;
     std::ifstream fin;
@@ -254,44 +313,78 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
         }
 
         // CIGAR parse — lossless: aas[] + inserts[]
-        auto ar     = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
-        r.aas       = std::move(ar.aas);
-        r.inserts   = std::move(ar.inserts);
+        auto ar   = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
+        r.aas     = std::move(ar.aas);
+        r.inserts = std::move(ar.inserts);
 
+        if (opts.saav_only) {
+            // build sparse variant record from M positions only
+            VariantRecord vr;
+            vr.contig_idx = r.contig_idx;
+            vr.hog_idx    = r.hog_idx;
+            vr.sstart     = r.sstart;
+            vr.send       = r.send;
+            vr.pident     = r.pident;
+            vr.evalue     = r.evalue;
+            vr.obs.reserve(r.aas.size());
+            for (uint32_t i = 0; i < uint32_t(r.aas.size()); ++i) {
+                uint8_t aa = r.aas[i];
+                if (aa != AA_GAP && aa != AA_UNK)
+                    vr.obs.push_back({r.sstart + i, aa});
+            }
+            vw.add(std::move(vr));
+        } else {
+            bw.add(std::move(r));
+        }
         ++bw.n_written;
-        bw.add(std::move(r));
     }
     bw.flush();
+    if (opts.saav_only) vw.flush();
 
-    // Assemble final file: file header → HOG dict → contig dict → alignment blocks
+    // Assemble: file header → HOG dict → contig dict → data blocks
     std::FILE* fout = std::fopen(out_path.c_str(), "wb");
-    if (!fout) { std::fclose(tmp); throw std::runtime_error("cannot open: " + out_path); }
+    if (!fout) {
+        std::fclose(tmp);
+        if (vtmp) std::fclose(vtmp);
+        throw std::runtime_error("cannot open: " + out_path);
+    }
+
+    size_t data_blocks = opts.saav_only ? vw.n_blocks() : bw.n_blocks();
 
     FileHeader fh{};
     std::memcpy(fh.magic, MAGIC, 8);
     fh.version  = FORMAT_VERSION;
     fh.flags    = FLAG_VALUE_LOSSLESS;
-    fh.n_blocks = uint32_t(2 + bw.n_blocks());
+    fh.n_blocks = uint32_t(2 + data_blocks);
     std::fwrite(&fh, sizeof(fh), 1, fout);
 
     write_dict_block(fout, BlockType::HOGDict,    hog_strings,    opts.zstd_level);
     write_dict_block(fout, BlockType::ContigDict, contig_strings, opts.zstd_level);
 
-    std::fclose(tmp);
-    std::FILE* t2 = std::fopen(tmp_path.c_str(), "rb");
-    if (t2) {
+    auto copy_tmp = [](std::FILE* src, std::FILE* dst, const std::string& p) {
+        std::fclose(src);
+        std::FILE* t = std::fopen(p.c_str(), "rb");
+        if (!t) return;
         std::vector<uint8_t> buf(1 << 20);
         size_t n;
-        while ((n = std::fread(buf.data(), 1, buf.size(), t2)) > 0)
-            std::fwrite(buf.data(), 1, n, fout);
-        std::fclose(t2);
+        while ((n = std::fread(buf.data(), 1, buf.size(), t)) > 0)
+            std::fwrite(buf.data(), 1, n, dst);
+        std::fclose(t);
+    };
+
+    if (opts.saav_only) {
+        std::fclose(tmp); std::filesystem::remove(tmp_path);
+        copy_tmp(vtmp, fout, vtmp_path);
+        std::filesystem::remove(vtmp_path);
+    } else {
+        copy_tmp(tmp, fout, tmp_path);
+        std::filesystem::remove(tmp_path);
     }
     std::fclose(fout);
-    std::filesystem::remove(tmp_path);
 
     std::cerr << "wrote " << bw.n_written << " records, "
               << bw.n_skipped << " skipped, "
-              << bw.n_blocks() << " blocks → " << out_path << "\n";
+              << data_blocks << " blocks → " << out_path << "\n";
 }
 
 } // namespace lhi

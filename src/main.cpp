@@ -19,6 +19,7 @@ static void usage(const char* prog) {
         << "  -p MINPID  minimum pident % (default 0)\n"
         << "  -e MAXEV   max evalue (default 1.0, e.g. 1e-5)\n"
         << "  -v         verbose: print parse errors\n"
+        << "  --saav     write sparse Variant blocks only (compact, for DB import)\n"
         << "\n"
         << "query: AA frequency table at a HOG position\n"
         << "  POS        1-based HOG position (omit for all positions)\n"
@@ -26,7 +27,14 @@ static void usage(const char* prog) {
         << "  -C         list contig IDs for variant matches\n"
         << "  -p/-e      same filters as convert\n"
         << "\n"
-        << "stats: block summary (no decompression)\n";
+        << "stats: block summary (no decompression)\n"
+        << "\n"
+        << "saav: query Variant blocks for a specific (HOG, position, AA)\n"
+        << "  lhi saav <in.lhi> <HOG_ID> <POS> [OBS_AA]\n"
+        << "  Outputs TSV: contig_id\\thog_pos\\tobs_aa\\tpident\\tevalue\n"
+        << "  POS        1-based HOG position\n"
+        << "  OBS_AA     filter to a specific amino acid letter (optional)\n"
+        << "  -p/-e      same filters as convert\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -44,6 +52,7 @@ int main(int argc, char* argv[]) {
             else if (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
             else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
             else if (a == "-v")               opts.verbose = true;
+            else if (a == "--saav")           opts.saav_only = true;
             else if (in_path.empty())         in_path  = a;
             else if (out_path.empty())        out_path = a;
         }
@@ -68,6 +77,24 @@ int main(int argc, char* argv[]) {
         }
         if (lhi_path.empty() || opts.hog_id.empty()) { usage(argv[0]); return 1; }
         lhi::query_position(lhi_path, opts);
+        return 0;
+    }
+
+    if (mode == "saav") {
+        if (argc < 5) { usage(argv[0]); return 1; }
+        lhi::QueryOptions opts;
+        std::string lhi_path;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
+            else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
+            else if (lhi_path.empty())        lhi_path    = a;
+            else if (opts.hog_id.empty())     opts.hog_id = a;
+            else if (!opts.pos)               opts.pos    = uint32_t(std::stoul(a));
+            else                              opts.variant_aa = lhi::encode_aa(a[0]);
+        }
+        if (lhi_path.empty() || opts.hog_id.empty() || !opts.pos) { usage(argv[0]); return 1; }
+        lhi::query_variants(lhi_path, opts);
         return 0;
     }
 
