@@ -345,6 +345,7 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
 
         if (pident < opts.min_pident) { ++bw.n_skipped; continue; }
         if (ev     > opts.max_evalue) { ++bw.n_skipped; continue; }
+        if (opts.varnt && pident == 100.0f) { ++bw.n_skipped; continue; }
 
         uint32_t sstart, send, qstart, qend, qlen;
         try {
