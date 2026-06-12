@@ -1,5 +1,5 @@
 #pragma once
-#include "format.hpp"  // InsertionRecord lives here
+#include "format.hpp"
 #include "aa.hpp"
 #include <string_view>
 #include <vector>
@@ -7,12 +7,11 @@
 namespace lhi {
 
 struct AlignedResult {
-    std::vector<uint8_t>         aas;          // M/D positions; length = send-sstart+1
-    std::vector<InsertionRecord> inserts;       // I ops, sparse (fully lossless)
-    std::vector<uint32_t>        qseq_offsets; // parallel to aas[]; UINT32_MAX for D positions
+    std::vector<uint8_t>  aas;           // M/D positions; length = send-sstart+1
+    std::vector<uint32_t> qseq_offsets;  // parallel to aas[]; UINT32_MAX for D positions
 };
 
-// Parse CIGAR + qseq_translated → AA array + insertion events
+// Parse CIGAR + qseq_translated → AA array + per-position query offsets.
 inline AlignedResult cigar_parse(
     std::string_view cigar,
     std::string_view qseq,
@@ -29,7 +28,7 @@ inline AlignedResult cigar_parse(
     const char* p = cigar.data(), *end = p + cigar.size();
     while (p < end && r.aas.size() < span) {
         uint32_t len = 0;
-        while (p < end && *p >= '0' && *p <= '9') len = len*10 + uint32_t(*p++ - '0');
+        while (p < end && *p >= '0' && *p <= '9') len = len * 10 + uint32_t(*p++ - '0');
         if (p >= end || !len) break;
         char op = *p++;
 
@@ -40,12 +39,7 @@ inline AlignedResult cigar_parse(
                 ++q_off;
             }
         } else if (op == 'I') {
-            InsertionRecord ev;
-            ev.before_hog_pos = hog_pos;
-            ev.aas.reserve(len);
-            for (uint32_t i = 0; i < len; ++i, ++q_off)
-                ev.aas.push_back(q_off < qseq.size() ? encode_aa(qseq[q_off]) : AA_UNK);
-            r.inserts.push_back(std::move(ev));
+            q_off += len;  // skip inserted residues (not in subject space)
         } else if (op == 'D') {
             for (uint32_t i = 0; i < len && r.aas.size() < span; ++i, ++hog_pos) {
                 r.qseq_offsets.push_back(UINT32_MAX);

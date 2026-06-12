@@ -63,7 +63,7 @@ CMAKE_BINARY_DIR = /maps/projects/fernandezguerra/apps/repos/lhi/build
 # Directory level rules for the build root directory
 
 # The main recursive "all" target.
-all: CMakeFiles/lhi.dir/all
+all: CMakeFiles/hoki.dir/all
 .PHONY : all
 
 # The main recursive "preinstall" target.
@@ -71,34 +71,34 @@ preinstall:
 .PHONY : preinstall
 
 # The main recursive "clean" target.
-clean: CMakeFiles/lhi.dir/clean
+clean: CMakeFiles/hoki.dir/clean
 .PHONY : clean
 
 #=============================================================================
-# Target rules for target CMakeFiles/lhi.dir
+# Target rules for target CMakeFiles/hoki.dir
 
 # All Build rule for target.
-CMakeFiles/lhi.dir/all:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/depend
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles --progress-num=1,2 "Built target lhi"
-.PHONY : CMakeFiles/lhi.dir/all
+CMakeFiles/hoki.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles --progress-num=1,2 "Built target hoki"
+.PHONY : CMakeFiles/hoki.dir/all
 
 # Build rule for subdir invocation for target.
-CMakeFiles/lhi.dir/rule: cmake_check_build_system
+CMakeFiles/hoki.dir/rule: cmake_check_build_system
 	$(CMAKE_COMMAND) -E cmake_progress_start /maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles 2
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/lhi.dir/all
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/hoki.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles 0
-.PHONY : CMakeFiles/lhi.dir/rule
+.PHONY : CMakeFiles/hoki.dir/rule
 
 # Convenience name for target.
-lhi: CMakeFiles/lhi.dir/rule
-.PHONY : lhi
+hoki: CMakeFiles/hoki.dir/rule
+.PHONY : hoki
 
 # clean rule for target.
-CMakeFiles/lhi.dir/clean:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/clean
-.PHONY : CMakeFiles/lhi.dir/clean
+CMakeFiles/hoki.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/clean
+.PHONY : CMakeFiles/hoki.dir/clean
 
 #=============================================================================
 # Special targets to cleanup operation of make.

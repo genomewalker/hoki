@@ -122,7 +122,7 @@ CMAKE_PROJECT_DESCRIPTION:STATIC=
 CMAKE_PROJECT_HOMEPAGE_URL:STATIC=
 
 //Value Computed by CMake
-CMAKE_PROJECT_NAME:STATIC=lhi
+CMAKE_PROJECT_NAME:STATIC=hoki
 
 //Path to a program.
 CMAKE_RANLIB:FILEPATH=/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-ranlib
@@ -191,6 +191,15 @@ XXHASH_INC:PATH=/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/inclu
 
 //Path to a library.
 XXHASH_LIB:FILEPATH=/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/lib/libxxhash.so
+
+//Value Computed by CMake
+hoki_BINARY_DIR:STATIC=/maps/projects/fernandezguerra/apps/repos/lhi/build
+
+//Value Computed by CMake
+hoki_IS_TOP_LEVEL:STATIC=ON
+
+//Value Computed by CMake
+hoki_SOURCE_DIR:STATIC=/maps/projects/fernandezguerra/apps/repos/lhi
 
 //Value Computed by CMake
 lhi_BINARY_DIR:STATIC=/maps/projects/fernandezguerra/apps/repos/lhi/build

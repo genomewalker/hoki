@@ -2,8 +2,7 @@
 #include "format.hpp"
 #include "cigar.hpp"
 #include "aa.hpp"
-#include <xxhash.h>
-#include <zstd.h>
+#include "container.hpp"
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -20,23 +19,19 @@
 namespace lhi {
 
 struct ConvertOptions {
-    int    zstd_level  = 3;
-    size_t block_recs  = 50000;
-    float  min_pident  = 0.0f;
-    double max_evalue  = 1.0;
-    bool   verbose     = false;
-    bool   saav_only   = false;  // write Variant blocks only (no full AA arrays)
-    bool   varnt       = false;  // write VarNT blocks instead of alignment blocks
+    int    zstd_level = 3;
+    size_t block_recs = 50000;  // records per shard flush batch
+    float  min_pident = 0.0f;
+    double max_evalue = 1.0;
+    bool   verbose    = false;
 };
 
-// diamond blastx outfmt 6 column indices (0-based):
+// diamond blastx outfmt 6 columns (0-based):
 //   qseqid qstart qend qlen qstrand sseqid sstart send slen pident evalue cigar qseq_translated full_qseq
-//     0      1     2    3     4       5      6      7    8     9     10     11         12            13
 namespace col {
-    constexpr int qseqid   = 0, qstart = 1, qend = 2, qlen = 3, qstrand = 4;
-    constexpr int sseqid   = 5, sstart = 6, send  = 7, slen = 8;
-    constexpr int pident   = 9, evalue = 10, cigar = 11, qseq_aa = 12;
-    constexpr int full_qseq = 13;  // nt contig — hashed (xxh3-128), not stored
+    constexpr int qseqid=0, qstart=1, qend=2, qlen=3, qstrand=4;
+    constexpr int sseqid=5, sstart=6, send=7,  slen=8;
+    constexpr int pident=9, evalue=10, cigar=11, qseq_aa=12, full_qseq=13;
 }
 
 inline std::string extract_hog(std::string_view sv) {
@@ -45,266 +40,56 @@ inline std::string extract_hog(std::string_view sv) {
 }
 
 inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart) {
-    uint32_t base = (qstart > 0 ? qstart - 1 : 0);
-    int frame = static_cast<int>(base % 3) + 1;
-    int sign  = (qstrand.empty() || qstrand[0] != '-') ? 1 : -1;
-    return static_cast<int8_t>(sign * frame);
+    int frame = int((qstart > 0 ? qstart - 1 : 0) % 3) + 1;
+    return int8_t(qstrand.empty() || qstrand[0] != '-' ? frame : -frame);
 }
 
 inline double parse_double(std::string_view sv) {
     char buf[64];
     size_t n = std::min(sv.size(), sizeof(buf) - 1);
-    std::memcpy(buf, sv.data(), n);
-    buf[n] = '\0';
-    char* end;
-    return std::strtod(buf, &end);
+    std::memcpy(buf, sv.data(), n); buf[n] = '\0';
+    char* end; return std::strtod(buf, &end);
 }
 
-class BlockWriter {
-    std::vector<uint8_t> raw_buf_;
-    std::vector<AlignmentRecord> records_;
-    std::unordered_map<std::string, uint32_t>& hog_dict_;
-    std::unordered_map<std::string, uint32_t>& contig_dict_;
-    std::vector<std::string>& hog_strings_;
-    std::vector<std::string>& contig_strings_;
-    std::FILE* out_;
-    ConvertOptions opts_;
-    size_t n_blocks_ = 0;
-
-public:
-    uint64_t n_written = 0, n_skipped = 0;
-
-    BlockWriter(std::FILE* out,
-                std::unordered_map<std::string, uint32_t>& hd,
-                std::unordered_map<std::string, uint32_t>& cd,
-                std::vector<std::string>& hs,
-                std::vector<std::string>& cs,
-                ConvertOptions opts)
-        : hog_dict_(hd), contig_dict_(cd), hog_strings_(hs), contig_strings_(cs),
-          out_(out), opts_(opts) {}
-
-    uint32_t intern_hog(const std::string& s) {
-        auto [it, ins] = hog_dict_.emplace(s, uint32_t(hog_strings_.size()));
-        if (ins) hog_strings_.push_back(s);
-        return it->second;
-    }
-    uint32_t intern_contig(const std::string& s) {
-        auto [it, ins] = contig_dict_.emplace(s, uint32_t(contig_strings_.size()));
-        if (ins) contig_strings_.push_back(s);
-        return it->second;
-    }
-
-    void add(AlignmentRecord&& r) {
-        records_.push_back(std::move(r));
-        if (records_.size() >= opts_.block_recs) flush();
-    }
-
-    void flush() {
-        if (records_.empty()) return;
-        raw_buf_.clear();
-        for (auto& r : records_) serialize_record(raw_buf_, r);
-
-        BlockHeader bh{};
-        bh.block_type     = uint8_t(BlockType::Alignments);
-        bh.n_records      = uint32_t(records_.size());
-        bh.min_hog_idx    = UINT32_MAX;
-        bh.max_hog_idx    = 0;
-        bh.min_sstart     = UINT32_MAX;
-        bh.max_send       = 0;
-        bh.min_pident     = 100.0f;
-        bh.max_pident     = 0.0f;
-        bh.min_evalue_log = 0.0f;
-        bh.max_evalue_log = -300.0f;
-
-        for (auto& r : records_) {
-            bh.min_hog_idx    = std::min(bh.min_hog_idx,  r.hog_idx);
-            bh.max_hog_idx    = std::max(bh.max_hog_idx,  r.hog_idx);
-            bh.min_sstart     = std::min(bh.min_sstart,   r.sstart);
-            bh.max_send       = std::max(bh.max_send,     r.send);
-            bh.min_pident     = std::min(bh.min_pident,   r.pident);
-            bh.max_pident     = std::max(bh.max_pident,   r.pident);
-            float el = evalue_log(r.evalue);
-            bh.min_evalue_log = std::max(bh.min_evalue_log, el);
-            bh.max_evalue_log = std::min(bh.max_evalue_log, el);
-        }
-        records_.clear();
-
-        size_t bound = ZSTD_compressBound(raw_buf_.size());
-        std::vector<uint8_t> cbuf(bound);
-        size_t csz = ZSTD_compress(cbuf.data(), bound, raw_buf_.data(), raw_buf_.size(), opts_.zstd_level);
-        if (ZSTD_isError(csz))
-            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
-
-        bh.raw_sz        = uint32_t(raw_buf_.size());
-        bh.compressed_sz = uint32_t(csz);
-        std::fwrite(&bh, sizeof(bh), 1, out_);
-        std::fwrite(cbuf.data(), 1, csz, out_);
-        ++n_blocks_;
-    }
-
-    size_t n_blocks() const { return n_blocks_; }
-};
-
-class VariantBlockWriter {
-    std::vector<uint8_t>   raw_buf_;
-    std::vector<VariantRecord> records_;
-    std::FILE* out_;
-    ConvertOptions opts_;
-    size_t n_blocks_ = 0;
-
-public:
-    VariantBlockWriter(std::FILE* out, ConvertOptions opts) : out_(out), opts_(opts) {}
-
-    void add(VariantRecord&& r) {
-        records_.push_back(std::move(r));
-        if (records_.size() >= opts_.block_recs) flush();
-    }
-
-    void flush() {
-        if (records_.empty()) return;
-        raw_buf_.clear();
-        for (auto& r : records_) serialize_variant(raw_buf_, r);
-
-        BlockHeader bh{};
-        bh.block_type  = uint8_t(BlockType::Variants);
-        bh.n_records   = uint32_t(records_.size());
-        bh.min_hog_idx = UINT32_MAX; bh.max_hog_idx = 0;
-        bh.min_sstart  = UINT32_MAX; bh.max_send    = 0;
-        bh.min_pident  = 100.0f;     bh.max_pident  = 0.0f;
-        bh.min_evalue_log = 0.0f;    bh.max_evalue_log = -300.0f;
-        for (auto& r : records_) {
-            bh.min_hog_idx    = std::min(bh.min_hog_idx, r.hog_idx);
-            bh.max_hog_idx    = std::max(bh.max_hog_idx, r.hog_idx);
-            bh.min_sstart     = std::min(bh.min_sstart,  r.sstart);
-            bh.max_send       = std::max(bh.max_send,    r.send);
-            bh.min_pident     = std::min(bh.min_pident,  r.pident);
-            bh.max_pident     = std::max(bh.max_pident,  r.pident);
-            float el = evalue_log(r.evalue);
-            bh.min_evalue_log = std::max(bh.min_evalue_log, el);
-            bh.max_evalue_log = std::min(bh.max_evalue_log, el);
-        }
-        records_.clear();
-
-        size_t bound = ZSTD_compressBound(raw_buf_.size());
-        std::vector<uint8_t> cbuf(bound);
-        size_t csz = ZSTD_compress(cbuf.data(), bound, raw_buf_.data(), raw_buf_.size(), opts_.zstd_level);
-        if (ZSTD_isError(csz))
-            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
-        bh.raw_sz = uint32_t(raw_buf_.size()); bh.compressed_sz = uint32_t(csz);
-        std::fwrite(&bh, sizeof(bh), 1, out_);
-        std::fwrite(cbuf.data(), 1, csz, out_);
-        ++n_blocks_;
-    }
-
-    size_t n_blocks() const { return n_blocks_; }
-};
-
-class VarNTBlockWriter {
-    std::vector<uint8_t>    raw_buf_;
-    std::vector<VarNTRecord> records_;
-    std::FILE* out_;
-    ConvertOptions opts_;
-    size_t n_blocks_ = 0;
-
-public:
-    VarNTBlockWriter(std::FILE* out, ConvertOptions opts) : out_(out), opts_(opts) {}
-
-    void add(VarNTRecord&& r) {
-        records_.push_back(std::move(r));
-        if (records_.size() >= opts_.block_recs) flush();
-    }
-
-    void flush() {
-        if (records_.empty()) return;
-        raw_buf_.clear();
-        serialize_varnt_block(raw_buf_, records_);
-
-        BlockHeader bh{};
-        bh.block_type  = uint8_t(BlockType::VarNT);
-        bh.n_records   = uint32_t(records_.size());
-        bh.min_hog_idx = UINT32_MAX; bh.max_hog_idx = 0;
-        bh.min_sstart  = UINT32_MAX; bh.max_send    = 0;
-        bh.min_pident  = 100.0f;     bh.max_pident  = 0.0f;
-        bh.min_evalue_log = 0.0f;    bh.max_evalue_log = -300.0f;
-        for (auto& r : records_) {
-            bh.min_hog_idx    = std::min(bh.min_hog_idx, r.hog_idx);
-            bh.max_hog_idx    = std::max(bh.max_hog_idx, r.hog_idx);
-            bh.min_sstart     = std::min(bh.min_sstart,  r.sstart);
-            bh.max_send       = std::max(bh.max_send,    r.send);
-            bh.min_pident     = std::min(bh.min_pident,  r.pident);
-            bh.max_pident     = std::max(bh.max_pident,  r.pident);
-            float el = evalue_log(r.evalue);
-            bh.min_evalue_log = std::max(bh.min_evalue_log, el);
-            bh.max_evalue_log = std::min(bh.max_evalue_log, el);
-        }
-        records_.clear();
-
-        size_t bound = ZSTD_compressBound(raw_buf_.size());
-        std::vector<uint8_t> cbuf(bound);
-        size_t csz = ZSTD_compress(cbuf.data(), bound, raw_buf_.data(), raw_buf_.size(), opts_.zstd_level);
-        if (ZSTD_isError(csz))
-            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
-        bh.raw_sz = uint32_t(raw_buf_.size()); bh.compressed_sz = uint32_t(csz);
-        std::fwrite(&bh, sizeof(bh), 1, out_);
-        std::fwrite(cbuf.data(), 1, csz, out_);
-        ++n_blocks_;
-    }
-
-    size_t n_blocks() const { return n_blocks_; }
-};
-
-inline void write_dict_block(std::FILE* out, BlockType type,
-                              const std::vector<std::string>& strings, int zstd_level) {
-    std::string raw;
-    raw.reserve(strings.size() * 32);
-    for (auto& s : strings) { raw += s; raw += '\n'; }
-
-    size_t bound = ZSTD_compressBound(raw.size());
-    std::vector<uint8_t> cbuf(bound);
-    size_t csz = ZSTD_compress(cbuf.data(), bound, raw.data(), raw.size(), zstd_level);
-    if (ZSTD_isError(csz))
-        throw std::runtime_error(std::string("zstd dict: ") + ZSTD_getErrorName(csz));
-
-    BlockHeader bh{};
-    bh.block_type    = uint8_t(type);
-    bh.n_records     = uint32_t(strings.size());
-    bh.raw_sz        = uint32_t(raw.size());
-    bh.compressed_sz = uint32_t(csz);
-    std::fwrite(&bh, sizeof(bh), 1, out);
-    std::fwrite(cbuf.data(), 1, csz, out);
-}
-
-// Reverse-complement 3 nt bytes in place: A↔T, C↔G, reverse order
+// Reverse-complement 3 nt bytes in place.
 inline void revcomp_codon(uint8_t c[3]) {
     auto rc = [](uint8_t b) -> uint8_t {
-        switch (b) {
-            case 'A': return 'T'; case 'T': return 'A';
-            case 'C': return 'G'; case 'G': return 'C';
-            default:  return 'N';
-        }
+        switch (b) { case 'A':return 'T'; case 'T':return 'A'; case 'C':return 'G'; case 'G':return 'C'; default:return 'N'; }
     };
-    uint8_t t0 = rc(c[2]), t1 = rc(c[1]), t2 = rc(c[0]);
-    c[0] = t0; c[1] = t1; c[2] = t2;
+    uint8_t t[3] = {rc(c[2]), rc(c[1]), rc(c[0])};
+    c[0]=t[0]; c[1]=t[1]; c[2]=t[2];
 }
 
-inline void convert(const std::string& tsv_path, const std::string& out_path,
+// Convert diamond TSV → HOG-sharded container directory.
+// Only VarNT (codon-resolved, 100% pident skipped) records are written.
+// Multiple concurrent writers are safe: each HOG shard uses flock(LOCK_EX).
+inline void convert(const std::string& tsv_path, const std::string& container_dir,
                     ConvertOptions opts) {
+
+    std::filesystem::create_directories(
+        std::filesystem::path(container_dir) / "shards");
 
     std::unordered_map<std::string, uint32_t> hog_dict, contig_dict;
     std::vector<std::string> hog_strings, contig_strings;
 
-    std::string tmp_path  = out_path + ".blocks.tmp";
-    std::string vtmp_path = out_path + ".vblocks.tmp";
-    std::FILE* tmp  = std::fopen(tmp_path.c_str(), "wb");
-    if (!tmp) throw std::runtime_error("cannot open tmp: " + tmp_path);
-    std::FILE* vtmp = (opts.saav_only || opts.varnt)
-                      ? std::fopen(vtmp_path.c_str(), "wb") : nullptr;
-    if ((opts.saav_only || opts.varnt) && !vtmp)
-        throw std::runtime_error("cannot open vtmp: " + vtmp_path);
+    auto intern = [](std::unordered_map<std::string,uint32_t>& d,
+                     std::vector<std::string>& v, const std::string& s) -> uint32_t {
+        auto [it, ins] = d.emplace(s, uint32_t(v.size()));
+        if (ins) v.push_back(s);
+        return it->second;
+    };
 
-    BlockWriter        bw(tmp,  hog_dict, contig_dict, hog_strings, contig_strings, opts);
-    VariantBlockWriter vw(vtmp ? vtmp : tmp, opts);
-    VarNTBlockWriter   vntw(vtmp ? vtmp : tmp, opts);
+    // Accumulate VarNT records per HOG index.
+    std::unordered_map<uint32_t, std::vector<VarNTRecord>> batches;
+
+    auto flush_hog = [&](uint32_t hog_idx) {
+        auto it = batches.find(hog_idx);
+        if (it == batches.end() || it->second.empty()) return;
+        auto shard = std::filesystem::path(container_dir) / "shards"
+                   / hog_to_filename(hog_strings[hog_idx]);
+        flush_hog_shard(shard, contig_strings, it->second, opts.zstd_level);
+        it->second.clear();
+    };
 
     std::istream* in = &std::cin;
     std::ifstream fin;
@@ -315,37 +100,28 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
     }
 
     std::string line;
-    uint64_t lineno = 0;
+    uint64_t lineno = 0, n_written = 0, n_skipped = 0;
 
     while (std::getline(*in, line)) {
         ++lineno;
         if (line.empty() || line[0] == '#') continue;
 
-        // Parse all 14 tab-separated fields; full_qseq is field[13]
-        std::array<std::string_view, 14> f;
+        std::array<std::string_view, 14> f{};
         size_t fi = 0;
         const char* p = line.data(), *ep = p + line.size(), *fp = p;
         while (p <= ep && fi < 14) {
-            if (p == ep || *p == '\t') {
-                f[fi++] = {fp, size_t(p - fp)};
-                fp = p + 1;
-            }
+            if (p == ep || *p == '\t') { f[fi++] = {fp, size_t(p-fp)}; fp = p+1; }
             ++p;
         }
-        if (fi < 13) {
-            if (opts.verbose)
-                std::cerr << "skip line " << lineno << ": " << fi << " fields\n";
-            ++bw.n_skipped; continue;
-        }
-        // field[13] may be absent (older diamond without full_qseq) — hash becomes all-zero
+        if (fi < 13) { if (opts.verbose) std::cerr << "skip L" << lineno << ": " << fi << " fields\n"; ++n_skipped; continue; }
         bool has_nt = (fi == 14 && !f[col::full_qseq].empty());
 
-        float  pident = static_cast<float>(parse_double(f[col::pident]));
+        float  pident = float(parse_double(f[col::pident]));
         double ev     = parse_double(f[col::evalue]);
 
-        if (pident < opts.min_pident) { ++bw.n_skipped; continue; }
-        if (ev     > opts.max_evalue) { ++bw.n_skipped; continue; }
-        if (opts.varnt && pident == 100.0f) { ++bw.n_skipped; continue; }
+        if (pident < opts.min_pident) { ++n_skipped; continue; }
+        if (ev     > opts.max_evalue) { ++n_skipped; continue; }
+        if (pident == 100.0f)         { ++n_skipped; continue; }  // no variant info at exact identity
 
         uint32_t sstart, send, qstart, qend, qlen;
         try {
@@ -354,164 +130,62 @@ inline void convert(const std::string& tsv_path, const std::string& out_path,
             qstart = uint32_t(std::stoul(std::string(f[col::qstart])));
             qend   = uint32_t(std::stoul(std::string(f[col::qend])));
             qlen   = uint32_t(std::stoul(std::string(f[col::qlen])));
-        } catch (const std::exception& e) {
-            if (opts.verbose)
-                std::cerr << "parse error line " << lineno << ": " << e.what() << "\n";
-            ++bw.n_skipped; continue;
-        }
-        if (sstart > send) { ++bw.n_skipped; continue; }
+        } catch (...) { if (opts.verbose) std::cerr << "parse error L" << lineno << "\n"; ++n_skipped; continue; }
+        if (sstart > send) { ++n_skipped; continue; }
 
-        std::string hog_id = extract_hog(f[col::sseqid]);
+        std::string hog_id     = extract_hog(f[col::sseqid]);
+        uint32_t    hog_idx    = intern(hog_dict, hog_strings, hog_id);
+        uint32_t    contig_idx = intern(contig_dict, contig_strings, std::string(f[col::qseqid]));
+        int8_t      qframe     = make_qframe(f[col::qstrand], qstart);
 
-        AlignmentRecord r;
-        r.hog_idx    = bw.intern_hog(hog_id);
-        r.contig_idx = bw.intern_contig(std::string(f[col::qseqid]));
-        r.sstart     = sstart;
-        r.send       = send;
-        r.qstart     = qstart;
-        r.qend       = qend;
-        r.qlen       = qlen;
-        r.pident     = pident;
-        r.evalue     = ev;
-        r.qframe     = make_qframe(f[col::qstrand], qstart);
+        auto ar = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
 
-        // xxh3-128 of full_qseq — pointer-lossless fingerprint
-        if (has_nt) {
-            XXH128_hash_t h = XXH3_128bits(f[col::full_qseq].data(), f[col::full_qseq].size());
-            uint64_t lo = h.low64, hi = h.high64;
-            for (int i = 0; i < 8; ++i) { r.nt_hash[i]   = uint8_t(lo >> (8*i)); }
-            for (int i = 0; i < 8; ++i) { r.nt_hash[8+i] = uint8_t(hi >> (8*i)); }
-        } else {
-            std::memset(r.nt_hash, 0, 16);
-        }
+        VarNTRecord vr;
+        vr.contig_idx = contig_idx;
+        vr.hog_idx    = hog_idx;
+        vr.sstart     = sstart; vr.send = send;
+        vr.qstart     = qstart; vr.qend = qend; vr.qlen = qlen;
+        vr.qframe     = qframe;
+        vr.pident     = pident; vr.evalue = ev;
 
-        // CIGAR parse — lossless: aas[] + inserts[] + qseq_offsets[]
-        auto ar   = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
-        r.aas     = std::move(ar.aas);
-        r.inserts = std::move(ar.inserts);
+        std::string_view full_nt = has_nt ? f[col::full_qseq] : std::string_view{};
+        uint32_t span = send - sstart + 1;
 
-        if (opts.varnt) {
-            // Build VarNTRecord: variant positions with codon from full_qseq
-            VarNTRecord vr;
-            vr.contig_idx = r.contig_idx;
-            vr.hog_idx    = r.hog_idx;
-            vr.sstart     = sstart;
-            vr.send       = send;
-            vr.qstart     = qstart;
-            vr.qend       = qend;
-            vr.qlen       = qlen;
-            vr.qframe     = r.qframe;
-            vr.pident     = pident;
-            vr.evalue     = ev;
+        for (uint32_t i = 0; i < span; ++i) {
+            uint8_t obs_aa = ar.aas[i];
+            if (obs_aa == AA_GAP || obs_aa == AA_UNK) continue;
+            uint32_t q_off = ar.qseq_offsets[i];
+            if (q_off == UINT32_MAX || full_nt.empty()) continue;
 
-            std::string_view full_nt = has_nt ? f[col::full_qseq] : std::string_view{};
-            uint32_t span = send - sstart + 1;
-
-            for (uint32_t i = 0; i < span; ++i) {
-                uint8_t obs_aa = r.aas[i];
-                if (obs_aa == AA_GAP || obs_aa == AA_UNK) continue;
-
-                uint32_t q_off = ar.qseq_offsets[i];
-                if (q_off == UINT32_MAX || full_nt.empty()) continue;
-
-                uint8_t c0, c1, c2;
-                if (r.qframe > 0) {
-                    size_t cs = size_t(qstart - 1) + size_t(q_off) * 3;
-                    if (cs + 2 >= full_nt.size()) continue;
-                    c0 = uint8_t(full_nt[cs]);
-                    c1 = uint8_t(full_nt[cs+1]);
-                    c2 = uint8_t(full_nt[cs+2]);
-                } else {
-                    if (size_t(q_off) * 3 + 2 > size_t(qend - 1)) continue;
-                    size_t cs = size_t(qend - 1) - size_t(q_off) * 3 - 2;
-                    if (cs + 2 >= full_nt.size()) continue;
-                    c0 = uint8_t(full_nt[cs]);
-                    c1 = uint8_t(full_nt[cs+1]);
-                    c2 = uint8_t(full_nt[cs+2]);
-                    uint8_t tmp3[3] = {c0, c1, c2};
-                    revcomp_codon(tmp3);
-                    c0 = tmp3[0]; c1 = tmp3[1]; c2 = tmp3[2];
-                }
-
-                uint8_t raw3[3] = {c0, c1, c2};
-                VarNTObs obs;
-                obs.hog_offset   = i;   // offset from sstart
-                obs.obs_aa       = obs_aa;
-                obs.packed_codon = pack_codon(raw3);
-                vr.vars.push_back(obs);
+            uint8_t c0, c1, c2;
+            if (qframe > 0) {
+                size_t cs = size_t(qstart-1) + size_t(q_off)*3;
+                if (cs+2 >= full_nt.size()) continue;
+                c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
+            } else {
+                if (size_t(q_off)*3+2 > size_t(qend-1)) continue;
+                size_t cs = size_t(qend-1) - size_t(q_off)*3 - 2;
+                if (cs+2 >= full_nt.size()) continue;
+                c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
+                uint8_t tmp[3]={c0,c1,c2}; revcomp_codon(tmp); c0=tmp[0]; c1=tmp[1]; c2=tmp[2];
             }
-            if (!vr.vars.empty()) vntw.add(std::move(vr));
-        } else if (opts.saav_only) {
-            // build sparse variant record from M positions only
-            VariantRecord vr;
-            vr.contig_idx = r.contig_idx;
-            vr.hog_idx    = r.hog_idx;
-            vr.sstart     = r.sstart;
-            vr.send       = r.send;
-            vr.pident     = r.pident;
-            vr.evalue     = r.evalue;
-            vr.obs.reserve(r.aas.size());
-            for (uint32_t i = 0; i < uint32_t(r.aas.size()); ++i) {
-                uint8_t aa = r.aas[i];
-                if (aa != AA_GAP && aa != AA_UNK)
-                    vr.obs.push_back({r.sstart + i, aa});
-            }
-            vw.add(std::move(vr));
-        } else {
-            bw.add(std::move(r));
+
+            uint8_t raw3[3]={c0,c1,c2};
+            vr.vars.push_back({i, obs_aa, pack_codon(raw3)});
         }
-        ++bw.n_written;
-    }
-    bw.flush();
-    if (opts.saav_only) vw.flush();
-    if (opts.varnt)     vntw.flush();
 
-    // Assemble: file header → HOG dict → contig dict → data blocks
-    std::FILE* fout = std::fopen(out_path.c_str(), "wb");
-    if (!fout) {
-        std::fclose(tmp);
-        if (vtmp) std::fclose(vtmp);
-        throw std::runtime_error("cannot open: " + out_path);
+        if (!vr.vars.empty()) {
+            batches[hog_idx].push_back(std::move(vr));
+            if (batches[hog_idx].size() >= opts.block_recs) flush_hog(hog_idx);
+        }
+        ++n_written;
     }
 
-    size_t data_blocks = opts.varnt    ? vntw.n_blocks()
-                       : opts.saav_only ? vw.n_blocks()
-                       : bw.n_blocks();
+    // Final flush: all remaining HOGs.
+    for (auto& [hog_idx, _] : batches) flush_hog(hog_idx);
 
-    FileHeader fh{};
-    std::memcpy(fh.magic, MAGIC, 8);
-    fh.version  = FORMAT_VERSION;
-    fh.flags    = FLAG_VALUE_LOSSLESS;
-    fh.n_blocks = uint32_t(2 + data_blocks);
-    std::fwrite(&fh, sizeof(fh), 1, fout);
-
-    write_dict_block(fout, BlockType::HOGDict,    hog_strings,    opts.zstd_level);
-    write_dict_block(fout, BlockType::ContigDict, contig_strings, opts.zstd_level);
-
-    auto copy_tmp = [](std::FILE* src, std::FILE* dst, const std::string& p) {
-        std::fclose(src);
-        std::FILE* t = std::fopen(p.c_str(), "rb");
-        if (!t) return;
-        std::vector<uint8_t> buf(1 << 20);
-        size_t n;
-        while ((n = std::fread(buf.data(), 1, buf.size(), t)) > 0)
-            std::fwrite(buf.data(), 1, n, dst);
-        std::fclose(t);
-    };
-
-    if (opts.varnt || opts.saav_only) {
-        std::fclose(tmp); std::filesystem::remove(tmp_path);
-        copy_tmp(vtmp, fout, vtmp_path);
-        std::filesystem::remove(vtmp_path);
-    } else {
-        copy_tmp(tmp, fout, tmp_path);
-        std::filesystem::remove(tmp_path);
-    }
-    std::fclose(fout);
-
-    std::cerr << "wrote " << bw.n_written << " records, "
-              << bw.n_skipped << " skipped, "
-              << data_blocks << " blocks → " << out_path << "\n";
+    std::cerr << "wrote " << n_written << " records, " << n_skipped
+              << " skipped → " << container_dir << "\n";
 }
 
 } // namespace lhi

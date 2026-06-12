@@ -1,4 +1,4 @@
-/maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles/lhi.dir
+/maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles/hoki.dir
 /maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles/edit_cache.dir
 /maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles/rebuild_cache.dir
 /maps/projects/fernandezguerra/apps/repos/lhi/build/CMakeFiles/list_install_components.dir

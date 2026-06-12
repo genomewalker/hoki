@@ -1,4 +1,4 @@
-CMakeFiles/lhi.dir/src/main.cpp.o: \
+CMakeFiles/hoki.dir/src/main.cpp.o: \
  /maps/projects/fernandezguerra/apps/repos/lhi/src/main.cpp \
  /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/x86_64-conda-linux-gnu/sysroot/usr/include/stdc-predef.h \
  /maps/projects/fernandezguerra/apps/repos/lhi/src/convert.hpp \

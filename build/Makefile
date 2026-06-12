@@ -162,24 +162,24 @@ depend:
 .PHONY : depend
 
 #=============================================================================
-# Target rules for targets named lhi
+# Target rules for targets named hoki
 
 # Build rule for target.
-lhi: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 lhi
-.PHONY : lhi
+hoki: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 hoki
+.PHONY : hoki
 
 # fast build rule for target.
-lhi/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/build
-.PHONY : lhi/fast
+hoki/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/build
+.PHONY : hoki/fast
 
 src/main.o: src/main.cpp.o
 .PHONY : src/main.o
 
 # target to build an object file
 src/main.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/src/main.cpp.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/src/main.cpp.o
 .PHONY : src/main.cpp.o
 
 src/main.i: src/main.cpp.i
@@ -187,7 +187,7 @@ src/main.i: src/main.cpp.i
 
 # target to preprocess a source file
 src/main.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/src/main.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/src/main.cpp.i
 .PHONY : src/main.cpp.i
 
 src/main.s: src/main.cpp.s
@@ -195,7 +195,7 @@ src/main.s: src/main.cpp.s
 
 # target to generate assembly for a file
 src/main.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/lhi.dir/build.make CMakeFiles/lhi.dir/src/main.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/hoki.dir/build.make CMakeFiles/hoki.dir/src/main.cpp.s
 .PHONY : src/main.cpp.s
 
 # Help Target
@@ -210,7 +210,7 @@ help:
 	@echo "... install/strip"
 	@echo "... list_install_components"
 	@echo "... rebuild_cache"
-	@echo "... lhi"
+	@echo "... hoki"
 	@echo "... src/main.o"
 	@echo "... src/main.i"
 	@echo "... src/main.s"
