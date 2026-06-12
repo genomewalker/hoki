@@ -205,4 +205,121 @@ inline void query_variants(const std::string& lhi_path, const QueryOptions& opts
     }
 }
 
+
+// query_varnt: scan VarNT blocks for a HOG position + optional AA filter
+// Output TSV: contig_id \t hog_pos \t obs_aa \t codon \t pident \t evalue
+inline void query_varnt(const std::string& lhi_path, const QueryOptions& opts) {
+    LHIReader rdr(lhi_path);
+    rdr.load_dicts();
+
+    uint32_t hog_idx = rdr.find_hog(opts.hog_id);
+    if (hog_idx == UINT32_MAX) {
+        std::cerr << "HOG " << opts.hog_id << " not in " << lhi_path << "\n";
+        return;
+    }
+
+    std::printf("contig_id\thog_pos\tobs_aa\tcodon\tpident\tevalue\n");
+
+    BlockHeader bh; std::vector<uint8_t> raw;
+    while (rdr.read_block(bh, raw)) {
+        if (BlockType(bh.block_type) != BlockType::VarNT) continue;
+        if (bh.min_hog_idx > hog_idx || bh.max_hog_idx < hog_idx) continue;
+        if (opts.pos && (bh.min_sstart > opts.pos || bh.max_send < opts.pos)) continue;
+
+        const uint8_t* p = raw.data(), *end = p + raw.size();
+        VarNTRecord vr;
+        while (p < end) {
+            int n = deserialize_varnt(p, end, vr);
+            if (n <= 0) break;
+            p += n;
+            if (vr.hog_idx != hog_idx) continue;
+            if (vr.pident < opts.min_pident) continue;
+            if (vr.evalue > opts.max_evalue) continue;
+            for (auto& o : vr.vars) {
+                uint32_t hog_pos = vr.sstart + o.hog_offset;
+                if (opts.pos && hog_pos != opts.pos) continue;
+                if (opts.variant_aa != AA_UNK && o.obs_aa != opts.variant_aa) continue;
+                char aac = (o.obs_aa < 20) ? AA_ALPHA[o.obs_aa] : 'X';
+                std::printf("%s\t%u\t%c\t%c%c%c\t%.2f\t%g\n",
+                    rdr.contig_strings[vr.contig_idx].c_str(),
+                    hog_pos, aac,
+                    char(o.codon[0]), char(o.codon[1]), char(o.codon[2]),
+                    vr.pident, vr.evalue);
+            }
+        }
+    }
+}
+
+// query_tile: find tiling gaps across accessions for a HOG
+// Groups VarNT records by accession prefix (strip after last '.' in contig_id)
+// Output TSV: accession \t gap_start \t gap_end \t gap_aa_size \t n_exon_records
+inline void query_tile(const std::string& lhi_path, const std::string& hog_id,
+                        float min_pident, double max_evalue, uint32_t min_acc) {
+    LHIReader rdr(lhi_path);
+    rdr.load_dicts();
+
+    uint32_t hog_idx = rdr.find_hog(hog_id);
+    if (hog_idx == UINT32_MAX) {
+        std::cerr << "HOG " << hog_id << " not in " << lhi_path << "\n";
+        return;
+    }
+
+    // accession → sorted list of (sstart, send)
+    std::unordered_map<std::string, std::vector<std::pair<uint32_t,uint32_t>>> acc_spans;
+
+    BlockHeader bh; std::vector<uint8_t> raw;
+    while (rdr.read_block(bh, raw)) {
+        if (BlockType(bh.block_type) != BlockType::VarNT) continue;
+        if (bh.min_hog_idx > hog_idx || bh.max_hog_idx < hog_idx) continue;
+
+        const uint8_t* p = raw.data(), *end = p + raw.size();
+        VarNTRecord vr;
+        while (p < end) {
+            int n = deserialize_varnt(p, end, vr);
+            if (n <= 0) break;
+            p += n;
+            if (vr.hog_idx != hog_idx) continue;
+            if (vr.pident < min_pident) continue;
+            if (vr.evalue > max_evalue) continue;
+            const std::string& contig = rdr.contig_strings[vr.contig_idx];
+            auto dot = contig.rfind('.');
+            std::string acc = (dot != std::string::npos) ? contig.substr(0, dot) : contig;
+            acc_spans[acc].emplace_back(vr.sstart, vr.send);
+        }
+    }
+
+    // gap positions → count of accessions showing a gap there
+    std::unordered_map<uint64_t, uint32_t> gap_acc_count;  // key = (gap_start<<32)|gap_end
+
+    std::printf("accession\tgap_start\tgap_end\tgap_aa_size\tn_exon_records\n");
+    for (auto& [acc, spans] : acc_spans) {
+        std::sort(spans.begin(), spans.end());
+        for (size_t i = 1; i < spans.size(); ++i) {
+            if (spans[i].first > spans[i-1].second + 1) {
+                uint32_t gs = spans[i-1].second;
+                uint32_t ge = spans[i].first;
+                uint32_t gap_sz = ge - gs - 1;
+                uint64_t key = (uint64_t(gs) << 32) | uint64_t(ge);
+                gap_acc_count[key]++;
+                if (gap_acc_count[key] >= min_acc) {
+                    std::printf("%s\t%u\t%u\t%u\t%zu\n",
+                        acc.c_str(), gs, ge, gap_sz, spans.size());
+                }
+            }
+        }
+    }
+
+    // Summary: HOG position ranges with gaps seen in >= min_acc accessions
+    std::printf("\n# Gap summary (position -> n_accessions)\n");
+    std::printf("gap_start\tgap_end\tgap_aa_size\tn_accessions\n");
+    std::vector<std::pair<uint64_t,uint32_t>> sorted_gaps(gap_acc_count.begin(), gap_acc_count.end());
+    std::sort(sorted_gaps.begin(), sorted_gaps.end(), [](auto& a, auto& b){ return a.first < b.first; });
+    for (auto& [key, cnt] : sorted_gaps) {
+        if (cnt < min_acc) continue;
+        uint32_t gs = uint32_t(key >> 32);
+        uint32_t ge = uint32_t(key & 0xFFFFFFFF);
+        std::printf("%u\t%u\t%u\t%u\n", gs, ge, ge - gs - 1, cnt);
+    }
+}
+
 } // namespace lhi

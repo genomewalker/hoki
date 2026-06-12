@@ -34,6 +34,7 @@ enum class BlockType : uint8_t {
     Pileup     = 3,
     NT         = 4,
     Variants   = 5,  // sparse: only M-position (hog_pos, obs_aa) pairs per record
+    VarNT      = 6,  // variant+codon+tiling block (--varnt mode)
 };
 
 #pragma pack(push, 1)
@@ -265,6 +266,94 @@ inline int deserialize_variant(const uint8_t* p, const uint8_t* end, VariantReco
         if (p + 4 > end) return 0;
         o.hog_pos = read_u24(p); p+=3;
         o.obs_aa  = *p++;
+    }
+    return int(p - s);
+}
+
+
+// ── VarNT record (all M-position AA + codon, --varnt mode) ──────────────────
+// On-disk layout inside compressed VarNT block:
+//
+//  varint   contig_idx
+//  varint   hog_idx
+//  uint24   sstart          HOG coverage extent (for tiling gap detection)
+//  uint24   send
+//  uint32   qstart          nt coords in contig (for tiling + codon offset)
+//  uint32   qend
+//  uint32   qlen            contig total nt length
+//  int8     qframe          ±1..±3
+//  float32  pident
+//  float64  evalue
+//  varint   n_obs
+//  per obs (6 bytes):
+//    uint16  hog_offset     hog_pos - sstart (fits u16; max HOG ~60K)
+//    uint8   obs_aa         encoded (0-19)
+//    uint8   codon[3]       raw nt bytes (A/C/G/T/N) from full_qseq in reading direction
+
+struct VarNTObs {
+    uint16_t hog_offset;
+    uint8_t  obs_aa;
+    uint8_t  codon[3];
+};
+
+struct VarNTRecord {
+    uint32_t contig_idx;
+    uint32_t hog_idx;
+    uint32_t sstart, send;
+    uint32_t qstart, qend, qlen;
+    int8_t   qframe;
+    float    pident;
+    double   evalue;
+    std::vector<VarNTObs> vars;
+};
+
+inline void serialize_varnt(std::vector<uint8_t>& b, const VarNTRecord& r) {
+    write_varint(b, r.contig_idx);
+    write_varint(b, r.hog_idx);
+    write_u24(b, r.sstart);
+    write_u24(b, r.send);
+    write_u32(b, r.qstart);
+    write_u32(b, r.qend);
+    write_u32(b, r.qlen);
+    b.push_back(uint8_t(r.qframe));
+    write_f32(b, r.pident);
+    write_f64(b, r.evalue);
+    write_varint(b, uint32_t(r.vars.size()));
+    for (auto& v : r.vars) {
+        b.push_back(uint8_t(v.hog_offset & 0xFF));
+        b.push_back(uint8_t(v.hog_offset >> 8));
+        b.push_back(v.obs_aa);
+        b.push_back(v.codon[0]);
+        b.push_back(v.codon[1]);
+        b.push_back(v.codon[2]);
+    }
+}
+
+inline int deserialize_varnt(const uint8_t* p, const uint8_t* end, VarNTRecord& r) {
+    const uint8_t* s = p;
+    int n;
+    n = read_varint(p, end, &r.contig_idx); p += n;
+    n = read_varint(p, end, &r.hog_idx);    p += n;
+    // fixed: 3+3+4+4+4+1+4+8 = 31 bytes
+    if (p + 31 > end) return 0;
+    r.sstart = read_u24(p); p+=3;
+    r.send   = read_u24(p); p+=3;
+    r.qstart = read_u32(p); p+=4;
+    r.qend   = read_u32(p); p+=4;
+    r.qlen   = read_u32(p); p+=4;
+    r.qframe = int8_t(*p++);
+    r.pident = read_f32(p); p+=4;
+    r.evalue = read_f64(p); p+=8;
+    uint32_t n_vars = 0;
+    n = read_varint(p, end, &n_vars); p += n;
+    r.vars.resize(n_vars);
+    for (auto& v : r.vars) {
+        if (p + 6 > end) return 0;
+        v.hog_offset = uint16_t(p[0]) | (uint16_t(p[1]) << 8); p+=2;
+        v.obs_aa  = *p++;
+        v.codon[0] = *p++;
+        v.codon[1] = *p++;
+        v.codon[2] = *p++;
     }
     return int(p - s);
 }

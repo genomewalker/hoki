@@ -7,8 +7,9 @@
 namespace lhi {
 
 struct AlignedResult {
-    std::vector<uint8_t>         aas;     // M/D positions; length = send-sstart+1
-    std::vector<InsertionRecord> inserts; // I ops, sparse (fully lossless)
+    std::vector<uint8_t>         aas;          // M/D positions; length = send-sstart+1
+    std::vector<InsertionRecord> inserts;       // I ops, sparse (fully lossless)
+    std::vector<uint32_t>        qseq_offsets; // parallel to aas[]; UINT32_MAX for D positions
 };
 
 // Parse CIGAR + qseq_translated → AA array + insertion events
@@ -20,6 +21,7 @@ inline AlignedResult cigar_parse(
     const uint32_t span = send - sstart + 1;
     AlignedResult r;
     r.aas.reserve(span);
+    r.qseq_offsets.reserve(span);
 
     size_t   q_off   = 0;
     uint32_t hog_pos = sstart;
@@ -32,8 +34,11 @@ inline AlignedResult cigar_parse(
         char op = *p++;
 
         if (op == 'M') {
-            for (uint32_t i = 0; i < len && r.aas.size() < span; ++i, ++q_off, ++hog_pos)
+            for (uint32_t i = 0; i < len && r.aas.size() < span; ++i, ++hog_pos) {
+                r.qseq_offsets.push_back(uint32_t(q_off));
                 r.aas.push_back(q_off < qseq.size() ? encode_aa(qseq[q_off]) : AA_UNK);
+                ++q_off;
+            }
         } else if (op == 'I') {
             InsertionRecord ev;
             ev.before_hog_pos = hog_pos;
@@ -42,11 +47,16 @@ inline AlignedResult cigar_parse(
                 ev.aas.push_back(q_off < qseq.size() ? encode_aa(qseq[q_off]) : AA_UNK);
             r.inserts.push_back(std::move(ev));
         } else if (op == 'D') {
-            for (uint32_t i = 0; i < len && r.aas.size() < span; ++i, ++hog_pos)
+            for (uint32_t i = 0; i < len && r.aas.size() < span; ++i, ++hog_pos) {
+                r.qseq_offsets.push_back(UINT32_MAX);
                 r.aas.push_back(AA_GAP);
+            }
         }
     }
-    while (r.aas.size() < span) r.aas.push_back(AA_UNK);
+    while (r.aas.size() < span) {
+        r.qseq_offsets.push_back(UINT32_MAX);
+        r.aas.push_back(AA_UNK);
+    }
     return r;
 }
 
