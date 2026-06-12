@@ -217,7 +217,7 @@ public:
     void flush() {
         if (records_.empty()) return;
         raw_buf_.clear();
-        for (auto& r : records_) serialize_varnt(raw_buf_, r);
+        serialize_varnt_block(raw_buf_, records_);
 
         BlockHeader bh{};
         bh.block_type  = uint8_t(BlockType::VarNT);

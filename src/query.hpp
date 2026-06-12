@@ -46,7 +46,7 @@ struct LHIReader {
         if (std::fread(&fh, sizeof(fh), 1, f) != 1)
             throw std::runtime_error("short header");
         if (std::memcmp(fh.magic, MAGIC, 8) != 0)
-            throw std::runtime_error("bad magic — not an LHI v3 file");
+            throw std::runtime_error("bad magic — not an LHI v4 file");
         if (fh.version != FORMAT_VERSION)
             throw std::runtime_error("unsupported version " + std::to_string(fh.version));
         n_blocks = fh.n_blocks;
@@ -226,12 +226,9 @@ inline void query_varnt(const std::string& lhi_path, const QueryOptions& opts) {
         if (bh.min_hog_idx > hog_idx || bh.max_hog_idx < hog_idx) continue;
         if (opts.pos && (bh.min_sstart > opts.pos || bh.max_send < opts.pos)) continue;
 
-        const uint8_t* p = raw.data(), *end = p + raw.size();
-        VarNTRecord vr;
-        while (p < end) {
-            int n = deserialize_varnt(p, end, vr);
-            if (n <= 0) break;
-            p += n;
+        std::vector<VarNTRecord> block_recs;
+        if (!deserialize_varnt_block(raw.data(), raw.data() + raw.size(), block_recs)) continue;
+        for (auto& vr : block_recs) {
             if (vr.hog_idx != hog_idx) continue;
             if (vr.pident < opts.min_pident) continue;
             if (vr.evalue > opts.max_evalue) continue;
@@ -272,12 +269,9 @@ inline void query_tile(const std::string& lhi_path, const std::string& hog_id,
         if (BlockType(bh.block_type) != BlockType::VarNT) continue;
         if (bh.min_hog_idx > hog_idx || bh.max_hog_idx < hog_idx) continue;
 
-        const uint8_t* p = raw.data(), *end = p + raw.size();
-        VarNTRecord vr;
-        while (p < end) {
-            int n = deserialize_varnt(p, end, vr);
-            if (n <= 0) break;
-            p += n;
+        std::vector<VarNTRecord> block_recs;
+        if (!deserialize_varnt_block(raw.data(), raw.data() + raw.size(), block_recs)) continue;
+        for (auto& vr : block_recs) {
             if (vr.hog_idx != hog_idx) continue;
             if (vr.pident < min_pident) continue;
             if (vr.evalue > max_evalue) continue;
