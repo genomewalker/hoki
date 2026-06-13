@@ -1,7 +1,6 @@
 #pragma once
 #include "format.hpp"
 #include <filesystem>
-#include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <zstd.h>
@@ -18,12 +17,13 @@
 //     shards/<HOG_ID>.lhs   — one file per HOG, sequence of shard blocks
 //
 // Each .lhs file is a sequence of ShardBlock records written independently
-// by concurrent workers.  Writers hold flock(LOCK_EX) for the duration of
-// a single append.  No global index is needed: the shard path is derived
-// deterministically from the HOG ID string.
+// by concurrent workers.  Writers hold a POSIX write lock (fcntl F_SETLKW)
+// for the duration of a single append — NFS-safe (unlike flock).
+// No global index is needed: the shard path is derived deterministically
+// from the HOG ID string.
 //
 // Shard block wire format:
-//   ShardBlockHeader (24 bytes)
+//   ShardBlockHeader (28 bytes)
 //   zstd-compressed payload (compressed_sz bytes)
 //
 // Payload (decompressed raw_sz bytes):
@@ -35,18 +35,35 @@
 namespace lhi {
 
 constexpr uint8_t SHARD_BLOCK_MAGIC[4] = {'L','H','S','B'};
+constexpr uint8_t SHARD_BLOCK_VERSION  = 1;
 
 #pragma pack(push, 1)
 struct ShardBlockHeader {
-    uint8_t  magic[4];
+    uint8_t  magic[4];       // "LHSB"
+    uint8_t  version;        // SHARD_BLOCK_VERSION
+    uint8_t  flags;          // reserved, must be 0
+    uint8_t  reserved[2];    // reserved, must be 0
     uint32_t compressed_sz;
     uint32_t raw_sz;
     uint32_t n_records;
     uint32_t min_sstart;
     uint32_t max_send;
 };
-static_assert(sizeof(ShardBlockHeader) == 24);
+static_assert(sizeof(ShardBlockHeader) == 28);
 #pragma pack(pop)
+
+// POSIX write lock (fcntl F_SETLKW) — NFS-safe, unlike flock().
+inline void posix_wlock(int fd) {
+    struct flock fl{};
+    fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET; fl.l_start = 0; fl.l_len = 0;
+    if (fcntl(fd, F_SETLKW, &fl) != 0)
+        throw std::runtime_error("fcntl F_WRLCK failed");
+}
+inline void posix_unlock(int fd) {
+    struct flock fl{};
+    fl.l_type = F_UNLCK; fl.l_whence = SEEK_SET; fl.l_start = 0; fl.l_len = 0;
+    fcntl(fd, F_SETLK, &fl);
+}
 
 // Convert a HOG ID string to a safe filename (replaces '/' ':' ' ' with '_').
 inline std::string hog_to_filename(const std::string& hog_id) {
@@ -95,6 +112,7 @@ inline void write_shard_block(int fd,
 
     ShardBlockHeader hdr{};
     std::memcpy(hdr.magic, SHARD_BLOCK_MAGIC, 4);
+    hdr.version       = SHARD_BLOCK_VERSION;
     hdr.compressed_sz = uint32_t(csz);
     hdr.raw_sz        = uint32_t(raw.size());
     hdr.n_records     = uint32_t(recs.size());
@@ -117,10 +135,10 @@ inline void flush_hog_shard(const std::filesystem::path& shard_path,
     if (recs.empty()) return;
     int fd = open(shard_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) throw std::runtime_error("cannot open shard: " + shard_path.string());
-    if (flock(fd, LOCK_EX) != 0) { close(fd); throw std::runtime_error("flock: " + shard_path.string()); }
+    posix_wlock(fd);
     try { write_shard_block(fd, global_contigs, recs, zstd_level); }
-    catch (...) { flock(fd, LOCK_UN); close(fd); throw; }
-    flock(fd, LOCK_UN);
+    catch (...) { posix_unlock(fd); close(fd); throw; }
+    posix_unlock(fd);
     close(fd);
 }
 
@@ -140,6 +158,9 @@ inline bool read_shard_file(const std::string& path, Cb cb) {
             throw std::runtime_error("truncated shard header: " + path);
         if (std::memcmp(hdr.magic, SHARD_BLOCK_MAGIC, 4) != 0)
             throw std::runtime_error("bad shard magic in: " + path);
+        if (hdr.version != SHARD_BLOCK_VERSION)
+            throw std::runtime_error("unsupported shard version " +
+                std::to_string(hdr.version) + " in: " + path);
 
         std::vector<uint8_t> cbuf(hdr.compressed_sz);
         if (::read(fd, cbuf.data(), hdr.compressed_sz) != ssize_t(hdr.compressed_sz))

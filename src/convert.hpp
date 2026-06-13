@@ -39,9 +39,13 @@ inline std::string extract_hog(std::string_view sv) {
     return std::string(p != std::string_view::npos ? sv.substr(p + 1) : sv);
 }
 
-inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart) {
-    int frame = int((qstart > 0 ? qstart - 1 : 0) % 3) + 1;
-    return int8_t(qstrand.empty() || qstrand[0] != '-' ? frame : -frame);
+inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart,
+                          uint32_t qend, uint32_t qlen) {
+    bool minus = (!qstrand.empty() && qstrand[0] == '-');
+    uint32_t base = minus ? (qlen > qend ? qlen - qend : 0)
+                          : (qstart > 0  ? qstart - 1  : 0);
+    int frame = int(base % 3) + 1;
+    return int8_t(minus ? -frame : frame);
 }
 
 inline double parse_double(std::string_view sv) {
@@ -136,7 +140,7 @@ inline void convert(const std::string& tsv_path, const std::string& container_di
         std::string hog_id     = extract_hog(f[col::sseqid]);
         uint32_t    hog_idx    = intern(hog_dict, hog_strings, hog_id);
         uint32_t    contig_idx = intern(contig_dict, contig_strings, std::string(f[col::qseqid]));
-        int8_t      qframe     = make_qframe(f[col::qstrand], qstart);
+        int8_t      qframe     = make_qframe(f[col::qstrand], qstart, qend, qlen);
 
         auto ar = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
 
