@@ -159,7 +159,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           const std::string& hog_range_start = "",
                           const std::string& hog_range_end   = "",
                           const std::string& acc_registry_path = "",
-                          int n_buckets = 1) {
+                          int n_buckets = 1,
+                          int n_threads_override = 0) {
 
     // Pass 1: scan all inputs, collect per-HOG MergeRefs (offsets only).
     std::vector<MergeRef> refs;
@@ -608,7 +609,14 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     std::atomic<bool> failed{false};
     std::string first_error;
     std::mutex err_mtx;
-    size_t n_threads = std::min<size_t>(std::thread::hardware_concurrency(), groups.size());
+    // Default: cap at 32 — bandwidth saturation and NUMA effects cause
+    // degradation beyond this on typical 2-socket servers (measured: 32T=6.8s,
+    // 96T=8.9s on same workload). Override with -t N.
+    size_t hw = std::thread::hardware_concurrency();
+    size_t default_threads = std::min<size_t>(32u, hw);
+    size_t n_threads = (n_threads_override > 0)
+                       ? std::min<size_t>(size_t(n_threads_override), groups.size())
+                       : std::min<size_t>(default_threads, groups.size());
     if (n_threads == 0) n_threads = 1;
 
     auto worker = [&]() {
