@@ -242,6 +242,14 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         return it->second;
     };
 
+    // Remap tables: one per source, computed once, shared read-only across threads.
+    std::vector<std::vector<uint32_t>> src_remap(input_paths.size());
+    for (size_t fi = 0; fi < input_paths.size(); ++fi) {
+        const auto& accs = source_accs[fi];
+        src_remap[fi].resize(accs.size());
+        for (size_t i = 0; i < accs.size(); ++i) src_remap[fi][i] = global_acc(accs[i]);
+    }
+
     // Fix 1: one fd per source, opened lazily, kept alive for all of pass-2.
     // pread is positional, so a shared read-only fd is thread-safe on Linux.
     std::vector<UniqueFd> src_fds;
@@ -307,13 +315,35 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     };
     std::vector<GroupResult> results(groups.size());
 
+    // Per-worker reusable containers — cleared (not reallocated) per group.
+    struct WorkerScratch {
+        std::vector<uint32_t>   unitigs;
+        std::unordered_map<uint64_t, uint32_t> unitig_map;
+        // Distinct-acc counter: seen_epoch[gacc]==epoch ⇒ already counted this
+        // group. Bump epoch per group instead of clearing — O(obs), no per-acc
+        // alloc, no full sort (the set<> and the sort+unique both cost more).
+        std::vector<uint32_t>   seen_epoch;
+        uint32_t                epoch = 0;
+        uint32_t                n_accs = 0;
+        std::vector<InvPosition> positions;
+        // all_lhg path
+        std::vector<InvBlock>   blocks;
+        std::vector<std::vector<InvPosition>> src_pos;
+        std::vector<InvObs>     obs;
+        // mixed/lhb path
+        std::unordered_map<uint32_t, std::vector<InvObs>> inverted;
+        std::vector<VarNTRecord> recs;
+        std::vector<uint32_t>   contig_cnum;
+    };
+
     // Per-group inversion + serialize + compress. Self-contained; uses only the
     // caller's read-only state plus worker-owned zstd contexts/buffers.
     auto process_group = [&](size_t g, ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
                              std::vector<uint8_t>& cbuf_in,
                              std::vector<uint8_t>& raw_block,
                              std::vector<uint8_t>& inv_raw,
-                             std::vector<uint8_t>& hog_cbuf) {
+                             std::vector<uint8_t>& hog_cbuf,
+                             WorkerScratch& sc) {
         size_t group_start = groups[g].first;
         size_t group_end   = groups[g].second;
         const std::string& hog_id = refs[group_start].hog_id;
@@ -321,19 +351,25 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
         // per-HOG local unitig dict: store contig numbers, dedup by
         // (global_acc_idx, contig_num) — the unitig identity.
-        std::vector<uint32_t> unitigs;
-        std::unordered_map<uint64_t, uint32_t> unitig_to_idx;
+        auto& unitigs    = sc.unitigs;    unitigs.clear();
+        auto& unitig_map = sc.unitig_map; unitig_map.clear();
         auto unitig_idx_of = [&](uint32_t gacc, uint32_t cnum) -> uint32_t {
             uint64_t key = (uint64_t(gacc) << 32) | cnum;
-            auto it = unitig_to_idx.find(key);
-            if (it != unitig_to_idx.end()) return it->second;
+            auto it = unitig_map.find(key);
+            if (it != unitig_map.end()) return it->second;
             uint32_t idx = uint32_t(unitigs.size());
             unitigs.push_back(cnum);
-            unitig_to_idx.emplace(key, idx);
+            unitig_map.emplace(key, idx);
             return idx;
         };
-        // Distinct global accessions actually contributing to this HOG.
-        std::set<uint32_t> contributing_accs;
+        // Distinct global accessions contributing to this HOG. Epoch-marking
+        // counter: count each gacc once, O(1) per obs, no alloc after warmup.
+        if (sc.seen_epoch.size() < accessions.size()) sc.seen_epoch.assign(accessions.size(), 0);
+        ++sc.epoch;
+        sc.n_accs = 0;
+        auto mark_acc = [&sc](uint32_t gacc) {
+            if (sc.seen_epoch[gacc] != sc.epoch) { sc.seen_epoch[gacc] = sc.epoch; ++sc.n_accs; }
+        };
 
         // Fix 4: heap-merge path when every ref is .lhg. Each source block's
         // positions are already ascending; merge them without a map.
@@ -341,13 +377,13 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         for (size_t bi = 0; bi < n_blocks && all_lhg; ++bi)
             if (refs[group_start + bi].kind != MergeRef::Kind::LHG) all_lhg = false;
 
-        std::vector<InvPosition> positions;
+        auto& positions = sc.positions; positions.clear();
 
         if (all_lhg) {
             // Decode each source into an ordered list of positions; the obs in
             // each are already remapped to global acc + merged unitig dict.
-            std::vector<InvBlock> blocks(n_blocks);
-            std::vector<std::vector<InvPosition>> src_pos(n_blocks);
+            auto& blocks  = sc.blocks;  blocks.clear();  blocks.resize(n_blocks);
+            auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
             for (size_t bi = 0; bi < n_blocks; ++bi) {
                 const MergeRef& ref = refs[group_start + bi];
                 int fd = get_src_fd(ref.source_file_idx);
@@ -358,9 +394,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, blocks[bi], dctx))
                     throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
-                const auto& accs = source_accs[ref.source_file_idx];
-                std::vector<uint32_t> remap(accs.size());
-                for (size_t i = 0; i < accs.size(); ++i) remap[i] = global_acc(accs[i]);
+                const auto& remap = src_remap[ref.source_file_idx];
 
                 const uint8_t* p   = blocks[bi].pos_ptr;
                 const uint8_t* end = blocks[bi].end;
@@ -369,7 +403,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 if (!n) throw std::runtime_error("corrupt position count for HOG " + hog_id);
                 p += n;
                 src_pos[bi].reserve(n_positions);
-                std::vector<InvObs> obs;
+                auto& obs = sc.obs;
                 uint32_t prev_pos = 0;
                 for (uint32_t pi = 0; pi < n_positions; ++pi) {
                     uint32_t hog_pos = 0;
@@ -385,7 +419,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         if (o.unitig_idx >= blocks[bi].unitigs.size())
                             throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
                         uint32_t cnum = blocks[bi].unitigs[o.unitig_idx];
-                        contributing_accs.insert(gacc);
+                        mark_acc(gacc);
                         ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
                     }
                     src_pos[bi].push_back(std::move(ip));
@@ -420,7 +454,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             }
         } else {
             // Mixed/LHB groups: accumulate into a map, then sort (existing path).
-            std::unordered_map<uint32_t, std::vector<InvObs>> inverted;
+            auto& inverted = sc.inverted; inverted.clear();
             for (size_t bi = 0; bi < n_blocks; ++bi) {
                 const MergeRef& ref = refs[group_start + bi];
                 int src_fd = get_src_fd(ref.source_file_idx);
@@ -463,7 +497,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     p += n;
                     if (n_contigs > 65536)
                         throw std::runtime_error("n_contigs OOB for HOG " + hog_id);
-                    std::vector<uint32_t> contig_cnum(n_contigs);
+                    auto& contig_cnum = sc.contig_cnum; contig_cnum.clear(); contig_cnum.resize(n_contigs);
                     for (uint32_t j = 0; j < n_contigs; ++j) {
                         uint32_t len = 0;
                         n = read_varint(p, end, &len);
@@ -481,11 +515,11 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         contig_cnum[j] = cnum;
                     }
 
-                    std::vector<VarNTRecord> recs;
+                    auto& recs = sc.recs; recs.clear();
                     if (!deserialize_varnt_block(p, end, recs))
                         throw std::runtime_error("corrupt varnt block for HOG " + hog_id);
 
-                    contributing_accs.insert(acc_idx);
+                    mark_acc(acc_idx);
                     for (const auto& r : recs) {
                         if (r.contig_idx >= contig_cnum.size())
                             throw std::runtime_error("contig_idx OOB in HOG " + hog_id);
@@ -508,9 +542,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
                     // Per-source acc remap: source's local acc registry → global.
-                    const auto& accs = source_accs[ref.source_file_idx];
-                    std::vector<uint32_t> remap(accs.size());
-                    for (size_t i = 0; i < accs.size(); ++i) remap[i] = global_acc(accs[i]);
+                    const auto& remap = src_remap[ref.source_file_idx];
 
                     const uint8_t* p   = blk.pos_ptr;
                     const uint8_t* end = blk.end;
@@ -518,7 +550,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     int n = read_varint(p, end, &n_positions);
                     if (!n) throw std::runtime_error("corrupt position count for HOG " + hog_id);
                     p += n;
-                    std::vector<InvObs> obs;
+                    auto& obs = sc.obs;
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
@@ -532,7 +564,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                             if (o.unitig_idx >= blk.unitigs.size())
                                 throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
                             uint32_t cnum = blk.unitigs[o.unitig_idx];
-                            contributing_accs.insert(gacc);
+                            mark_acc(gacc);
                             dst.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
                         }
                     }
@@ -566,7 +598,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         GroupResult& gr = results[g];
         gr.hog_id = hog_id;
         gr.stored_sz = use_raw ? (uint32_t(inv_raw.size()) | 0x80000000u) : uint32_t(csz);
-        gr.n_accs = uint32_t(contributing_accs.size());
+        gr.n_accs = sc.n_accs;
         if (use_raw) gr.payload.assign(inv_raw.begin(), inv_raw.end());
         else         gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + csz);
     };
@@ -584,11 +616,12 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
         ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, zstd_level);
         std::vector<uint8_t> cbuf_in, raw_block, inv_raw, hog_cbuf;
+        WorkerScratch scratch;
         for (;;) {
             size_t g = next_group.fetch_add(1, std::memory_order_relaxed);
             if (g >= groups.size() || failed.load(std::memory_order_relaxed)) break;
             try {
-                process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf);
+                process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf, scratch);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(err_mtx);
                 if (!failed.exchange(true)) first_error = e.what();
