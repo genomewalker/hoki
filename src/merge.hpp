@@ -11,6 +11,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
+#include <charconv>
+#include <optional>
 #include <zstd.h>
 
 // Merge N .lhb (v4 per-accession) batch files into one position-centric .lhg
@@ -88,6 +90,14 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
     std::vector<uint8_t> inv_raw;     // serialized inverted block
     std::vector<uint8_t> hog_cbuf;    // output HOG compressed buffer
 
+    // Reused zstd contexts (one alloc for the whole merge, not per HOG/block).
+    struct ZstdCtx {
+        ZSTD_CCtx* c = ZSTD_createCCtx();
+        ZSTD_DCtx* d = ZSTD_createDCtx();
+        ~ZstdCtx() { ZSTD_freeCCtx(c); ZSTD_freeDCtx(d); }
+    } zc;
+    ZSTD_CCtx_setParameter(zc.c, ZSTD_c_compressionLevel, zstd_level);
+
     size_t group_start = 0;
     while (group_start < refs.size()) {
         size_t group_end = group_start + 1;
@@ -107,7 +117,12 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
             if (it != unitig_to_idx.end()) return it->second;
             uint32_t idx = uint32_t(unitigs.size());
             auto pos = uid.rfind('_');
-            uint32_t cnum = uint32_t(std::stoul(uid.substr(pos + 1)));
+            if (pos == std::string::npos)
+                throw std::runtime_error("unitig_id has no '_': " + uid);
+            uint32_t cnum = 0;
+            auto res = std::from_chars(uid.data() + pos + 1, uid.data() + uid.size(), cnum);
+            if (res.ec != std::errc{})
+                throw std::runtime_error("unitig_id non-numeric suffix: " + uid);
             unitigs.push_back(cnum);
             unitig_to_idx.emplace(uid, idx);
             return idx;
@@ -115,37 +130,42 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
 
         {
             size_t cur_file_idx = SIZE_MAX;
-            int    src_fd       = -1;
-            struct FdGuard {
-                int& fd;
-                ~FdGuard() { if (fd >= 0) { close(fd); fd = -1; } }
-            } guard{src_fd};
+            std::optional<UniqueFd> src;
 
             for (size_t bi = 0; bi < n_blocks; ++bi) {
                 const BatchBlockRef& ref = refs[group_start + bi];
 
                 if (ref.batch_file_idx != cur_file_idx) {
-                    if (src_fd >= 0) { close(src_fd); src_fd = -1; }
-                    src_fd = open(batch_paths[ref.batch_file_idx].c_str(), O_RDONLY);
-                    if (src_fd < 0)
+                    src.emplace(open(batch_paths[ref.batch_file_idx].c_str(), O_RDONLY));
+                    if (*src < 0)
                         throw std::runtime_error("cannot reopen: " + batch_paths[ref.batch_file_idx]);
                     cur_file_idx = ref.batch_file_idx;
                 }
+                int src_fd = *src;
 
-                ShardBlockHeader shard_hdr;
-                ssize_t nr = ::pread(src_fd, &shard_hdr, sizeof(shard_hdr), ref.shard_hdr_offset);
-                if (nr != ssize_t(sizeof(shard_hdr)))
+                uint8_t hdr_bytes[28];
+                ssize_t nr = ::pread(src_fd, hdr_bytes, sizeof(hdr_bytes), ref.shard_hdr_offset);
+                if (nr != ssize_t(sizeof(hdr_bytes)))
                     throw std::runtime_error("pread header failed: " + batch_paths[ref.batch_file_idx]);
+                if (hdr_bytes[4] != SHARD_BLOCK_VERSION)
+                    throw std::runtime_error("unsupported shard version in: " + batch_paths[ref.batch_file_idx]);
+                uint32_t compressed_sz = read_u32_le(hdr_bytes + 8);
+                uint32_t raw_sz        = read_u32_le(hdr_bytes + 12);
 
-                cbuf_in.resize(shard_hdr.compressed_sz);
-                nr = ::pread(src_fd, cbuf_in.data(), shard_hdr.compressed_sz,
-                             ref.shard_hdr_offset + sizeof(shard_hdr));
-                if (nr != ssize_t(shard_hdr.compressed_sz))
+                if (compressed_sz > 256u * 1024 * 1024)
+                    throw std::runtime_error("compressed_sz OOB for HOG " + hog_id);
+                if (raw_sz > 512u * 1024 * 1024)
+                    throw std::runtime_error("raw_sz OOB for HOG " + hog_id);
+
+                cbuf_in.resize(compressed_sz);
+                nr = ::pread(src_fd, cbuf_in.data(), compressed_sz,
+                             ref.shard_hdr_offset + sizeof(hdr_bytes));
+                if (nr != ssize_t(compressed_sz))
                     throw std::runtime_error("pread payload failed: " + batch_paths[ref.batch_file_idx]);
 
-                raw_block.resize(shard_hdr.raw_sz);
-                size_t rz = ZSTD_decompress(raw_block.data(), shard_hdr.raw_sz,
-                                            cbuf_in.data(), shard_hdr.compressed_sz);
+                raw_block.resize(raw_sz);
+                size_t rz = ZSTD_decompressDCtx(zc.d, raw_block.data(), raw_sz,
+                                                cbuf_in.data(), compressed_sz);
                 if (ZSTD_isError(rz))
                     throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
 
@@ -156,6 +176,8 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
                 int n = read_varint(p, end, &n_contigs);
                 if (!n) throw std::runtime_error("corrupt contig dict in block for HOG " + hog_id);
                 p += n;
+                if (n_contigs > 65536)
+                    throw std::runtime_error("n_contigs OOB for HOG " + hog_id);
                 std::vector<std::string> local_contigs(n_contigs);
                 for (uint32_t j = 0; j < n_contigs; ++j) {
                     uint32_t len = 0;
@@ -172,6 +194,8 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
 
                 uint32_t acc_idx = acc_id_to_idx.at(ref.acc_id);
                 for (const auto& r : recs) {
+                    if (r.contig_idx >= local_contigs.size())
+                        throw std::runtime_error("contig_idx OOB in HOG " + hog_id);
                     const std::string& unitig_id = local_contigs[r.contig_idx];
                     uint32_t u_idx = unitig_idx_of(unitig_id);
                     for (const auto& o : r.vars) {
@@ -198,11 +222,11 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
         inv_raw.clear();
         serialize_inverted_block(inv_raw, unitigs, positions);
 
-        // HOG-level zstd compress.
+        // HOG-level zstd compress (reused CCtx; level set once before the loop).
         size_t bound = ZSTD_compressBound(inv_raw.size());
         hog_cbuf.resize(bound);
-        size_t csz = ZSTD_compress(hog_cbuf.data(), bound,
-                                   inv_raw.data(), inv_raw.size(), zstd_level);
+        size_t csz = ZSTD_compress2(zc.c, hog_cbuf.data(), bound,
+                                    inv_raw.data(), inv_raw.size());
         if (ZSTD_isError(csz))
             throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
 

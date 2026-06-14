@@ -103,29 +103,43 @@ inline void write_shard_block(int fd,
         write_varint(raw, uint32_t(s.size()));
         raw.insert(raw.end(), s.begin(), s.end());
     }
-    serialize_varnt_block(raw, recs);
 
-    // Compress payload.
+    // Header stats computed before recs is moved into serialize_varnt_block.
+    uint32_t n_records = uint32_t(recs.size());
+    uint32_t min_sstart = UINT32_MAX, max_send = 0;
+    for (const auto& r : recs) {
+        min_sstart = std::min(min_sstart, r.sstart);
+        max_send   = std::max(max_send,   r.send);
+    }
+
+    serialize_varnt_block(raw, std::move(recs));
+
+    // Compress payload (content checksum enabled so the reader validates on decompress).
     size_t bound = ZSTD_compressBound(raw.size());
     std::vector<uint8_t> cbuf(bound);
-    size_t csz = ZSTD_compress(cbuf.data(), bound, raw.data(), raw.size(), zstd_level);
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, zstd_level);
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
+    size_t csz = ZSTD_compress2(cctx, cbuf.data(), bound, raw.data(), raw.size());
+    ZSTD_freeCCtx(cctx);
     if (ZSTD_isError(csz))
         throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
 
-    ShardBlockHeader hdr{};
-    std::memcpy(hdr.magic, SHARD_BLOCK_MAGIC, 4);
-    hdr.version       = SHARD_BLOCK_VERSION;
-    hdr.compressed_sz = uint32_t(csz);
-    hdr.raw_sz        = uint32_t(raw.size());
-    hdr.n_records     = uint32_t(recs.size());
-    hdr.min_sstart    = UINT32_MAX; hdr.max_send = 0;
-    for (const auto& r : recs) {
-        hdr.min_sstart = std::min(hdr.min_sstart, r.sstart);
-        hdr.max_send   = std::max(hdr.max_send,   r.send);
-    }
+    // Serialize the 28-byte header explicitly little-endian (host-endian-independent).
+    std::vector<uint8_t> hdr_bytes;
+    hdr_bytes.reserve(28);
+    hdr_bytes.insert(hdr_bytes.end(), SHARD_BLOCK_MAGIC, SHARD_BLOCK_MAGIC + 4);
+    hdr_bytes.push_back(SHARD_BLOCK_VERSION);
+    hdr_bytes.push_back(0);                 // flags
+    hdr_bytes.push_back(0); hdr_bytes.push_back(0);  // reserved[2]
+    write_u32(hdr_bytes, uint32_t(csz));
+    write_u32(hdr_bytes, uint32_t(raw.size()));
+    write_u32(hdr_bytes, n_records);
+    write_u32(hdr_bytes, min_sstart);
+    write_u32(hdr_bytes, max_send);
 
-    if (::write(fd, &hdr,        sizeof(hdr)) != ssize_t(sizeof(hdr)) ||
-        ::write(fd, cbuf.data(), csz)         != ssize_t(csz))
+    if (::write(fd, hdr_bytes.data(), hdr_bytes.size()) != ssize_t(hdr_bytes.size()) ||
+        ::write(fd, cbuf.data(), csz)                   != ssize_t(csz))
         throw std::runtime_error("shard write error");
 }
 
@@ -149,27 +163,32 @@ inline void flush_hog_shard(const std::filesystem::path& shard_path,
 // Returns false if the file does not exist (HOG absent from container).
 template<typename Cb>
 inline bool read_shard_file(const std::string& path, Cb cb) {
-    int fd = open(path.c_str(), O_RDONLY);
+    UniqueFd fd(open(path.c_str(), O_RDONLY));
     if (fd < 0) return false;
 
-    ShardBlockHeader hdr;
+    uint8_t hdr[28];
     while (true) {
-        ssize_t nr = ::read(fd, &hdr, sizeof(hdr));
+        ssize_t nr = ::read(fd, hdr, sizeof(hdr));
         if (nr == 0) break;
         if (nr != ssize_t(sizeof(hdr)))
             throw std::runtime_error("truncated shard header: " + path);
-        if (std::memcmp(hdr.magic, SHARD_BLOCK_MAGIC, 4) != 0)
+        if (std::memcmp(hdr, SHARD_BLOCK_MAGIC, 4) != 0)
             throw std::runtime_error("bad shard magic in: " + path);
-        if (hdr.version != SHARD_BLOCK_VERSION)
+        if (hdr[4] != SHARD_BLOCK_VERSION)
             throw std::runtime_error("unsupported shard version " +
-                std::to_string(hdr.version) + " in: " + path);
+                std::to_string(hdr[4]) + " in: " + path);
 
-        std::vector<uint8_t> cbuf(hdr.compressed_sz);
-        if (::read(fd, cbuf.data(), hdr.compressed_sz) != ssize_t(hdr.compressed_sz))
+        uint32_t compressed_sz = read_u32_le(hdr + 8);
+        uint32_t raw_sz        = read_u32_le(hdr + 12);
+        if (compressed_sz > 256u * 1024 * 1024 || raw_sz > 512u * 1024 * 1024)
+            throw std::runtime_error("shard block size OOB in: " + path);
+
+        std::vector<uint8_t> cbuf(compressed_sz);
+        if (::read(fd, cbuf.data(), compressed_sz) != ssize_t(compressed_sz))
             throw std::runtime_error("truncated shard data: " + path);
 
-        std::vector<uint8_t> raw(hdr.raw_sz);
-        size_t rz = ZSTD_decompress(raw.data(), hdr.raw_sz, cbuf.data(), hdr.compressed_sz);
+        std::vector<uint8_t> raw(raw_sz);
+        size_t rz = ZSTD_decompress(raw.data(), raw_sz, cbuf.data(), compressed_sz);
         if (ZSTD_isError(rz))
             throw std::runtime_error(std::string("shard zstd: ") + ZSTD_getErrorName(rz));
 
@@ -195,7 +214,6 @@ inline bool read_shard_file(const std::string& path, Cb cb) {
 
         cb(local_contigs, recs);
     }
-    close(fd);
     return true;
 }
 

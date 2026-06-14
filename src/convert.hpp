@@ -31,10 +31,19 @@ namespace col {
     constexpr int pident=9, evalue=10, cigar=11, qseq_aa=12, full_qseq=13;
 }
 
-inline std::string extract_hog(std::string_view sv) {
+// Returns a view into the caller's line buffer (alive for the call duration).
+inline std::string_view extract_hog(std::string_view sv) {
     auto p = sv.rfind('|');
-    return std::string(p != std::string_view::npos ? sv.substr(p + 1) : sv);
+    return p != std::string_view::npos ? sv.substr(p + 1) : sv;
 }
+
+// Transparent hash/equality so unordered_map<std::string,...> can be looked up
+// by std::string_view without constructing a temporary std::string.
+struct SvHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const { return std::hash<std::string_view>{}(sv); }
+    size_t operator()(const std::string& s)  const { return std::hash<std::string_view>{}(s); }
+};
 
 inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart,
                           uint32_t qend, uint32_t qlen) {
@@ -62,14 +71,18 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
 
     BatchWriter batch(lhb_path, opts.acc_id);
 
-    std::unordered_map<std::string, uint32_t> hog_dict, contig_dict;
+    using SvDict = std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>>;
+    SvDict hog_dict, contig_dict;
     std::vector<std::string> hog_strings, contig_strings;
 
-    auto intern = [](std::unordered_map<std::string,uint32_t>& d,
-                     std::vector<std::string>& v, const std::string& s) -> uint32_t {
-        auto [it, ins] = d.emplace(s, uint32_t(v.size()));
-        if (ins) v.push_back(s);
-        return it->second;
+    // Lookup by string_view (no allocation on hit); allocate only on first sight.
+    auto intern = [](SvDict& d, std::vector<std::string>& v, std::string_view s) -> uint32_t {
+        auto it = d.find(s);
+        if (it != d.end()) return it->second;
+        uint32_t idx = uint32_t(v.size());
+        v.emplace_back(s);
+        d.emplace(v.back(), idx);
+        return idx;
     };
 
     std::unordered_map<uint32_t, std::vector<VarNTRecord>> batches;
@@ -90,7 +103,7 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
     }
 
     std::string line;
-    uint64_t lineno = 0, n_written = 0, n_skipped = 0;
+    uint64_t lineno = 0, n_written = 0, n_skipped = 0, n_obs_dropped = 0;
 
     while (std::getline(*in, line)) {
         ++lineno;
@@ -130,9 +143,8 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
         }
         if (sstart > send) { ++n_skipped; continue; }
 
-        std::string hog_id     = extract_hog(f[col::sseqid]);
-        uint32_t    hog_idx    = intern(hog_dict, hog_strings, hog_id);
-        uint32_t    contig_idx = intern(contig_dict, contig_strings, std::string(f[col::qseqid]));
+        uint32_t    hog_idx    = intern(hog_dict, hog_strings, extract_hog(f[col::sseqid]));
+        uint32_t    contig_idx = intern(contig_dict, contig_strings, f[col::qseqid]);
         int8_t      qframe     = make_qframe(f[col::qstrand], qstart, qend, qlen);
 
         auto ar = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
@@ -148,21 +160,21 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
 
         for (uint32_t i = 0; i < span; ++i) {
             uint8_t obs_aa = ar.aas[i];
-            if (obs_aa == AA_GAP || obs_aa == AA_UNK) continue;
+            if (obs_aa == AA_GAP || obs_aa == AA_UNK) { ++n_obs_dropped; continue; }
             uint32_t q_off = ar.qseq_offsets[i];
-            if (q_off == UINT32_MAX || full_nt.empty()) continue;
+            if (q_off == UINT32_MAX || full_nt.empty()) { ++n_obs_dropped; continue; }
 
             uint8_t c0, c1, c2;
             if (qframe > 0) {
                 size_t cs = size_t(qstart-1) + size_t(q_off)*3;
-                if (cs+2 >= full_nt.size()) continue;
+                if (cs+2 >= full_nt.size()) { ++n_obs_dropped; continue; }
                 c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
             } else {
                 // Minus strand: diamond reports qstart > qend; codon i sits at
                 // [(qstart-1) - q_off*3 - 2 .. (qstart-1) - q_off*3], revcomp'd.
-                if (size_t(q_off)*3 + 3 > size_t(qstart)) continue;
+                if (size_t(q_off)*3 + 3 > size_t(qstart)) { ++n_obs_dropped; continue; }
                 size_t cs = size_t(qstart-1) - size_t(q_off)*3 - 2;
-                if (cs+2 >= full_nt.size()) continue;
+                if (cs+2 >= full_nt.size()) { ++n_obs_dropped; continue; }
                 c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
                 uint8_t tmp[3]={c0,c1,c2}; revcomp_codon(tmp); c0=tmp[0]; c1=tmp[1]; c2=tmp[2];
             }
@@ -171,7 +183,7 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
             auto is_acgt = [](uint8_t b) {
                 return b=='A'||b=='C'||b=='G'||b=='T';
             };
-            if (!is_acgt(c0) || !is_acgt(c1) || !is_acgt(c2)) { ++n_skipped; continue; }
+            if (!is_acgt(c0) || !is_acgt(c1) || !is_acgt(c2)) { ++n_obs_dropped; continue; }
 
             uint8_t raw3[3]={c0,c1,c2};
             uint8_t packed = pack_codon(raw3);
@@ -182,7 +194,7 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
                 if (opts.verbose) std::cerr << "codon/AA mismatch L" << lineno
                     << " (diamond=" << char(AA_ALPHA[obs_aa])
                     << " nt=" << char(c0) << char(c1) << char(c2) << ")\n";
-                ++n_skipped; continue;
+                ++n_obs_dropped; continue;
             }
 
             vr.vars.push_back({i, obs_aa, packed});
@@ -205,7 +217,8 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
     batch.finalize();
 
     std::cerr << "convert: " << n_written << " records, " << n_skipped
-              << " skipped → " << lhb_path << "\n";
+              << " records skipped, " << n_obs_dropped << " observations dropped → "
+              << lhb_path << "\n";
 }
 
 } // namespace lhi

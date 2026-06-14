@@ -7,8 +7,19 @@
 #include <vector>
 #include <array>
 #include <algorithm>
+#include <unistd.h>
 
 namespace lhi {
+
+// RAII wrapper for a POSIX fd: closes on scope exit, move-only.
+struct UniqueFd {
+    int fd = -1;
+    explicit UniqueFd(int f) : fd(f) {}
+    ~UniqueFd() { if (fd >= 0) { ::close(fd); fd = -1; } }
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+    operator int() const { return fd; }
+};
 
 inline void write_varint(std::vector<uint8_t>& b, uint32_t v) {
     while (v >= 0x80) { b.push_back(uint8_t((v & 0x7F) | 0x80)); v >>= 7; }
@@ -16,8 +27,37 @@ inline void write_varint(std::vector<uint8_t>& b, uint32_t v) {
 }
 inline int read_varint(const uint8_t* p, const uint8_t* end, uint32_t* out) {
     uint32_t v = 0; int sh = 0; const uint8_t* s = p;
-    while (p < end) { uint8_t x = *p++; v |= uint32_t(x & 0x7F) << sh; sh += 7; if (!(x & 0x80)) break; }
-    *out = v; return int(p - s);
+    while (p < end && sh < 35) {
+        uint8_t x = *p++;
+        if (sh == 28) {                          // 5th byte: only low 4 bits fit uint32
+            if (x & 0x80) return 0;              // 6th continuation byte ⇒ overflow
+            if (x > 0x0F) return 0;              // value > UINT32_MAX
+            v |= uint32_t(x) << 28;
+            *out = v; return int(p - s);
+        }
+        v |= uint32_t(x & 0x7F) << sh;
+        sh += 7;
+        if (!(x & 0x80)) { *out = v; return int(p - s); }
+    }
+    return 0;  // truncated or overflow
+}
+
+inline void write_u32(std::vector<uint8_t>& b, uint32_t v) {
+    b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8));
+    b.push_back(uint8_t(v >> 16)); b.push_back(uint8_t(v >> 24));
+}
+inline uint32_t read_u32_le(const uint8_t* p) {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+           (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+// Adler-32 over a byte range (self-contained; no extra dependency).
+// Used to checksum the raw (non-zstd) index section of a .lhg/.lhgi file.
+inline uint32_t adler32(const uint8_t* p, size_t n) {
+    uint32_t a = 1, b = 0;
+    constexpr uint32_t MOD = 65521;
+    for (size_t i = 0; i < n; ++i) { a = (a + p[i]) % MOD; b = (b + a) % MOD; }
+    return (b << 16) | a;
 }
 
 inline void write_u16(std::vector<uint8_t>& b, uint16_t v) {
@@ -105,10 +145,10 @@ struct VarNTRecord {
 };
 
 inline void serialize_varnt_block(std::vector<uint8_t>& raw,
-                                   std::vector<VarNTRecord> recs) {
+                                   std::vector<VarNTRecord>&& recs) {
     const size_t N = recs.size();
 
-    // sstart-sorted → monotone column enables delta encoding; recs is by value.
+    // sstart-sorted → monotone column enables delta encoding; recs is moved-in.
     std::stable_sort(recs.begin(), recs.end(),
         [](const VarNTRecord& a, const VarNTRecord& b) { return a.sstart < b.sstart; });
 

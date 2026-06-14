@@ -94,7 +94,7 @@ struct BatchBlockRef {
 template<typename HdrCb, typename BlkCb>
 inline bool scan_batch_file(const std::string& path, size_t file_idx,
                              HdrCb header_cb, BlkCb block_cb) {
-    int fd = open(path.c_str(), O_RDONLY);
+    UniqueFd fd(open(path.c_str(), O_RDONLY));
     if (fd < 0) return false;
 
     auto read_exact = [&](void* buf, size_t n) -> bool {
@@ -112,6 +112,11 @@ inline bool scan_batch_file(const std::string& path, size_t file_idx,
         for (;;) {
             uint8_t x;
             if (::read(fd, &x, 1) != 1) return false;
+            if (sh == 28) {                          // 5th byte: only low 4 bits fit uint32
+                if (x & 0x80) return false;          // 6th continuation byte ⇒ overflow
+                if (x > 0x0F) return false;          // value > UINT32_MAX
+                out |= uint32_t(x) << 28; return true;
+            }
             out |= uint32_t(x & 0x7F) << sh; sh += 7;
             if (!(x & 0x80)) break;
         }
@@ -125,15 +130,14 @@ inline bool scan_batch_file(const std::string& path, size_t file_idx,
     };
 
     uint8_t magic[4], ver, flags, pad[2];
-    if (!read_exact(magic, 4) || memcmp(magic, LHB_FILE_MAGIC, 4) != 0) {
-        close(fd);
+    if (!read_exact(magic, 4) || memcmp(magic, LHB_FILE_MAGIC, 4) != 0)
         throw std::runtime_error("bad .lhb magic: " + path);
-    }
-    if (!read_exact(&ver, 1) || !read_exact(&flags, 1) || !read_exact(pad, 2)) {
-        close(fd); throw std::runtime_error("truncated .lhb header: " + path);
-    }
+    if (!read_exact(&ver, 1) || !read_exact(&flags, 1) || !read_exact(pad, 2))
+        throw std::runtime_error("truncated .lhb header: " + path);
+    if (ver != LHB_VERSION)
+        throw std::runtime_error("unsupported .lhb version " + std::to_string(ver) + " in: " + path);
     std::string acc_id;
-    if (!read_str(acc_id)) { close(fd); throw std::runtime_error("truncated acc_id: " + path); }
+    if (!read_str(acc_id)) throw std::runtime_error("truncated acc_id: " + path);
     header_cb(acc_id);
 
     for (;;) {
@@ -149,20 +153,22 @@ inline bool scan_batch_file(const std::string& path, size_t file_idx,
         if (!read_str(hog_id)) throw std::runtime_error("truncated hog_id in: " + path);
 
         off_t shard_hdr_off = lseek(fd, 0, SEEK_CUR);
-        ShardBlockHeader hdr;
-        if (!read_exact(&hdr, sizeof(hdr))) throw std::runtime_error("truncated shard hdr in: " + path);
-        if (memcmp(hdr.magic, SHARD_BLOCK_MAGIC, 4) != 0)
+        uint8_t hdr[28];
+        if (!read_exact(hdr, sizeof(hdr))) throw std::runtime_error("truncated shard hdr in: " + path);
+        if (memcmp(hdr, SHARD_BLOCK_MAGIC, 4) != 0)
             throw std::runtime_error("bad shard magic in: " + path);
+        if (hdr[4] != SHARD_BLOCK_VERSION)
+            throw std::runtime_error("unsupported shard version in: " + path);
 
+        uint32_t compressed_sz = read_u32_le(hdr + 8);
         block_cb(BatchBlockRef{hog_id, acc_id, file_idx, shard_hdr_off,
-                               hdr.compressed_sz, hdr.raw_sz,
-                               hdr.min_sstart, hdr.max_send});
+                               compressed_sz, read_u32_le(hdr + 12),
+                               read_u32_le(hdr + 20), read_u32_le(hdr + 24)});
 
-        if (lseek(fd, hdr.compressed_sz, SEEK_CUR) < 0)
+        if (lseek(fd, compressed_sz, SEEK_CUR) < 0)
             throw std::runtime_error("lseek failed in: " + path);
     }
 
-    close(fd);
     return true;
 }
 

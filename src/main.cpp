@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <optional>
 #include <sys/stat.h>
 
 static void usage(const char* prog) {
@@ -57,7 +58,7 @@ int main(int argc, char* argv[]) {
         std::string lhgi_path = argv[3];
         std::string hog_id    = argv[4];
         uint32_t    pos       = uint32_t(std::stoul(argv[5]));
-        uint8_t     aa        = lhi::AA_UNK;
+        std::optional<uint8_t> aa;
         if (argc >= 7) aa = lhi::encode_aa(argv[6][0]);
 
         lhi::GlobalIndex idx;

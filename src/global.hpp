@@ -10,8 +10,9 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
+#include <optional>
 
-// .lhg — LHG Global file (v5: position-centric inverted format).
+// .lhg — LHG Global file (LHG_VERSION 4: position-centric inverted format).
 // .lhgi — LHG Index: companion small file; load once, range-GET .lhg per HOG.
 //
 // .lhg layout:
@@ -81,47 +82,56 @@ struct GlobalIndex {
     }
 
     bool load(const std::string& path) {
-        int fd = open(path.c_str(), O_RDONLY);
+        UniqueFd fd(open(path.c_str(), O_RDONLY));
         if (fd < 0) return false;
-        bool ok = load_from_fd(fd);
-        close(fd);
-        return ok;
+        return load_from_fd(fd);
     }
 
     // Load from .lhg by seeking to index_offset stored in the file header.
     bool load_from_lhg(const std::string& path) {
-        int fd = open(path.c_str(), O_RDONLY);
+        UniqueFd fd(open(path.c_str(), O_RDONLY));
         if (fd < 0) return false;
         uint8_t hdr[LHG_HEADER_SZ];
         if (::read(fd, hdr, LHG_HEADER_SZ) != ssize_t(LHG_HEADER_SZ) ||
-            memcmp(hdr, LHG_FILE_MAGIC, 4) != 0) {
-            close(fd); return false;
-        }
+            memcmp(hdr, LHG_FILE_MAGIC, 4) != 0)
+            return false;
+        if (hdr[4] != LHG_VERSION) return false;  // reject unknown version
         uint64_t idx_off = 0;
         for (int i = 0; i < 8; ++i) idx_off |= uint64_t(hdr[8 + i]) << (8 * i);
-        if (lseek(fd, off_t(idx_off), SEEK_SET) < 0) { close(fd); return false; }
-        bool ok = load_from_fd(fd);
-        close(fd);
-        return ok;
+        if (lseek(fd, off_t(idx_off), SEEK_SET) < 0) return false;
+        return load_from_fd(fd);
     }
 
 private:
     bool load_from_fd(int fd) {
+        // Accumulate every consumed index byte so we can validate the trailing Adler-32.
+        std::vector<uint8_t> consumed;
         auto read_exact = [&](void* buf, size_t n) -> bool {
             char* p = (char*)buf; size_t done = 0;
             while (done < n) { ssize_t r = ::read(fd, p + done, n - done); if (r <= 0) return false; done += r; }
+            consumed.insert(consumed.end(), (uint8_t*)buf, (uint8_t*)buf + n);
             return true;
         };
         auto read_varint_fd = [&](uint32_t& out) -> bool {
             out = 0; int sh = 0;
-            for (;;) { uint8_t x; if (::read(fd, &x, 1) != 1) return false;
-                out |= uint32_t(x & 0x7F) << sh; sh += 7; if (!(x & 0x80)) break; }
+            for (;;) {
+                uint8_t x; if (::read(fd, &x, 1) != 1) return false;
+                consumed.push_back(x);
+                if (sh == 28) {                          // 5th byte: only low 4 bits fit uint32
+                    if (x & 0x80) return false;          // 6th continuation byte ⇒ overflow
+                    if (x > 0x0F) return false;          // value > UINT32_MAX
+                    out |= uint32_t(x) << 28; return true;
+                }
+                out |= uint32_t(x & 0x7F) << sh; sh += 7;
+                if (!(x & 0x80)) break;
+            }
             return true;
         };
 
         uint8_t magic[4]; uint32_t n_hogs = 0;
         if (!read_exact(magic, 4) || memcmp(magic, LHG_INDEX_MAGIC, 4) != 0) return false;
         if (!read_exact(&n_hogs, 4)) return false;
+        if (n_hogs > 50000000) return false;
         entries.resize(n_hogs);
         for (auto& e : entries) {
             uint32_t len = 0;
@@ -138,6 +148,7 @@ private:
         uint8_t amagic[4]; uint32_t n_accs = 0;
         if (!read_exact(amagic, 4) || memcmp(amagic, LHG_ACC_MAGIC, 4) != 0) return false;
         if (!read_exact(&n_accs, 4)) return false;
+        if (n_accs > 50000000) return false;
         accessions.resize(n_accs);
         for (auto& a : accessions) {
             uint32_t len = 0;
@@ -145,11 +156,15 @@ private:
             a.resize(len);
             if (!read_exact(a.data(), len)) return false;
         }
+        // Validate trailing Adler-32 over all preceding index bytes (raw read, not checksummed).
+        uint8_t crc_bytes[4]; size_t got = 0;
+        while (got < 4) { ssize_t r = ::read(fd, crc_bytes + got, 4 - got); if (r <= 0) return false; got += size_t(r); }
+        if (adler32(consumed.data(), consumed.size()) != read_u32_le(crc_bytes)) return false;
         return true;
     }
 };
 
-// ── v5 inverted-block in-memory model ────────────────────────────────────────
+// ── LHG_VERSION 4 inverted-block in-memory model ─────────────────────────────
 
 struct InvObs {
     uint32_t acc_idx;
@@ -210,22 +225,25 @@ struct InvBlock {
 inline bool read_hog_inverted(const std::string& lhg_path,
                               const HogIndexEntry& entry,
                               InvBlock& out) {
-    int fd = open(lhg_path.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("cannot open: " + lhg_path);
-    if (lseek(fd, off_t(entry.data_offset), SEEK_SET) < 0) {
-        close(fd); throw std::runtime_error("seek failed in: " + lhg_path);
+    bool is_raw = false;
+    uint32_t payload_sz = 0;
+    std::vector<uint8_t> cbuf;
+    {
+        UniqueFd fd(open(lhg_path.c_str(), O_RDONLY));
+        if (fd < 0) throw std::runtime_error("cannot open: " + lhg_path);
+        if (lseek(fd, off_t(entry.data_offset), SEEK_SET) < 0)
+            throw std::runtime_error("seek failed in: " + lhg_path);
+        uint8_t hoe_magic[4];
+        if (!fd_read_exact(fd, hoe_magic, 4) || memcmp(hoe_magic, LHG_HOG_ENTRY_MAGIC, 4) != 0)
+            throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
+        uint32_t stored = 0;
+        if (!fd_read_exact(fd, &stored, 4)) return false;
+        is_raw = (stored >> 31) & 1;
+        payload_sz = stored & 0x7FFFFFFFu;
+        if (payload_sz > 256u * 1024 * 1024) return false;
+        cbuf.resize(payload_sz);
+        if (!fd_read_exact(fd, cbuf.data(), payload_sz)) return false;
     }
-    uint8_t hoe_magic[4];
-    if (!fd_read_exact(fd, hoe_magic, 4) || memcmp(hoe_magic, LHG_HOG_ENTRY_MAGIC, 4) != 0) {
-        close(fd); throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
-    }
-    uint32_t stored = 0;
-    if (!fd_read_exact(fd, &stored, 4)) { close(fd); return false; }
-    bool is_raw = (stored >> 31) & 1;
-    uint32_t payload_sz = stored & 0x7FFFFFFFu;
-    std::vector<uint8_t> cbuf(payload_sz);
-    if (!fd_read_exact(fd, cbuf.data(), payload_sz)) { close(fd); return false; }
-    close(fd);
 
     if (is_raw) {
         out.raw.assign(cbuf.begin(), cbuf.end());
@@ -246,6 +264,7 @@ inline bool read_hog_inverted(const std::string& lhg_path,
     int n = read_varint(p, out.end, &n_unitigs);
     if (!n) throw std::runtime_error("corrupt unitig dict for HOG " + entry.hog_id);
     p += n;
+    if (n_unitigs > 65536) throw std::runtime_error("n_unitigs OOB for HOG " + entry.hog_id);
     out.unitigs.resize(n_unitigs);
     for (uint32_t i = 0; i < n_unitigs; ++i) {
         uint32_t cnum = 0;
@@ -269,6 +288,7 @@ inline bool decode_position(const uint8_t*& p, const uint8_t* end,
     prev_pos = hog_pos;
     uint32_t n_obs = 0;
     n = read_varint(p, end, &n_obs); if (!n) return false; p += n;
+    if (size_t(n_obs) > size_t(end - p)) return false;  // each obs ≥1 byte; bound before resize
     obs.resize(n_obs);
     uint32_t prev = 0;
     for (uint32_t i = 0; i < n_obs; ++i) {
@@ -293,7 +313,7 @@ inline bool decode_position(const uint8_t*& p, const uint8_t* end,
 // Output TSV: acc_id \t unitig_id \t hog_pos \t obs_aa \t codon
 void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
                 const std::string& hog_id, uint32_t pos,
-                uint8_t aa_filter = AA_UNK);
+                std::optional<uint8_t> aa_filter = std::nullopt);
 
 // Per-position codon frequency table for a HOG.
 // Output TSV: hog_pos \t codon \t obs_aa \t n_accessions
@@ -302,7 +322,7 @@ void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
 
 inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
                        const std::string& hog_id, uint32_t pos,
-                       uint8_t aa_filter) {
+                       std::optional<uint8_t> aa_filter) {
     const auto* entry = idx.find(hog_id);
     if (!entry) {
         std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str());
@@ -328,16 +348,15 @@ inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
             throw std::runtime_error("corrupt position record for HOG " + hog_id);
         if (hog_pos != pos) continue;
         for (const auto& o : obs) {
+            if (o.unitig_idx >= blk.unitigs.size()) continue;  // OOB unitig ref ⇒ skip
             uint8_t packed = uint8_t(o.codon_idx << 2);
             uint8_t aa = codon_to_aa(packed);
-            if (aa_filter != AA_UNK && aa != aa_filter) continue;
+            if (aa_filter && aa != *aa_filter) continue;
             char aac = (aa < 20) ? AA_ALPHA[aa] : 'X';
             char cdn[3]; unpack_codon(packed, cdn);
             const std::string& acc = (o.acc_idx < idx.accessions.size())
                                    ? idx.accessions[o.acc_idx] : std::string();
-            std::string uni = (o.unitig_idx < blk.unitigs.size())
-                            ? acc + "_" + std::to_string(blk.unitigs[o.unitig_idx])
-                            : std::string();
+            std::string uni = acc + "_" + std::to_string(blk.unitigs[o.unitig_idx]);
             std::printf("%s\t%s\t%u\t%c\t%c%c%c\n",
                         acc.c_str(), uni.c_str(), hog_pos, aac,
                         cdn[0], cdn[1], cdn[2]);
@@ -418,6 +437,8 @@ inline std::vector<uint8_t> build_index_bytes(const std::vector<HogIndexEntry>& 
         write_varint(buf, uint32_t(a.size()));
         buf.insert(buf.end(), a.begin(), a.end());
     }
+    // Trailing Adler-32 over all preceding index bytes (validated on load).
+    write_u32(buf, adler32(buf.data(), buf.size()));
     return buf;
 }
 
