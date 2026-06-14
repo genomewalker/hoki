@@ -3,6 +3,7 @@
 #include "global.hpp"
 #include "batch.hpp"
 #include "container.hpp"
+#include <lz4.h>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -207,8 +208,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int n_threads_override = 0,
                           bool do_profile = false,
                           int hot_threshold = 100,
-                          int out_compress_level = -1) {
-    if (out_compress_level < 0) out_compress_level = zstd_level;
+                          int /*out_compress_level*/ = -1) {
+    (void)zstd_level;  // output now uses LZ4; -z / -zo flags accepted but ignored
 
     // Pass 1: scan all inputs, collect per-HOG MergeRefs (offsets only).
     std::vector<MergeRef> refs;
@@ -434,6 +435,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::vector<InvBlock>   blocks;
         std::vector<std::vector<InvPosition>> src_pos;
         std::vector<InvObs>     obs;
+        // per-block obs accumulator for the all_lhg and cold heap merge paths:
+        // indexed by src/bi; avoids O(n log n) sort since blocks have disjoint acc ranges.
+        std::vector<std::vector<InvObs>> per_block_obs;
         // mixed/lhb path
         std::unordered_map<uint32_t, std::vector<InvObs>> inverted;
         std::vector<VarNTRecord> recs;
@@ -463,7 +467,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
     // Per-group inversion + serialize + compress. Self-contained; uses only the
     // caller's read-only state plus worker-owned zstd contexts/buffers.
-    auto process_group = [&](size_t g, ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
+    auto process_group = [&](size_t g, ZSTD_DCtx* dctx,
                              std::vector<uint8_t>& cbuf_in,
                              std::vector<uint8_t>& raw_block,
                              std::vector<uint8_t>& inv_raw,
@@ -579,12 +583,15 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 }
 
                 // K-way min-heap merge (identical to cold path).
+                // Each source block holds a disjoint acc_idx range (stage-2 invariant),
+                // so concatenating per-block in src order produces sorted output without sort().
                 struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
                 auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
                 std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
                 for (size_t bi = 0; bi < n_blocks; ++bi)
                     if (!src_pos[bi].empty())
                         heap.push({src_pos[bi][0].hog_pos, bi, 0});
+                sc.per_block_obs.resize(n_blocks);
                 while (!heap.empty()) {
                     uint32_t cur_pos = heap.top().hog_pos;
                     InvPosition out_pos;
@@ -592,15 +599,19 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     while (!heap.empty() && heap.top().hog_pos == cur_pos) {
                         HeapItem it = heap.top(); heap.pop();
                         auto& obs = src_pos[it.src][it.cur].obs;
-                        out_pos.obs.insert(out_pos.obs.end(),
-                                           std::make_move_iterator(obs.begin()),
-                                           std::make_move_iterator(obs.end()));
+                        sc.per_block_obs[it.src].insert(sc.per_block_obs[it.src].end(),
+                                                        std::make_move_iterator(obs.begin()),
+                                                        std::make_move_iterator(obs.end()));
                         size_t next = it.cur + 1;
                         if (next < src_pos[it.src].size())
                             heap.push({src_pos[it.src][next].hog_pos, it.src, next});
                     }
-                    std::sort(out_pos.obs.begin(), out_pos.obs.end(),
-                        [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+                    for (size_t bi = 0; bi < n_blocks; ++bi) {
+                        out_pos.obs.insert(out_pos.obs.end(),
+                                           std::make_move_iterator(sc.per_block_obs[bi].begin()),
+                                           std::make_move_iterator(sc.per_block_obs[bi].end()));
+                        sc.per_block_obs[bi].clear();
+                    }
                     positions.push_back(std::move(out_pos));
                 }
             } else {
@@ -652,13 +663,15 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 t_dec_end = clock_ns();
 
                 // K-way min-heap over (hog_pos, src_idx, cursor). Concatenate obs at
-                // equal hog_pos directly — sources are already position-ordered.
+                // equal hog_pos in src order — blocks have disjoint acc_idx ranges so
+                // this is equivalent to sorting by acc_idx without the O(n log n) cost.
                 struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
                 auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
                 std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
                 for (size_t bi = 0; bi < n_blocks; ++bi)
                     if (!src_pos[bi].empty())
                         heap.push({src_pos[bi][0].hog_pos, bi, 0});
+                sc.per_block_obs.resize(n_blocks);
                 while (!heap.empty()) {
                     uint32_t cur_pos = heap.top().hog_pos;
                     InvPosition out_pos;
@@ -666,15 +679,19 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     while (!heap.empty() && heap.top().hog_pos == cur_pos) {
                         HeapItem it = heap.top(); heap.pop();
                         auto& obs = src_pos[it.src][it.cur].obs;
-                        out_pos.obs.insert(out_pos.obs.end(),
-                                           std::make_move_iterator(obs.begin()),
-                                           std::make_move_iterator(obs.end()));
+                        sc.per_block_obs[it.src].insert(sc.per_block_obs[it.src].end(),
+                                                        std::make_move_iterator(obs.begin()),
+                                                        std::make_move_iterator(obs.end()));
                         size_t next = it.cur + 1;
                         if (next < src_pos[it.src].size())
                             heap.push({src_pos[it.src][next].hog_pos, it.src, next});
                     }
-                    std::sort(out_pos.obs.begin(), out_pos.obs.end(),
-                        [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+                    for (size_t bi = 0; bi < n_blocks; ++bi) {
+                        out_pos.obs.insert(out_pos.obs.end(),
+                                           std::make_move_iterator(sc.per_block_obs[bi].begin()),
+                                           std::make_move_iterator(sc.per_block_obs[bi].end()));
+                        sc.per_block_obs[bi].clear();
+                    }
                     positions.push_back(std::move(out_pos));
                 }
             }
@@ -817,24 +834,35 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         tl_decode += t_dec_end - t0;
         tl_build  += t_build_end - t_dec_end;
 
-        // HOG-level zstd compress (worker-owned CCtx; level set per worker).
-        size_t bound = ZSTD_compressBound(inv_raw.size());
-        hog_cbuf.resize(bound);
-        size_t csz = ZSTD_compress2(cctx, hog_cbuf.data(), bound,
-                                    inv_raw.data(), inv_raw.size());
-        if (ZSTD_isError(csz))
-            throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
+        // HOG-level LZ4 compress: ~5× faster than ZSTD, ~60% ratio (vs ZSTD ~70%).
+        // stored_sz encoding: bit31=raw, bit30=lz4, bits29-0=payload_sz.
+        // LZ4 payload layout: [4-byte raw_sz LE][LZ4 compressed bytes].
+        size_t raw_sz = inv_raw.size();
+        size_t lz4_bound = size_t(LZ4_compressBound(int(raw_sz)));
+        hog_cbuf.resize(4 + lz4_bound);
+        hog_cbuf[0] = uint8_t(raw_sz);
+        hog_cbuf[1] = uint8_t(raw_sz >> 8);
+        hog_cbuf[2] = uint8_t(raw_sz >> 16);
+        hog_cbuf[3] = uint8_t(raw_sz >> 24);
+        int lz4_csz = LZ4_compress_default(
+            reinterpret_cast<const char*>(inv_raw.data()),
+            reinterpret_cast<char*>(hog_cbuf.data() + 4),
+            int(raw_sz), int(lz4_bound));
+        size_t total_lz4 = (lz4_csz > 0) ? size_t(4 + lz4_csz) : raw_sz;
+        bool use_raw = (lz4_csz <= 0 || total_lz4 >= raw_sz);
 
         tl_compress += clock_ns() - t_build_end;
 
-        // Raw fallback: if zstd doesn't shrink the block, store raw (high bit set).
-        bool use_raw = (csz >= inv_raw.size());
         GroupResult& gr = results[g];
         gr.hog_id = hog_id;
-        gr.stored_sz = use_raw ? (uint32_t(inv_raw.size()) | 0x80000000u) : uint32_t(csz);
         gr.n_accs = sc.n_accs;
-        if (use_raw) gr.payload.assign(inv_raw.begin(), inv_raw.end());
-        else         gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + csz);
+        if (use_raw) {
+            gr.stored_sz = uint32_t(raw_sz) | 0x80000000u;
+            gr.payload.assign(inv_raw.begin(), inv_raw.end());
+        } else {
+            gr.stored_sz = uint32_t(total_lz4) | 0x40000000u;
+            gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + total_lz4);
+        }
         // Signal the async writer that this result slot is ready.
         result_ready[g].store(true, std::memory_order_release);
     };
@@ -855,9 +883,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     if (n_threads == 0) n_threads = 1;
 
     auto worker = [&]() {
-        ZSTD_CCtx* cctx = ZSTD_createCCtx();
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
-        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, out_compress_level);
         std::vector<uint8_t> cbuf_in, raw_block, inv_raw, hog_cbuf;
         WorkerScratch scratch;
         uint64_t tl_decode = 0, tl_build = 0, tl_compress = 0;
@@ -865,7 +891,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             size_t g = next_group.fetch_add(1, std::memory_order_relaxed);
             if (g < groups.size() && !failed.load(std::memory_order_relaxed)) {
                 try {
-                    process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
+                    process_group(g, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
                                   scratch, tl_decode, tl_build, tl_compress);
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lk(err_mtx);
@@ -901,7 +927,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         prof.ns_build.fetch_add(tl_build,   std::memory_order_relaxed);
         prof.ns_compress.fetch_add(tl_compress, std::memory_order_relaxed);
         prof.n_groups.fetch_add(1, std::memory_order_relaxed);
-        ZSTD_freeCCtx(cctx);
         ZSTD_freeDCtx(dctx);
     };
 

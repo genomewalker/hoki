@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(hoki CXX)
+project(hoki C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,8 +10,8 @@ list(PREPEND CMAKE_PREFIX_PATH
 
 find_package(zstd REQUIRED)
 
-add_executable(hoki src/main.cpp)
-target_include_directories(hoki PRIVATE src)
+add_executable(hoki src/main.cpp third_party/lz4/lib/lz4.c)
+target_include_directories(hoki PRIVATE src third_party/lz4/lib)
 
 if(TARGET zstd::libzstd_shared)
     target_link_libraries(hoki PRIVATE zstd::libzstd_shared)
