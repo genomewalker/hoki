@@ -206,7 +206,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int n_buckets = 1,
                           int n_threads_override = 0,
                           bool do_profile = false,
-                          int hot_threshold = 100) {
+                          int hot_threshold = 100,
+                          int out_compress_level = -1) {
+    if (out_compress_level < 0) out_compress_level = zstd_level;
 
     // Pass 1: scan all inputs, collect per-HOG MergeRefs (offsets only).
     std::vector<MergeRef> refs;
@@ -310,6 +312,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             if (!fd_opened[fi].load(std::memory_order_relaxed)) {
                 int fd = open(input_paths[fi].c_str(), O_RDONLY);
                 if (fd < 0) throw std::runtime_error("cannot open: " + input_paths[fi]);
+                posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
                 src_fds[fi].fd = fd;
                 fd_opened[fi].store(true, std::memory_order_release);
             }
@@ -854,7 +857,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     auto worker = [&]() {
         ZSTD_CCtx* cctx = ZSTD_createCCtx();
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
-        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, zstd_level);
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, out_compress_level);
         std::vector<uint8_t> cbuf_in, raw_block, inv_raw, hog_cbuf;
         WorkerScratch scratch;
         uint64_t tl_decode = 0, tl_build = 0, tl_compress = 0;
