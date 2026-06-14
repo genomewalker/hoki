@@ -20,6 +20,7 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+  try {
     if (argc < 2) { usage(argv[0]); return 1; }
     std::string mode = argv[1];
 
@@ -137,4 +138,8 @@ int main(int argc, char* argv[]) {
 
     usage(argv[0]);
     return 1;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
 }

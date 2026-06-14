@@ -231,6 +231,10 @@ inline bool read_hog_inverted(const std::string& lhg_path,
     {
         UniqueFd fd(open(lhg_path.c_str(), O_RDONLY));
         if (fd < 0) throw std::runtime_error("cannot open: " + lhg_path);
+        uint8_t fhdr[LHG_HEADER_SZ];
+        if (::read(fd, fhdr, LHG_HEADER_SZ) != ssize_t(LHG_HEADER_SZ) ||
+            memcmp(fhdr, LHG_FILE_MAGIC, 4) != 0 || fhdr[4] != LHG_VERSION)
+            throw std::runtime_error("bad or incompatible .lhg: " + lhg_path);
         if (lseek(fd, off_t(entry.data_offset), SEEK_SET) < 0)
             throw std::runtime_error("seek failed in: " + lhg_path);
         uint8_t hoe_magic[4];
