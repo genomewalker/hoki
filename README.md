@@ -1,7 +1,6 @@
 # hoki
 
-Position-centric inverted index over diamond blastx codon observations, keyed by
-OMA HOG. Answers `(HOG, hog_pos[, AA]) → {acc_id, codon, unitig}` in O(log n_hogs).
+Position-centric inverted index over diamond blastx codon observations, keyed by OMA HOG.
 
 **Deps**: C++17, zstd ≥1.4, cmake ≥3.16.
 
@@ -157,9 +156,8 @@ Index section (at index_offset; also written standalone as .lhgi):
     varint(len) + acc_id
 ```
 
-Raw fallback: singleton HOGs whose payload would expand under zstd are stored
-uncompressed (bit 31 of `stored_sz` set). Saves the ~10-byte zstd frame overhead
-on the ~90% singleton HOGs typical at <10 accessions.
+Raw fallback: if `ZSTD_compress` expands the payload, bit 31 of `stored_sz` is set
+and the payload is stored uncompressed.
 
 ### `.lhgi` — standalone index
 
@@ -172,18 +170,3 @@ range-GET `.lhg[data_offset : data_offset+data_length]` per HOG.
 
 Unsigned LEB128: 7 bits/byte, LSB first, high bit = continuation.
 
----
-
-## Compression (5 barley SRA accessions, 39 357 HOGs)
-
-| | bytes |
-|---|---|
-| TSV raw | 85 MB |
-| TSV −full\_qseq | 40 MB |
-| `.lhb` sum | 15 MB |
-| `.lhg` | **14 MB** |
-| `.lhgi` | 1.3 MB |
-
-vs TSV raw −83.5%; vs TSV−full\_qseq −64.5%.  
-At ≥16k accessions: cross-accession codon redundancy in HOG-level zstd-19 drives
-`codon_idx` column to near-zero entropy; expected >90% vs TSV.
