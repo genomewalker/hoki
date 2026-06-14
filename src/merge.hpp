@@ -13,33 +13,9 @@
 #include <iostream>
 #include <zstd.h>
 
-// Merge N .lhb batch files → .lhg (global, v5 inverted) + .lhgi (index).
-//
-// v5 inverts the per-accession .lhb blocks into position-centric records.
-// The .lhb format stays v4 (unchanged); inversion happens here at merge time.
-//
-//   Pass 1: scan each .lhb sequentially (one open at a time) → collect
-//           BatchBlockRef (offsets only, no payload read). Sort by (hog_id, acc_id).
-//
-//   Between passes: build the global accession registry — collect all unique
-//           acc_ids, sort alphabetically → acc_id_to_idx (stable integer IDs).
-//
-//   Pass 2: iterate HOG groups. For each HOG:
-//             For each block (acc_id, batch_file_idx, offset):
-//               pread ShardBlockHeader + compressed payload → decompress.
-//               Parse local contig dict; deserialize_varnt_block().
-//               For each record r, for each obs:
-//                 hog_pos   = r.sstart + obs.hog_offset
-//                 codon_idx = obs.packed_codon >> 2
-//                 unitig_id = local_contigs[r.contig_idx]
-//                 inverted[hog_pos].push_back({acc_idx, codon_idx, unitig_id})
-//             Sort each position's obs by acc_idx.
-//             Build per-HOG local unitig dict; serialize inverted block.
-//             HOG-level zstd compress (level 19). Write entry.
-//
-//   Pass 3: write HOG index + accession registry → .lhgi; backfill header.
-//
-// FDs: at most 2 open simultaneously (one source .lhb + the output .lhg).
+// Merge N .lhb (v4 per-accession) batch files into one position-centric .lhg
+// plus its .lhgi index. Inversion happens here; the .lhb format is unchanged.
+// At most 2 FDs are open at once: one source .lhb + the output .lhg.
 
 namespace lhi {
 
@@ -48,7 +24,7 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
                           const std::string& out_lhgi,
                           int zstd_level = 19) {
 
-    // ── Pass 1: scan all .lhb, collect refs ───────────────────────────────────
+    // Pass 1: scan all .lhb, collect block refs (offsets only).
     std::vector<BatchBlockRef> refs;
     refs.reserve(batch_paths.size() * 512);
 
@@ -65,14 +41,14 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
     std::cerr << "merge: " << refs.size() << " blocks from "
               << batch_paths.size() << " batches\n";
 
-    // Sort by (hog_id, acc_id) so HOG groups are contiguous.
+    // (hog_id, acc_id) order makes HOG groups contiguous for streaming.
     std::stable_sort(refs.begin(), refs.end(),
         [](const BatchBlockRef& a, const BatchBlockRef& b) {
             if (a.hog_id != b.hog_id) return a.hog_id < b.hog_id;
             return a.acc_id < b.acc_id;
         });
 
-    // ── Build global accession registry ───────────────────────────────────────
+    // Global accession registry: sorted unique acc_ids → stable integer idx.
     std::vector<std::string> accessions;
     accessions.reserve(refs.size());
     for (const auto& r : refs) accessions.push_back(r.acc_id);
@@ -83,7 +59,6 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
     acc_id_to_idx.reserve(accessions.size() * 2);
     for (uint32_t i = 0; i < accessions.size(); ++i) acc_id_to_idx[accessions[i]] = i;
 
-    // ── Open output file (sequential writes via write_all) ────────────────────
     int out_fd = open(out_lhg.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out_fd < 0) throw std::runtime_error("cannot create: " + out_lhg);
 
@@ -104,7 +79,7 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
     write_all(file_hdr, LHG_HEADER_SZ);
     uint64_t write_pos = LHG_HEADER_SZ;
 
-    // ── Pass 2: HOG-streaming inversion + compression ─────────────────────────
+    // Pass 2: HOG-streaming inversion + compression.
     std::vector<HogIndexEntry> index_entries;
     index_entries.reserve(4096);
 
@@ -231,7 +206,6 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
         if (ZSTD_isError(csz))
             throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
 
-        // ── Write HOG entry: "LHHE" + stored_sz + payload ─────────────────────
         // Raw fallback: if zstd doesn't shrink the block, store raw (high bit set).
         bool use_raw = (csz >= inv_raw.size());
         uint32_t stored_sz = use_raw ? (uint32_t(inv_raw.size()) | 0x80000000u)
@@ -261,7 +235,7 @@ inline void merge_batches(const std::vector<std::string>& batch_paths,
 
     uint64_t index_offset = write_pos;
 
-    // ── Pass 3: write index + accession registry; fill in file header ─────────
+    // Pass 3: write index + accession registry; backfill file header.
     auto idx_bytes = build_index_bytes(index_entries, accessions);
     write_all(idx_bytes.data(), idx_bytes.size());
 

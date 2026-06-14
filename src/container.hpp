@@ -52,7 +52,6 @@ struct ShardBlockHeader {
 static_assert(sizeof(ShardBlockHeader) == 28);
 #pragma pack(pop)
 
-// POSIX write lock (fcntl F_SETLKW) — NFS-safe, unlike flock().
 inline void posix_wlock(int fd) {
     struct flock fl{};
     fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET; fl.l_start = 0; fl.l_len = 0;
@@ -73,7 +72,7 @@ inline std::string hog_to_filename(const std::string& hog_id) {
 }
 
 // Serialize local contig dict + VarNT block, compress, write to open fd.
-// Caller must hold flock(LOCK_EX) on fd before calling.
+// Caller must hold the POSIX write lock (posix_wlock) on fd before calling.
 inline void write_shard_block(int fd,
                                const std::vector<std::string>& global_contigs,
                                std::vector<VarNTRecord>& recs,

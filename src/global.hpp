@@ -16,7 +16,7 @@
 //
 // .lhg layout:
 //   "LHGG" (4)
-//   version (1) = LHG_VERSION (3)
+//   version (1) = LHG_VERSION
 //   flags   (1) = 0
 //   pad[2]
 //   index_offset (8)  ← byte offset of "LHGI" section from file start
@@ -60,7 +60,7 @@ constexpr uint8_t LHG_FILE_MAGIC[4]      = {'L','H','G','G'};
 constexpr uint8_t LHG_INDEX_MAGIC[4]     = {'L','H','G','I'};
 constexpr uint8_t LHG_ACC_MAGIC[4]       = {'L','H','G','A'};
 constexpr uint8_t LHG_HOG_ENTRY_MAGIC[4] = {'L','H','H','E'};
-constexpr uint8_t LHG_VERSION            = 4;  // v5c: numeric unitig dict + raw fallback + delta hog_pos
+constexpr uint8_t LHG_VERSION            = 4;
 constexpr size_t  LHG_HEADER_SZ          = 16; // magic(4)+ver(1)+flags(1)+pad(2)+index_offset(8)
 
 struct HogIndexEntry {
@@ -174,18 +174,15 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
     write_varint(raw, uint32_t(positions.size()));
     uint32_t prev_pos = 0;
     for (const auto& pos : positions) {
-        write_varint(raw, pos.hog_pos - prev_pos);  // delta (first = absolute)
+        write_varint(raw, pos.hog_pos - prev_pos);  // delta; first = absolute
         prev_pos = pos.hog_pos;
         write_varint(raw, uint32_t(pos.obs.size()));
-        // acc_idx column: delta-varints (first absolute).
         uint32_t prev = 0;
         for (const auto& o : pos.obs) {
             write_varint(raw, o.acc_idx - prev);
             prev = o.acc_idx;
         }
-        // codon_idx column: raw bytes.
         for (const auto& o : pos.obs) raw.push_back(o.codon_idx);
-        // unitig_idx column: varints.
         for (const auto& o : pos.obs) write_varint(raw, o.unitig_idx);
     }
 }

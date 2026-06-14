@@ -10,37 +10,12 @@
 
 static void usage(const char* prog) {
     std::cerr
-        << "hoki — HOG codon Index (v5 position-centric inverted format)\n"
-        << "Usage:\n"
-        << "  " << prog << " convert -a ACC [-z LVL] [-b RECS] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
+        << "hoki — HOG codon Index\n"
+        << "  " << prog << " convert -a ACC [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
         << "  " << prog << " merge   <out.lhg> <out.lhgi> <batch1.lhb> [batch2.lhb ...]\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID>\n"
-        << "  " << prog << " stat    <file.lhb>   — show HOG/block counts for a batch file\n"
-        << "  " << prog << " stat    <global.lhg> [<global.lhgi>] — list all HOGs with offsets\n"
-        << "\n"
-        << "convert: diamond blastx TSV → .lhb batch file (one per accession, v4 format)\n"
-        << "  Column layout: qseqid qstart qend qlen qstrand sseqid sstart send slen\n"
-        << "                 pident evalue cigar qseq_translated full_qseq\n"
-        << "  Stores codon-resolved VarNT records. 100%% pident alignments skipped.\n"
-        << "  -a ACC   accession ID (SRA/ENA run ID, required)\n"
-        << "  -z LVL   zstd compression level (default 9)\n"
-        << "  -b RECS  records per HOG flush (default 50000)\n"
-        << "  -p PCT   minimum pident %% (default 0)\n"
-        << "  -e EV    max evalue (default 1.0)\n"
-        << "  -v       verbose parse errors\n"
-        << "\n"
-        << "merge: merge N .lhb batch files → one v5 inverted .lhg + .lhgi index\n"
-        << "  Inverts per-accession blocks into position-centric records.\n"
-        << "  HOGs are sorted lexicographically; .lhgi carries the accession registry.\n"
-        << "\n"
-        << "saav: query all accessions observed at HOG position POS\n"
-        << "  POS   HOG position (matches r.sstart + obs offset)\n"
-        << "  AA    optional amino-acid letter filter\n"
-        << "  Output TSV: acc_id\\tunitig_id\\thog_pos\\tobs_aa\\tcodon\n"
-        << "\n"
-        << "freq: per-position codon frequency table for a HOG\n"
-        << "  Output TSV: hog_pos\\tcodon\\tobs_aa\\tn_accessions\n";
+        << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -54,7 +29,6 @@ int main(int argc, char* argv[]) {
             std::string a = argv[i];
             if      (a == "-a" && i+1 < argc) opts.acc_id     = argv[++i];
             else if (a == "-z" && i+1 < argc) opts.zstd_level = std::stoi(argv[++i]);
-            else if (a == "-b" && i+1 < argc) opts.block_recs = std::stoul(argv[++i]);
             else if (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
             else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
             else if (a == "-v")               opts.verbose    = true;
@@ -78,7 +52,6 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "saav") {
-        // hoki saav <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]
         if (argc < 6) { usage(argv[0]); return 1; }
         std::string lhg_path  = argv[2];
         std::string lhgi_path = argv[3];
@@ -97,7 +70,6 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "freq") {
-        // hoki freq <global.lhg> <global.lhgi> <HOG_ID>
         if (argc < 5) { usage(argv[0]); return 1; }
         std::string lhg_path  = argv[2];
         std::string lhgi_path = argv[3];
@@ -113,7 +85,6 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "stat") {
-        // hoki stat <file.lhb|global.lhg> [<global.lhgi>]
         if (argc < 3) { usage(argv[0]); return 1; }
         std::string path = argv[2];
 

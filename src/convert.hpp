@@ -11,9 +11,6 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cstring>
-#include <cstdlib>
-#include <cstdio>
-#include <limits>
 #include <charconv>
 
 namespace lhi {
@@ -21,7 +18,6 @@ namespace lhi {
 struct ConvertOptions {
     std::string acc_id;          // SRA/ENA accession (required for .lhb output)
     int    zstd_level = 9;
-    size_t block_recs = 50000;
     float  min_pident = 0.0f;
     double max_evalue = 1.0;
     bool   verbose    = false;
@@ -47,13 +43,6 @@ inline int8_t make_qframe(std::string_view qstrand, uint32_t qstart,
                           : (qstart > 0  ? qstart - 1  : 0);
     int frame = int(base % 3) + 1;
     return int8_t(minus ? -frame : frame);
-}
-
-inline double parse_double(std::string_view sv) {
-    char buf[64];
-    size_t n = std::min(sv.size(), sizeof(buf) - 1);
-    std::memcpy(buf, sv.data(), n); buf[n] = '\0';
-    char* end; return std::strtod(buf, &end);
 }
 
 inline void revcomp_codon(uint8_t c[3]) {
@@ -165,15 +154,12 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
 
             uint8_t c0, c1, c2;
             if (qframe > 0) {
-                // Plus strand: i-th codon starts at (qstart-1) + q_off*3 (0-based)
                 size_t cs = size_t(qstart-1) + size_t(q_off)*3;
                 if (cs+2 >= full_nt.size()) continue;
                 c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
             } else {
-                // Minus strand: diamond reports qstart > qend.
-                // The i-th codon (0-based) is at 0-indexed positions:
-                //   (qstart-1) - q_off*3 - 2  ..  (qstart-1) - q_off*3
-                // Read those 3 nt and reverse-complement.
+                // Minus strand: diamond reports qstart > qend; codon i sits at
+                // [(qstart-1) - q_off*3 - 2 .. (qstart-1) - q_off*3], revcomp'd.
                 if (size_t(q_off)*3 + 3 > size_t(qstart)) continue;
                 size_t cs = size_t(qstart-1) - size_t(q_off)*3 - 2;
                 if (cs+2 >= full_nt.size()) continue;
@@ -207,9 +193,8 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
         ++n_written;
     }
 
-    // Remove intermediate flush from parse loop — hold all records until end,
-    // then flush in HOG-ID sorted order so .lhb blocks are lexicographically sorted.
-    // This enables streaming k-way merge in hoki merge.
+    // Flush in HOG-ID order so .lhb blocks are lexicographically sorted, which
+    // lets hoki merge do a streaming k-way merge.
     std::vector<uint32_t> sorted_idxs;
     sorted_idxs.reserve(batches.size());
     for (auto& [hog_idx, recs] : batches)

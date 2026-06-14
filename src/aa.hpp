@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <string_view>
 #include <array>
-#include <cmath>
 
 namespace lhi {
 
@@ -27,17 +26,6 @@ constexpr auto AA_TABLE = build_aa_table();
 inline uint8_t encode_aa(char c) {
     auto u = static_cast<unsigned char>(c);
     return (u < 128) ? AA_TABLE[u] : AA_UNK;
-}
-inline char decode_aa(uint8_t v) {
-    if (v < 20) return AA_ALPHA[v];
-    if (v == AA_GAP) return '-';
-    return 'X';
-}
-
-// log10 of evalue, clamped to float range, for block-header skip fields only
-inline float evalue_log(double ev) {
-    if (ev <= 0.0) return -300.0f;
-    return static_cast<float>(std::log10(ev));
 }
 
 } // namespace lhi
