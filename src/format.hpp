@@ -2,9 +2,11 @@
 #include "aa.hpp"
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <array>
+#include <algorithm>
 
 // hoki — HOG codon Index
 // Wire format helpers shared by container.hpp and cigar.hpp.
@@ -52,6 +54,33 @@ inline double read_f64(const uint8_t* p) {
     uint64_t x = 0; for (int i = 0; i < 8; ++i) x |= uint64_t(p[i]) << (8 * i);
     double v; std::memcpy(&v, &x, 8); return v;
 }
+// uint16 LE
+inline void write_u16(std::vector<uint8_t>& b, uint16_t v) {
+    b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8));
+}
+inline uint16_t read_u16(const uint8_t* p) {
+    return uint16_t(p[0]) | uint16_t(uint16_t(p[1]) << 8);
+}
+// int16 LE
+inline void write_i16(std::vector<uint8_t>& b, int16_t v) {
+    write_u16(b, uint16_t(v));
+}
+inline int16_t read_i16(const uint8_t* p) {
+    return int16_t(read_u16(p));
+}
+// Encode pident (0..100 float) → uint16 (×10, range 0–1000)
+inline uint16_t encode_pident(float p)  { return uint16_t(std::lroundf(p * 10.0f)); }
+inline float    decode_pident(uint16_t q) { return q / 10.0f; }
+// Encode evalue → int16 (floor(log10(e)×100), clamped to [−32767, 0]).
+// Reconstruct via pow(10, q/100.0).  Precision: ~3 sig-figs of the exponent.
+inline int16_t encode_evalue(double e) {
+    if (e <= 0.0) return int16_t(-32767);
+    double x = std::round(std::log10(e) * 100.0);
+    if (x < -32767.0) x = -32767.0;
+    if (x >     0.0)  x =     0.0;
+    return int16_t(x);
+}
+inline double decode_evalue(int16_t q) { return std::pow(10.0, q / 100.0); }
 
 // ── Standard genetic code ─────────────────────────────────────────────────────
 // codon_idx = packed_codon >> 2 = (nt0<<4)|(nt1<<2)|nt2  (A=0, C=1, G=2, T=3)
@@ -102,31 +131,66 @@ inline void unpack_codon(uint8_t pk, char* out) {
     out[0] = B[(pk >> 6) & 3]; out[1] = B[(pk >> 4) & 3]; out[2] = B[(pk >> 2) & 3];
 }
 
+// ── 6-bit codon packing ───────────────────────────────────────────────────────
+// codon_idx = packed_codon >> 2 (6 bits, 64 values).  4 indices fit in 3 bytes.
+// Bit layout for a group of 4 values a,b,c,d packed into bytes B0,B1,B2:
+//   B0 = (a<<2)|(b>>4)   B1 = (b<<4)|(c>>2)   B2 = (c<<6)|d
+// n values need ceil(n*6/8) bytes.
+
+inline size_t six_bit_packed_size(size_t n) { return (n * 6 + 7) / 8; }
+
+inline void pack_6bit(uint8_t* dst, const uint8_t* src, size_t n) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        size_t rem = n - i;
+        uint8_t a = src[i];
+        uint8_t b = rem > 1 ? src[i+1] : 0;
+        uint8_t c = rem > 2 ? src[i+2] : 0;
+        uint8_t d = rem > 3 ? src[i+3] : 0;
+        dst[o++] = uint8_t((a << 2) | (b >> 4));
+        if (rem > 1) dst[o++] = uint8_t((b << 4) | (c >> 2));
+        if (rem > 2) dst[o++] = uint8_t((c << 6) |  d);
+    }
+}
+
+inline void unpack_6bit(const uint8_t* src, uint8_t* dst, size_t n) {
+    size_t in = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        size_t rem = n - i;
+        uint8_t b0 = src[in++];
+        uint8_t b1 = rem > 1 ? src[in++] : 0;
+        uint8_t b2 = rem > 2 ? src[in++] : 0;
+        dst[i]   = (b0 >> 2) & 0x3F;
+        if (rem > 1) dst[i+1] = uint8_t(((b0 & 3) << 4) | (b1 >> 4));
+        if (rem > 2) dst[i+2] = uint8_t(((b1 & 0xF) << 2) | (b2 >> 6));
+        if (rem > 3) dst[i+3] = b2 & 0x3F;
+    }
+}
+
 // ── VarNT record (codon-resolved alignment) ───────────────────────────────────
 //
 // On-disk inside a shard block payload (see container.hpp):
 //
-//   VarNT columnar block:
-//     varint  n_records
-//     varint  hdr_section_bytes
-//     varint  bmp_section_bytes
-//     varint  cdn_section_bytes
-//     [hdr section] per record:
-//       varint  contig_idx     — index into block-local contig list
-//       varint  hog_idx        — always 0 for single-HOG shards
-//       uint24  sstart         — 1-based HOG MSA position, coverage start
-//       uint24  send           — coverage end
-//       uint32  qstart/qend/qlen  — nt coords in query contig
-//       int8    qframe         — ±1..±3 (sign=strand, magnitude=reading frame)
-//       float32 pident
-//       float64 evalue
-//       varint  n_M            — number of codon observations in this record
-//     [bmp section] per record:
-//       ceil((send-sstart+1)/8) bytes, LSB-first
-//       bit i = 1 → HOG position (sstart+i) has an observed codon
-//     [cdn section]:
-//       one packed_codon byte per set bit, ascending position order
+// Format v4 — SoA HDR, sstart-sorted, delta sstart + span, raw-byte CDN:
+//   varint  n_records
+//   varint  contig_col_bytes  — size of contig_idx varint column
+//   varint  sstart_col_bytes  — size of sstart delta-varint column
+//   varint  span_col_bytes    — size of span varint column
+//   varint  bmp_section_bytes
+//   varint  n_codons          — total codon count across all records (= cdn bytes)
+//   [contig_idx column: n_records varints, contig_col_bytes total]
+//   [sstart column:  n_records delta-varints (first = absolute), sstart_col_bytes]
+//   [span column:    n_records varints (span = send - sstart + 1), span_col_bytes]
+//   [qframe column:  n_records × 1 byte (int8)]
+//   [pident column:  n_records × 2 bytes (uint16 ×10)]
+//   [evalue column:  n_records × 2 bytes (int16, floor(log10(e)×100))]
+//   [bmp section:    per-record bitmap, ceil(span/8) bytes each]
+//   [cdn section:    raw codon_idx bytes (one per codon), n_codons total]
 //
+// Records are sorted by sstart ascending before serialization, so the sstart
+// delta column is monotonically non-decreasing (typically 1 varint byte each).
+// n_M (observations per record) is NOT stored; derived at query time as the
+// popcount of the record's bitmap slice.
 // obs_aa is NOT stored; derived at query time: codon_to_aa(packed_codon).
 
 struct VarNTObs {
@@ -137,90 +201,140 @@ struct VarNTObs {
 
 struct VarNTRecord {
     uint32_t contig_idx;
-    uint32_t hog_idx;
     uint32_t sstart, send;
-    uint32_t qstart, qend, qlen;
-    int8_t   qframe;
+    int8_t   qframe;   // ±1..±3: sign=strand, magnitude=reading frame
     float    pident;
     double   evalue;
     std::vector<VarNTObs> vars;
 };
 
 inline void serialize_varnt_block(std::vector<uint8_t>& raw,
-                                   const std::vector<VarNTRecord>& recs) {
-    std::vector<uint8_t> hdr_buf, bmp_buf, cdn_buf;
-    for (auto& r : recs) {
-        write_varint(hdr_buf, r.contig_idx);
-        write_varint(hdr_buf, r.hog_idx);
-        write_u24(hdr_buf, r.sstart); write_u24(hdr_buf, r.send);
-        write_u32(hdr_buf, r.qstart); write_u32(hdr_buf, r.qend); write_u32(hdr_buf, r.qlen);
-        hdr_buf.push_back(uint8_t(r.qframe));
-        write_f32(hdr_buf, r.pident); write_f64(hdr_buf, r.evalue);
-        write_varint(hdr_buf, uint32_t(r.vars.size()));
+                                   std::vector<VarNTRecord> recs) {
+    const size_t N = recs.size();
 
-        uint32_t span   = r.send - r.sstart + 1;
+    // Sort by sstart ascending → monotone sstart column compresses far better
+    // and enables delta encoding.  recs is taken by value, caller untouched.
+    std::stable_sort(recs.begin(), recs.end(),
+        [](const VarNTRecord& a, const VarNTRecord& b) { return a.sstart < b.sstart; });
+
+    // SoA: build each column separately so zstd sees homogeneous data per field.
+    std::vector<uint8_t> contig_col, sstart_col, span_col, qframe_col,
+                         pident_col, evalue_col, bmp_buf;
+    std::vector<uint8_t> cdn_idx;  // raw codon indices (one byte each, value 0–63)
+    contig_col.reserve(N * 2);
+    sstart_col.reserve(N * 2); span_col.reserve(N * 2);
+    qframe_col.reserve(N);
+    pident_col.reserve(N * 2); evalue_col.reserve(N * 2);
+    bmp_buf.reserve(N * 16);
+    cdn_idx.reserve(N * 8);
+
+    uint32_t prev_sstart = 0;
+    for (const auto& r : recs) {
+        write_varint(contig_col, r.contig_idx);
+        write_varint(sstart_col, r.sstart - prev_sstart);  // delta (first = absolute)
+        prev_sstart = r.sstart;
+        uint32_t span = r.send - r.sstart + 1;
+        write_varint(span_col, span);
+        qframe_col.push_back(uint8_t(r.qframe));
+        write_u16(pident_col, encode_pident(r.pident));
+        write_i16(evalue_col, encode_evalue(r.evalue));
+
         uint32_t bmp_sz = (span + 7) / 8;
         size_t   bmp_off = bmp_buf.size();
         bmp_buf.resize(bmp_off + bmp_sz, 0);
-        for (auto& v : r.vars)
+        for (const auto& v : r.vars) {
             bmp_buf[bmp_off + v.hog_offset / 8] |= uint8_t(1u << (v.hog_offset & 7));
-        for (auto& v : r.vars)
-            cdn_buf.push_back(v.packed_codon);
+            cdn_idx.push_back(uint8_t(v.packed_codon >> 2));  // raw 6-bit value in a byte
+        }
     }
-    write_varint(raw, uint32_t(recs.size()));
-    write_varint(raw, uint32_t(hdr_buf.size()));
+
+    // Header: sizes of variable-width columns; fixed columns derivable from N.
+    write_varint(raw, uint32_t(N));
+    write_varint(raw, uint32_t(contig_col.size()));
+    write_varint(raw, uint32_t(sstart_col.size()));
+    write_varint(raw, uint32_t(span_col.size()));
     write_varint(raw, uint32_t(bmp_buf.size()));
-    write_varint(raw, uint32_t(cdn_buf.size()));
-    raw.insert(raw.end(), hdr_buf.begin(), hdr_buf.end());
-    raw.insert(raw.end(), bmp_buf.begin(), bmp_buf.end());
-    raw.insert(raw.end(), cdn_buf.begin(), cdn_buf.end());
+    write_varint(raw, uint32_t(cdn_idx.size()));  // n_codons (= cdn section bytes)
+
+    // Columns in order: contig, sstart, span (all varint), fixed (1+2+2 ×N), bmp, cdn.
+    raw.insert(raw.end(), contig_col.begin(), contig_col.end());
+    raw.insert(raw.end(), sstart_col.begin(), sstart_col.end());
+    raw.insert(raw.end(), span_col.begin(),   span_col.end());
+    raw.insert(raw.end(), qframe_col.begin(), qframe_col.end());
+    raw.insert(raw.end(), pident_col.begin(), pident_col.end());
+    raw.insert(raw.end(), evalue_col.begin(), evalue_col.end());
+    raw.insert(raw.end(), bmp_buf.begin(),    bmp_buf.end());
+    raw.insert(raw.end(), cdn_idx.begin(),    cdn_idx.end());
 }
 
 inline bool deserialize_varnt_block(const uint8_t* p, const uint8_t* end,
                                      std::vector<VarNTRecord>& out) {
     int n;
-    uint32_t n_recs = 0, hdr_bytes = 0, bmp_bytes = 0, cdn_bytes = 0;
-    n = read_varint(p, end, &n_recs);    if (!n) return false; p += n;
-    n = read_varint(p, end, &hdr_bytes); if (!n) return false; p += n;
-    n = read_varint(p, end, &bmp_bytes); if (!n) return false; p += n;
-    n = read_varint(p, end, &cdn_bytes); if (!n) return false; p += n;
+    uint32_t n_recs = 0, contig_bytes = 0, sstart_bytes = 0, span_bytes = 0,
+             bmp_bytes = 0, n_codons = 0;
+    n = read_varint(p, end, &n_recs);       if (!n) return false; p += n;
+    n = read_varint(p, end, &contig_bytes); if (!n) return false; p += n;
+    n = read_varint(p, end, &sstart_bytes); if (!n) return false; p += n;
+    n = read_varint(p, end, &span_bytes);   if (!n) return false; p += n;
+    n = read_varint(p, end, &bmp_bytes);    if (!n) return false; p += n;
+    n = read_varint(p, end, &n_codons);     if (!n) return false; p += n;
 
-    const uint8_t* hdr_ptr = p,            *hdr_end = p + hdr_bytes;
-    const uint8_t* bmp_ptr = hdr_end,      *bmp_end = hdr_end + bmp_bytes;
-    const uint8_t* cdn_ptr = bmp_end,      *cdn_end = bmp_end + cdn_bytes;
-    if (cdn_end > end) return false;
+    // Fixed-column sizes are derivable from n_recs (qframe+pident+evalue).
+    size_t fixed_sz = size_t(n_recs) * (1 + 2 + 2);
+    if (p + contig_bytes + sstart_bytes + span_bytes + fixed_sz + bmp_bytes + n_codons > end)
+        return false;
+
+    const uint8_t* contig_ptr = p;                   p += contig_bytes;
+    const uint8_t* contig_end = p;
+    const uint8_t* sstart_ptr = p;                   p += sstart_bytes;
+    const uint8_t* sstart_end = p;
+    const uint8_t* span_ptr   = p;                   p += span_bytes;
+    const uint8_t* span_end   = p;
+    const uint8_t* qframe_ptr = p;                   p += 1 * n_recs;
+    const uint8_t* pident_ptr = p;                   p += 2 * n_recs;
+    const uint8_t* evalue_ptr = p;                   p += 2 * n_recs;
+    const uint8_t* bmp_ptr    = p;                   p += bmp_bytes;
+    const uint8_t* bmp_end_p  = p;
+    const uint8_t* cdn_ptr    = p;                   p += n_codons;  // raw byte per codon
+    size_t cdn_off = 0;
 
     out.resize(n_recs);
-    std::vector<uint32_t> n_Ms(n_recs);
-
+    uint32_t prev_sstart = 0;
     for (uint32_t i = 0; i < n_recs; ++i) {
         auto& r = out[i];
-        n = read_varint(hdr_ptr, hdr_end, &r.contig_idx); if (!n) return false; hdr_ptr += n;
-        n = read_varint(hdr_ptr, hdr_end, &r.hog_idx);    if (!n) return false; hdr_ptr += n;
-        if (hdr_ptr + 31 > hdr_end) return false;
-        r.sstart = read_u24(hdr_ptr); hdr_ptr += 3;
-        r.send   = read_u24(hdr_ptr); hdr_ptr += 3;
-        r.qstart = read_u32(hdr_ptr); hdr_ptr += 4;
-        r.qend   = read_u32(hdr_ptr); hdr_ptr += 4;
-        r.qlen   = read_u32(hdr_ptr); hdr_ptr += 4;
-        r.qframe = int8_t(*hdr_ptr++);
-        r.pident = read_f32(hdr_ptr); hdr_ptr += 4;
-        r.evalue = read_f64(hdr_ptr); hdr_ptr += 8;
-        n = read_varint(hdr_ptr, hdr_end, &n_Ms[i]); if (!n) return false; hdr_ptr += n;
-    }
+        uint32_t ci = 0;
+        n = read_varint(contig_ptr, contig_end, &ci); if (!n) return false;
+        contig_ptr += n;
+        r.contig_idx = ci;
 
-    for (uint32_t i = 0; i < n_recs; ++i) {
-        auto& r = out[i];
-        uint32_t span   = r.send - r.sstart + 1;
+        uint32_t dss = 0;
+        n = read_varint(sstart_ptr, sstart_end, &dss); if (!n) return false;
+        sstart_ptr += n;
+        r.sstart = prev_sstart + dss;  // cumulative sum of deltas
+        prev_sstart = r.sstart;
+
+        uint32_t span = 0;
+        n = read_varint(span_ptr, span_end, &span); if (!n) return false; span_ptr += n;
+        if (span == 0) return false;          // corrupt: span ≥ 1
+        r.send = r.sstart + span - 1;
+
+        r.qframe = int8_t(*qframe_ptr++);
+        r.pident = decode_pident(read_u16(pident_ptr)); pident_ptr += 2;
+        r.evalue = decode_evalue(read_i16(evalue_ptr)); evalue_ptr += 2;
+
         uint32_t bmp_sz = (span + 7) / 8;
-        uint32_t n_M    = n_Ms[i];
-        if (bmp_ptr + bmp_sz > bmp_end || cdn_ptr + n_M > cdn_end) return false;
+        if (bmp_ptr + bmp_sz > bmp_end_p) return false;  // bitmap overrun guard
+        // n_M derived as popcount of this record's bitmap slice.
+        uint32_t n_M = 0;
+        for (uint32_t b = 0; b < bmp_sz; ++b) n_M += uint32_t(__builtin_popcount(bmp_ptr[b]));
         r.vars.clear(); r.vars.reserve(n_M);
         for (uint32_t b = 0; b < span; ++b) {
             if (bmp_ptr[b / 8] & (1u << (b & 7))) {
+                if (cdn_off >= n_codons) return false;
+                uint8_t ci6 = cdn_ptr[cdn_off++];
                 VarNTObs obs;
                 obs.hog_offset   = b;
-                obs.packed_codon = *cdn_ptr++;
+                obs.packed_codon = uint8_t(ci6 << 2);  // 6→8 bit (lower 2 bits always 0)
                 obs.obs_aa       = codon_to_aa(obs.packed_codon);
                 r.vars.push_back(obs);
             }

@@ -1,34 +1,46 @@
 #include "convert.hpp"
-#include "query.hpp"
+#include "merge.hpp"
+#include "global.hpp"
+#include "aa.hpp"
 #include <iostream>
 #include <string>
+#include <vector>
+#include <unordered_map>
+#include <sys/stat.h>
 
 static void usage(const char* prog) {
     std::cerr
-        << "hoki — HOG codon Index\n"
+        << "hoki — HOG codon Index (v5 position-centric inverted format)\n"
         << "Usage:\n"
-        << "  " << prog << " convert [-z LEVEL] [-b RECS] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <container.lhc>\n"
-        << "  " << prog << " varnt   [-p MINPID] [-e MAXEV] <container.lhc> <HOG_ID> [POS [OBS_AA]]\n"
-        << "  " << prog << " tile    [-p MINPID] [-e MAXEV] [-n MIN_ACC] <container.lhc> <HOG_ID>\n"
+        << "  " << prog << " convert -a ACC [-z LVL] [-b RECS] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
+        << "  " << prog << " merge   <out.lhg> <out.lhgi> <batch1.lhb> [batch2.lhb ...]\n"
+        << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]\n"
+        << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID>\n"
+        << "  " << prog << " stat    <file.lhb>   — show HOG/block counts for a batch file\n"
+        << "  " << prog << " stat    <global.lhg> [<global.lhgi>] — list all HOGs with offsets\n"
         << "\n"
-        << "convert: diamond blastx TSV → HOG-sharded container directory\n"
+        << "convert: diamond blastx TSV → .lhb batch file (one per accession, v4 format)\n"
         << "  Column layout: qseqid qstart qend qlen qstrand sseqid sstart send slen\n"
         << "                 pident evalue cigar qseq_translated full_qseq\n"
-        << "  Writes VarNT records (codon-resolved). 100%% pident alignments are skipped.\n"
-        << "  Safe for concurrent writers: each HOG shard uses flock(LOCK_EX).\n"
-        << "  -z LEVEL   zstd compression level (default 3)\n"
-        << "  -b RECS    records per shard flush (default 50000)\n"
-        << "  -p MINPID  minimum pident %% (default 0)\n"
-        << "  -e MAXEV   max evalue (default 1.0)\n"
-        << "  -v         verbose: print parse errors\n"
+        << "  Stores codon-resolved VarNT records. 100%% pident alignments skipped.\n"
+        << "  -a ACC   accession ID (SRA/ENA run ID, required)\n"
+        << "  -z LVL   zstd compression level (default 9)\n"
+        << "  -b RECS  records per HOG flush (default 50000)\n"
+        << "  -p PCT   minimum pident %% (default 0)\n"
+        << "  -e EV    max evalue (default 1.0)\n"
+        << "  -v       verbose parse errors\n"
         << "\n"
-        << "varnt: query codon-level variants for a HOG\n"
-        << "  POS        1-based HOG position (omit for all positions)\n"
-        << "  OBS_AA     filter to a specific amino acid letter\n"
-        << "  Output TSV: contig_id\\thog_pos\\tobs_aa\\tcodon\\tpident\\tevalue\n"
+        << "merge: merge N .lhb batch files → one v5 inverted .lhg + .lhgi index\n"
+        << "  Inverts per-accession blocks into position-centric records.\n"
+        << "  HOGs are sorted lexicographically; .lhgi carries the accession registry.\n"
         << "\n"
-        << "tile: find tiling gaps across accessions for a HOG\n"
-        << "  -n MIN_ACC   min accessions showing gap to report (default 2)\n";
+        << "saav: query all accessions observed at HOG position POS\n"
+        << "  POS   HOG position (matches r.sstart + obs offset)\n"
+        << "  AA    optional amino-acid letter filter\n"
+        << "  Output TSV: acc_id\\tunitig_id\\thog_pos\\tobs_aa\\tcodon\n"
+        << "\n"
+        << "freq: per-position codon frequency table for a HOG\n"
+        << "  Output TSV: hog_pos\\tcodon\\tobs_aa\\tn_accessions\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -37,54 +49,117 @@ int main(int argc, char* argv[]) {
 
     if (mode == "convert") {
         lhi::ConvertOptions opts;
-        std::string in_path, container_dir;
+        std::string in_path, lhb_path;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "-z" && i+1 < argc) opts.zstd_level = std::stoi(argv[++i]);
+            if      (a == "-a" && i+1 < argc) opts.acc_id     = argv[++i];
+            else if (a == "-z" && i+1 < argc) opts.zstd_level = std::stoi(argv[++i]);
             else if (a == "-b" && i+1 < argc) opts.block_recs = std::stoul(argv[++i]);
             else if (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
             else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
             else if (a == "-v")               opts.verbose    = true;
-            else if (in_path.empty())         in_path       = a;
-            else if (container_dir.empty())   container_dir = a;
+            else if (in_path.empty())         in_path         = a;
+            else if (lhb_path.empty())        lhb_path        = a;
         }
-        if (container_dir.empty()) { usage(argv[0]); return 1; }
-        lhi::convert(in_path, container_dir, opts);
+        if (lhb_path.empty() || opts.acc_id.empty()) { usage(argv[0]); return 1; }
+        lhi::convert(in_path, lhb_path, opts);
         return 0;
     }
 
-    if (mode == "varnt") {
-        lhi::QueryOptions opts;
-        std::string container_dir;
-        for (int i = 2; i < argc; ++i) {
-            std::string a = argv[i];
-            if      (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
-            else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
-            else if (container_dir.empty())   container_dir = a;
-            else if (opts.hog_id.empty())     opts.hog_id   = a;
-            else if (!opts.pos)               opts.pos      = uint32_t(std::stoul(a));
-            else                              opts.variant_aa = lhi::encode_aa(a[0]);
-        }
-        if (container_dir.empty() || opts.hog_id.empty()) { usage(argv[0]); return 1; }
-        lhi::query_varnt(container_dir, opts);
+    if (mode == "merge") {
+        if (argc < 5) { usage(argv[0]); return 1; }
+        std::string out_lhg  = argv[2];
+        std::string out_lhgi = argv[3];
+        std::vector<std::string> batches;
+        for (int i = 4; i < argc; ++i) batches.emplace_back(argv[i]);
+        if (batches.empty()) { usage(argv[0]); return 1; }
+        lhi::merge_batches(batches, out_lhg, out_lhgi);
         return 0;
     }
 
-    if (mode == "tile") {
-        float    min_pident = 0.0f;
-        double   max_evalue = 1.0;
-        uint32_t min_acc    = 2;
-        std::string container_dir, hog_id;
-        for (int i = 2; i < argc; ++i) {
-            std::string a = argv[i];
-            if      (a == "-p" && i+1 < argc) min_pident    = std::stof(argv[++i]);
-            else if (a == "-e" && i+1 < argc) max_evalue    = std::stod(argv[++i]);
-            else if (a == "-n" && i+1 < argc) min_acc       = uint32_t(std::stoul(argv[++i]));
-            else if (container_dir.empty())   container_dir = a;
-            else if (hog_id.empty())          hog_id        = a;
+    if (mode == "saav") {
+        // hoki saav <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]
+        if (argc < 6) { usage(argv[0]); return 1; }
+        std::string lhg_path  = argv[2];
+        std::string lhgi_path = argv[3];
+        std::string hog_id    = argv[4];
+        uint32_t    pos       = uint32_t(std::stoul(argv[5]));
+        uint8_t     aa        = lhi::AA_UNK;
+        if (argc >= 7) aa = lhi::encode_aa(argv[6][0]);
+
+        lhi::GlobalIndex idx;
+        if (!idx.load(lhgi_path) && !idx.load_from_lhg(lhg_path)) {
+            std::cerr << "cannot load index from " << lhgi_path << "\n";
+            return 1;
         }
-        if (container_dir.empty() || hog_id.empty()) { usage(argv[0]); return 1; }
-        lhi::query_tile(container_dir, hog_id, min_pident, max_evalue, min_acc);
+        lhi::query_saav(lhg_path, idx, hog_id, pos, aa);
+        return 0;
+    }
+
+    if (mode == "freq") {
+        // hoki freq <global.lhg> <global.lhgi> <HOG_ID>
+        if (argc < 5) { usage(argv[0]); return 1; }
+        std::string lhg_path  = argv[2];
+        std::string lhgi_path = argv[3];
+        std::string hog_id    = argv[4];
+
+        lhi::GlobalIndex idx;
+        if (!idx.load(lhgi_path) && !idx.load_from_lhg(lhg_path)) {
+            std::cerr << "cannot load index from " << lhgi_path << "\n";
+            return 1;
+        }
+        lhi::query_freq(lhg_path, idx, hog_id);
+        return 0;
+    }
+
+    if (mode == "stat") {
+        // hoki stat <file.lhb|global.lhg> [<global.lhgi>]
+        if (argc < 3) { usage(argv[0]); return 1; }
+        std::string path = argv[2];
+
+        // If .lhgi provided or path ends with .lhg → global stats.
+        if (argc >= 4 || (path.size() > 4 && path.substr(path.size()-4) == ".lhg")) {
+            std::string lhgi_path = (argc >= 4) ? argv[3]
+                                  : path.substr(0, path.size()-4) + ".lhgi";
+            lhi::GlobalIndex idx;
+            bool ok = idx.load(lhgi_path);
+            if (!ok) ok = idx.load_from_lhg(path);
+            if (!ok) { std::cerr << "cannot load index from " << lhgi_path << "\n"; return 1; }
+
+            struct stat st;
+            if (::stat(path.c_str(), &st) == 0)
+                std::fprintf(stdout, "file_size_mb\t%.1f\n", double(st.st_size) / (1024*1024));
+            std::fprintf(stdout, "n_hogs\t%zu\n", idx.entries.size());
+            std::fprintf(stdout, "n_accessions\t%zu\n", idx.accessions.size());
+
+            uint64_t total_pairs = 0;
+            for (auto& e : idx.entries) total_pairs += e.n_accessions;
+            std::fprintf(stdout, "total_hog_accession_pairs\t%llu\n",
+                         (unsigned long long)total_pairs);
+
+            std::printf("hog_id\tn_accessions\tdata_length_kb\n");
+            for (auto& e : idx.entries)
+                std::printf("%s\t%u\t%.1f\n", e.hog_id.c_str(),
+                            e.n_accessions,
+                            double(e.data_length) / 1024.0);
+        } else {
+            // .lhb stats
+            size_t n_blocks = 0;
+            std::string acc;
+            std::unordered_map<std::string, size_t> hog_blocks;
+            lhi::scan_batch_file(path, 0,
+                [&](const std::string& a) { acc = a; },
+                [&](lhi::BatchBlockRef ref) {
+                    ++n_blocks; hog_blocks[ref.hog_id]++;
+                });
+            std::printf("acc_id\t%s\n", acc.c_str());
+            std::printf("n_hogs\t%zu\n", hog_blocks.size());
+            std::printf("n_blocks\t%zu\n", n_blocks);
+            std::printf("hog_id\tn_blocks\n");
+            std::vector<std::pair<std::string,size_t>> hv(hog_blocks.begin(), hog_blocks.end());
+            std::sort(hv.begin(), hv.end());
+            for (auto& [h, n] : hv) std::printf("%s\t%zu\n", h.c_str(), n);
+        }
         return 0;
     }
 

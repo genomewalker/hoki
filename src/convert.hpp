@@ -2,25 +2,26 @@
 #include "format.hpp"
 #include "cigar.hpp"
 #include "aa.hpp"
-#include "container.hpp"
+#include "batch.hpp"
 #include <unordered_map>
 #include <string>
 #include <vector>
 #include <iostream>
 #include <fstream>
-#include <filesystem>
 #include <stdexcept>
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
 #include <limits>
+#include <charconv>
 
 namespace lhi {
 
 struct ConvertOptions {
-    int    zstd_level = 3;
-    size_t block_recs = 50000;  // records per shard flush batch
+    std::string acc_id;          // SRA/ENA accession (required for .lhb output)
+    int    zstd_level = 9;
+    size_t block_recs = 50000;
     float  min_pident = 0.0f;
     double max_evalue = 1.0;
     bool   verbose    = false;
@@ -55,7 +56,6 @@ inline double parse_double(std::string_view sv) {
     char* end; return std::strtod(buf, &end);
 }
 
-// Reverse-complement 3 nt bytes in place.
 inline void revcomp_codon(uint8_t c[3]) {
     auto rc = [](uint8_t b) -> uint8_t {
         switch (b) { case 'A':return 'T'; case 'T':return 'A'; case 'C':return 'G'; case 'G':return 'C'; default:return 'N'; }
@@ -64,14 +64,14 @@ inline void revcomp_codon(uint8_t c[3]) {
     c[0]=t[0]; c[1]=t[1]; c[2]=t[2];
 }
 
-// Convert diamond TSV → HOG-sharded container directory.
-// Only VarNT (codon-resolved, 100% pident skipped) records are written.
-// Multiple concurrent writers are safe: each HOG shard uses flock(LOCK_EX).
-inline void convert(const std::string& tsv_path, const std::string& container_dir,
+// Convert a diamond blastx TSV (outfmt 6 + qseq_translated + full_qseq columns)
+// to a .lhb batch file.  All HOGs go into a single output file; no per-HOG shards.
+inline void convert(const std::string& tsv_path, const std::string& lhb_path,
                     ConvertOptions opts) {
+    if (opts.acc_id.empty())
+        throw std::runtime_error("acc_id is required for .lhb output (use -a ACC)");
 
-    std::filesystem::create_directories(
-        std::filesystem::path(container_dir) / "shards");
+    BatchWriter batch(lhb_path, opts.acc_id);
 
     std::unordered_map<std::string, uint32_t> hog_dict, contig_dict;
     std::vector<std::string> hog_strings, contig_strings;
@@ -83,15 +83,12 @@ inline void convert(const std::string& tsv_path, const std::string& container_di
         return it->second;
     };
 
-    // Accumulate VarNT records per HOG index.
     std::unordered_map<uint32_t, std::vector<VarNTRecord>> batches;
 
     auto flush_hog = [&](uint32_t hog_idx) {
         auto it = batches.find(hog_idx);
         if (it == batches.end() || it->second.empty()) return;
-        auto shard = std::filesystem::path(container_dir) / "shards"
-                   / hog_to_filename(hog_strings[hog_idx]);
-        flush_hog_shard(shard, contig_strings, it->second, opts.zstd_level);
+        batch.write_block(hog_strings[hog_idx], contig_strings, it->second, opts.zstd_level);
         it->second.clear();
     };
 
@@ -120,21 +117,28 @@ inline void convert(const std::string& tsv_path, const std::string& container_di
         if (fi < 13) { if (opts.verbose) std::cerr << "skip L" << lineno << ": " << fi << " fields\n"; ++n_skipped; continue; }
         bool has_nt = (fi == 14 && !f[col::full_qseq].empty());
 
-        float  pident = float(parse_double(f[col::pident]));
-        double ev     = parse_double(f[col::evalue]);
+        float  pident = 0.0f;
+        double ev     = 0.0;
+        std::from_chars(f[col::pident].data(), f[col::pident].data() + f[col::pident].size(), pident);
+        std::from_chars(f[col::evalue].data(),  f[col::evalue].data()  + f[col::evalue].size(),  ev);
 
         if (pident < opts.min_pident) { ++n_skipped; continue; }
         if (ev     > opts.max_evalue) { ++n_skipped; continue; }
-        if (pident == 100.0f)         { ++n_skipped; continue; }  // no variant info at exact identity
+        if (pident == 100.0f)         { ++n_skipped; continue; }
 
-        uint32_t sstart, send, qstart, qend, qlen;
-        try {
-            sstart = uint32_t(std::stoul(std::string(f[col::sstart])));
-            send   = uint32_t(std::stoul(std::string(f[col::send])));
-            qstart = uint32_t(std::stoul(std::string(f[col::qstart])));
-            qend   = uint32_t(std::stoul(std::string(f[col::qend])));
-            qlen   = uint32_t(std::stoul(std::string(f[col::qlen])));
-        } catch (...) { if (opts.verbose) std::cerr << "parse error L" << lineno << "\n"; ++n_skipped; continue; }
+        uint32_t sstart = 0, send = 0, qstart = 0, qend = 0, qlen = 0;
+        {
+            auto fc = [](std::string_view sv, uint32_t& out) -> bool {
+                auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
+                return ec == std::errc{};
+            };
+            if (!fc(f[col::sstart], sstart) || !fc(f[col::send], send) ||
+                !fc(f[col::qstart], qstart) || !fc(f[col::qend], qend) ||
+                !fc(f[col::qlen],   qlen)) {
+                if (opts.verbose) std::cerr << "parse error L" << lineno << "\n";
+                ++n_skipped; continue;
+            }
+        }
         if (sstart > send) { ++n_skipped; continue; }
 
         std::string hog_id     = extract_hog(f[col::sseqid]);
@@ -146,9 +150,7 @@ inline void convert(const std::string& tsv_path, const std::string& container_di
 
         VarNTRecord vr;
         vr.contig_idx = contig_idx;
-        vr.hog_idx    = hog_idx;
         vr.sstart     = sstart; vr.send = send;
-        vr.qstart     = qstart; vr.qend = qend; vr.qlen = qlen;
         vr.qframe     = qframe;
         vr.pident     = pident; vr.evalue = ev;
 
@@ -163,33 +165,62 @@ inline void convert(const std::string& tsv_path, const std::string& container_di
 
             uint8_t c0, c1, c2;
             if (qframe > 0) {
+                // Plus strand: i-th codon starts at (qstart-1) + q_off*3 (0-based)
                 size_t cs = size_t(qstart-1) + size_t(q_off)*3;
                 if (cs+2 >= full_nt.size()) continue;
                 c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
             } else {
-                if (size_t(q_off)*3+2 > size_t(qend-1)) continue;
-                size_t cs = size_t(qend-1) - size_t(q_off)*3 - 2;
+                // Minus strand: diamond reports qstart > qend.
+                // The i-th codon (0-based) is at 0-indexed positions:
+                //   (qstart-1) - q_off*3 - 2  ..  (qstart-1) - q_off*3
+                // Read those 3 nt and reverse-complement.
+                if (size_t(q_off)*3 + 3 > size_t(qstart)) continue;
+                size_t cs = size_t(qstart-1) - size_t(q_off)*3 - 2;
                 if (cs+2 >= full_nt.size()) continue;
                 c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
                 uint8_t tmp[3]={c0,c1,c2}; revcomp_codon(tmp); c0=tmp[0]; c1=tmp[1]; c2=tmp[2];
             }
 
+            // Reject ambiguous NT (N, lowercase, non-ACGT) — pack_codon would coerce to T.
+            auto is_acgt = [](uint8_t b) {
+                return b=='A'||b=='C'||b=='G'||b=='T';
+            };
+            if (!is_acgt(c0) || !is_acgt(c1) || !is_acgt(c2)) { ++n_skipped; continue; }
+
             uint8_t raw3[3]={c0,c1,c2};
-            vr.vars.push_back({i, obs_aa, pack_codon(raw3)});
+            uint8_t packed = pack_codon(raw3);
+
+            // Round-trip: codon→AA must agree with diamond's translated AA.
+            // Disagreement indicates a strand/frame extraction error; discard the observation.
+            if (codon_to_aa(packed) != obs_aa) {
+                if (opts.verbose) std::cerr << "codon/AA mismatch L" << lineno
+                    << " (diamond=" << char(AA_ALPHA[obs_aa])
+                    << " nt=" << char(c0) << char(c1) << char(c2) << ")\n";
+                ++n_skipped; continue;
+            }
+
+            vr.vars.push_back({i, obs_aa, packed});
         }
 
-        if (!vr.vars.empty()) {
+        if (!vr.vars.empty())
             batches[hog_idx].push_back(std::move(vr));
-            if (batches[hog_idx].size() >= opts.block_recs) flush_hog(hog_idx);
-        }
         ++n_written;
     }
 
-    // Final flush: all remaining HOGs.
-    for (auto& [hog_idx, _] : batches) flush_hog(hog_idx);
+    // Remove intermediate flush from parse loop — hold all records until end,
+    // then flush in HOG-ID sorted order so .lhb blocks are lexicographically sorted.
+    // This enables streaming k-way merge in hoki merge.
+    std::vector<uint32_t> sorted_idxs;
+    sorted_idxs.reserve(batches.size());
+    for (auto& [hog_idx, recs] : batches)
+        if (!recs.empty()) sorted_idxs.push_back(hog_idx);
+    std::sort(sorted_idxs.begin(), sorted_idxs.end(),
+        [&](uint32_t a, uint32_t b) { return hog_strings[a] < hog_strings[b]; });
+    for (auto hog_idx : sorted_idxs) flush_hog(hog_idx);
+    batch.finalize();
 
-    std::cerr << "wrote " << n_written << " records, " << n_skipped
-              << " skipped → " << container_dir << "\n";
+    std::cerr << "convert: " << n_written << " records, " << n_skipped
+              << " skipped → " << lhb_path << "\n";
 }
 
 } // namespace lhi

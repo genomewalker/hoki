@@ -35,7 +35,7 @@
 namespace lhi {
 
 constexpr uint8_t SHARD_BLOCK_MAGIC[4] = {'L','H','S','B'};
-constexpr uint8_t SHARD_BLOCK_VERSION  = 1;
+constexpr uint8_t SHARD_BLOCK_VERSION  = 4;
 
 #pragma pack(push, 1)
 struct ShardBlockHeader {
@@ -76,7 +76,7 @@ inline std::string hog_to_filename(const std::string& hog_id) {
 // Caller must hold flock(LOCK_EX) on fd before calling.
 inline void write_shard_block(int fd,
                                const std::vector<std::string>& global_contigs,
-                               const std::vector<VarNTRecord>& recs,
+                               std::vector<VarNTRecord>& recs,
                                int zstd_level) {
     if (recs.empty()) return;
 
@@ -90,18 +90,21 @@ inline void write_shard_block(int fd,
         }
     }
 
-    // Remap contig_idx to local space.
-    std::vector<VarNTRecord> local_recs = recs;
-    for (auto& r : local_recs) r.contig_idx = g2l.at(r.contig_idx);
+    // Remap contig_idx to local space in-place (caller clears batch after this call).
+    for (auto& r : recs) r.contig_idx = g2l.at(r.contig_idx);
 
     // Payload = local contig dict + VarNT columnar block.
+    size_t raw_est = 5;
+    for (auto& s : local_contigs) raw_est += 5 + s.size();
+    raw_est += recs.size() * 64;
     std::vector<uint8_t> raw;
+    raw.reserve(raw_est);
     write_varint(raw, uint32_t(local_contigs.size()));
     for (auto& s : local_contigs) {
         write_varint(raw, uint32_t(s.size()));
         raw.insert(raw.end(), s.begin(), s.end());
     }
-    serialize_varnt_block(raw, local_recs);
+    serialize_varnt_block(raw, recs);
 
     // Compress payload.
     size_t bound = ZSTD_compressBound(raw.size());
@@ -117,7 +120,7 @@ inline void write_shard_block(int fd,
     hdr.raw_sz        = uint32_t(raw.size());
     hdr.n_records     = uint32_t(recs.size());
     hdr.min_sstart    = UINT32_MAX; hdr.max_send = 0;
-    for (auto& r : recs) {
+    for (const auto& r : recs) {
         hdr.min_sstart = std::min(hdr.min_sstart, r.sstart);
         hdr.max_send   = std::max(hdr.max_send,   r.send);
     }
@@ -130,7 +133,7 @@ inline void write_shard_block(int fd,
 // Open (or create) shard_path, lock, append one block, unlock, close.
 inline void flush_hog_shard(const std::filesystem::path& shard_path,
                               const std::vector<std::string>& global_contigs,
-                              const std::vector<VarNTRecord>& recs,
+                              std::vector<VarNTRecord>& recs,
                               int zstd_level) {
     if (recs.empty()) return;
     int fd = open(shard_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
