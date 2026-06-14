@@ -13,7 +13,7 @@ static void usage(const char* prog) {
     std::cerr
         << "hoki — HOG codon Index\n"
         << "  " << prog << " convert -a ACC [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
-        << "  " << prog << " merge   [-z LVL=3] [--acc-registry file.acc] [--hog-range START END] <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
+        << "  " << prog << " merge   [-z LVL=3] [--buckets N=1] [--acc-registry file.acc] [--hog-range START END] <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
         << "                  inputs may be .lhb or .lhg, mixed\n"
         << "  " << prog << " accregistry <out.acc> <shard.lhgi> [shard.lhgi ...]\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]\n"
@@ -47,19 +47,21 @@ int main(int argc, char* argv[]) {
     if (mode == "merge") {
         std::string acc_registry, hog_start, hog_end;
         int zstd_level = 3;
+        int n_buckets = 1;
         std::vector<std::string> pos;  // out_lhg, out_lhgi, inputs...
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "--acc-registry" && i+1 < argc) acc_registry = argv[++i];
             else if (a == "--hog-range" && i+2 < argc) { hog_start = argv[++i]; hog_end = argv[++i]; }
             else if (a == "-z" && i+1 < argc)          zstd_level = std::stoi(argv[++i]);
+            else if (a == "--buckets" && i+1 < argc)   n_buckets = std::stoi(argv[++i]);
             else pos.emplace_back(a);
         }
         if (pos.size() < 3) { usage(argv[0]); return 1; }
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
         std::vector<std::string> inputs(pos.begin() + 2, pos.end());
-        lhi::merge_batches(inputs, out_lhg, out_lhgi, zstd_level, hog_start, hog_end, acc_registry);
+        lhi::merge_batches(inputs, out_lhg, out_lhgi, zstd_level, hog_start, hog_end, acc_registry, n_buckets);
         return 0;
     }
 

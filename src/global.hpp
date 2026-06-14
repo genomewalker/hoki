@@ -222,6 +222,58 @@ struct InvBlock {
     const uint8_t*           end;
 };
 
+// pread one HOG entry's compressed payload from an already-open .lhg fd.
+// Thread-safe: pread carries no seek state. `dctx` may be nullptr → ZSTD_decompress.
+inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
+                                 const HogIndexEntry& entry, InvBlock& out,
+                                 ZSTD_DCtx* dctx = nullptr) {
+    (void)lhg_path;  // kept for signature symmetry / future diagnostics
+    uint8_t hoe[8];
+    if (::pread(fd, hoe, 8, off_t(entry.data_offset)) != 8 ||
+        memcmp(hoe, LHG_HOG_ENTRY_MAGIC, 4) != 0)
+        throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
+    uint32_t stored = read_u32_le(hoe + 4);
+    bool is_raw = (stored >> 31) & 1;
+    uint32_t payload_sz = stored & 0x7FFFFFFFu;
+    if (payload_sz > 256u * 1024 * 1024) return false;
+    std::vector<uint8_t> cbuf(payload_sz);
+    if (::pread(fd, cbuf.data(), payload_sz, off_t(entry.data_offset) + 8) != ssize_t(payload_sz))
+        return false;
+
+    if (is_raw) {
+        out.raw.assign(cbuf.begin(), cbuf.end());
+    } else {
+        unsigned long long rsz = ZSTD_getFrameContentSize(cbuf.data(), payload_sz);
+        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
+            throw std::runtime_error("cannot determine raw size for HOG " + entry.hog_id);
+        out.raw.resize(size_t(rsz));
+        size_t dz = dctx
+            ? ZSTD_decompressDCtx(dctx, out.raw.data(), out.raw.size(), cbuf.data(), payload_sz)
+            : ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf.data(), payload_sz);
+        if (ZSTD_isError(dz))
+            throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
+        out.raw.resize(dz);
+    }
+
+    const uint8_t* p = out.raw.data();
+    out.end = p + out.raw.size();
+    uint32_t n_unitigs = 0;
+    int n = read_varint(p, out.end, &n_unitigs);
+    if (!n) throw std::runtime_error("corrupt unitig dict for HOG " + entry.hog_id);
+    p += n;
+    if (n_unitigs > 65536) throw std::runtime_error("n_unitigs OOB for HOG " + entry.hog_id);
+    out.unitigs.resize(n_unitigs);
+    for (uint32_t i = 0; i < n_unitigs; ++i) {
+        uint32_t cnum = 0;
+        n = read_varint(p, out.end, &cnum);
+        if (!n) throw std::runtime_error("truncated unitig dict");
+        p += n;
+        out.unitigs[i] = cnum;
+    }
+    out.pos_ptr = p;
+    return true;
+}
+
 inline bool read_hog_inverted(const std::string& lhg_path,
                               const HogIndexEntry& entry,
                               InvBlock& out) {
