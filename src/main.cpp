@@ -13,7 +13,9 @@ static void usage(const char* prog) {
     std::cerr
         << "hoki — HOG codon Index\n"
         << "  " << prog << " convert -a ACC [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
-        << "  " << prog << " merge   <out.lhg> <out.lhgi> <batch1.lhb> [batch2.lhb ...]\n"
+        << "  " << prog << " merge   [--acc-registry file.acc] [--hog-range START END] <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
+        << "                  inputs may be .lhb or .lhg, mixed\n"
+        << "  " << prog << " accregistry <out.acc> <shard.lhgi> [shard.lhgi ...]\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID>\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
@@ -43,13 +45,28 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "merge") {
-        if (argc < 5) { usage(argv[0]); return 1; }
-        std::string out_lhg  = argv[2];
-        std::string out_lhgi = argv[3];
-        std::vector<std::string> batches;
-        for (int i = 4; i < argc; ++i) batches.emplace_back(argv[i]);
-        if (batches.empty()) { usage(argv[0]); return 1; }
-        lhi::merge_batches(batches, out_lhg, out_lhgi);
+        std::string acc_registry, hog_start, hog_end;
+        std::vector<std::string> pos;  // out_lhg, out_lhgi, inputs...
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--acc-registry" && i+1 < argc) acc_registry = argv[++i];
+            else if (a == "--hog-range" && i+2 < argc) { hog_start = argv[++i]; hog_end = argv[++i]; }
+            else pos.emplace_back(a);
+        }
+        if (pos.size() < 3) { usage(argv[0]); return 1; }
+        std::string out_lhg  = pos[0];
+        std::string out_lhgi = pos[1];
+        std::vector<std::string> inputs(pos.begin() + 2, pos.end());
+        lhi::merge_batches(inputs, out_lhg, out_lhgi, 19, hog_start, hog_end, acc_registry);
+        return 0;
+    }
+
+    if (mode == "accregistry") {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        std::string out_acc = argv[2];
+        std::vector<std::string> lhgis;
+        for (int i = 3; i < argc; ++i) lhgis.emplace_back(argv[i]);
+        lhi::build_acc_registry(lhgis, out_acc);
         return 0;
     }
 
