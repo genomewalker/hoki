@@ -16,11 +16,19 @@
 #include <set>
 #include <fstream>
 #include <queue>
+#include <deque>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include <cstdint>
+#include <cstdio>
 #include <zstd.h>
+
+static inline uint64_t clock_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
 
 // Merge N inputs (.lhb per-accession batches and/or already-inverted .lhg
 // shards) into one position-centric .lhg plus its .lhgi index. For .lhb inputs
@@ -160,7 +168,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           const std::string& hog_range_end   = "",
                           const std::string& acc_registry_path = "",
                           int n_buckets = 1,
-                          int n_threads_override = 0) {
+                          int n_threads_override = 0,
+                          bool do_profile = false,
+                          int hot_threshold = 100) {
 
     // Pass 1: scan all inputs, collect per-HOG MergeRefs (offsets only).
     std::vector<MergeRef> refs;
@@ -307,6 +317,23 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     for (size_t g = 0; g < n_groups; ++g)
         group_bucket[g] = bucket_of(refs[groups[g].first].hog_id);
 
+    // Per-phase profiling counters (summed across all threads).
+    struct ProfCounters {
+        std::atomic<uint64_t> ns_decode{0}, ns_build{0}, ns_compress{0}, n_groups{0};
+    } prof;
+
+    // Hot-HOG parallel decode state.
+    struct HotDecodeTask { size_t g; size_t bi; };
+    struct HotHogState {
+        std::vector<InvBlock>                 blocks;
+        std::vector<std::vector<InvPosition>> src_pos;
+        std::atomic<int>                      pending{0};
+    };
+    std::vector<std::unique_ptr<HotHogState>> hot_states(groups.size());
+
+    std::deque<HotDecodeTask> dq_decode;
+    std::mutex                dq_mtx;
+
     // Fix 3 step 2: per-group result (compressed payload, ready to write).
     struct GroupResult {
         std::string          hog_id;
@@ -337,6 +364,61 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::vector<uint32_t>   contig_cnum;
     };
 
+    // decode_one_block: decode one source block for a hot HOG into hot_states[g].
+    // Safe to call from any worker thread — each (g,bi) slot written by exactly one worker.
+    auto decode_one_block = [&](size_t g, size_t bi, ZSTD_DCtx* dctx) {
+        size_t group_start = groups[g].first;
+        const std::string& hog_id = refs[group_start].hog_id;
+        const MergeRef& ref = refs[group_start + bi];
+        int fd = get_src_fd(ref.source_file_idx);
+        HotHogState& hs = *hot_states[g];
+
+        HogIndexEntry e;
+        e.hog_id = ref.hog_id;
+        e.data_offset = ref.lhg_data_offset;
+        e.data_length = ref.lhg_data_length;
+        if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, hs.blocks[bi], dctx))
+            throw std::runtime_error("failed to read .lhg HOG " + hog_id + " block " + std::to_string(bi));
+
+        const auto& remap = src_remap[ref.source_file_idx];
+        const InvBlock& blk = hs.blocks[bi];
+
+        const uint8_t* p   = blk.pos_ptr;
+        const uint8_t* end = blk.end;
+        uint32_t n_positions = 0;
+        int n = read_varint(p, end, &n_positions);
+        if (!n) throw std::runtime_error("corrupt position count for HOG " + hog_id);
+        p += n;
+        hs.src_pos[bi].reserve(n_positions);
+        std::vector<InvObs> obs;
+        uint32_t prev_pos = 0;
+        // Use a temporary local unitig map per block — hot HOGs merge unitigs later
+        // during the k-way heap pass (owner thread re-indexes with its own unitig_map).
+        // Here we just store the raw (gacc, codon_idx, cnum) by abusing unitig_idx to
+        // hold cnum temporarily; the owner thread will re-map when building positions.
+        // To keep it simple: store gacc and codon_idx; pack cnum into unitig_idx field.
+        for (uint32_t pi = 0; pi < n_positions; ++pi) {
+            uint32_t hog_pos = 0;
+            if (!decode_position(p, end, prev_pos, hog_pos, obs))
+                throw std::runtime_error("corrupt position record for HOG " + hog_id);
+            InvPosition ip;
+            ip.hog_pos = hog_pos;
+            ip.obs.reserve(obs.size());
+            for (const auto& o : obs) {
+                if (o.acc_idx >= remap.size())
+                    throw std::runtime_error("acc_idx out of source registry for HOG " + hog_id);
+                uint32_t gacc = remap[o.acc_idx];
+                if (o.unitig_idx >= blk.unitigs.size())
+                    throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
+                uint32_t cnum = blk.unitigs[o.unitig_idx];
+                // Store cnum in unitig_idx field temporarily; owner rebuilds dict.
+                ip.obs.push_back({gacc, o.codon_idx, cnum});
+            }
+            hs.src_pos[bi].push_back(std::move(ip));
+        }
+        hs.pending.fetch_sub(1, std::memory_order_release);
+    };
+
     // Per-group inversion + serialize + compress. Self-contained; uses only the
     // caller's read-only state plus worker-owned zstd contexts/buffers.
     auto process_group = [&](size_t g, ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
@@ -344,7 +426,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                              std::vector<uint8_t>& raw_block,
                              std::vector<uint8_t>& inv_raw,
                              std::vector<uint8_t>& hog_cbuf,
-                             WorkerScratch& sc) {
+                             WorkerScratch& sc,
+                             uint64_t& tl_decode, uint64_t& tl_build, uint64_t& tl_compress) {
         size_t group_start = groups[g].first;
         size_t group_end   = groups[g].second;
         const std::string& hog_id = refs[group_start].hog_id;
@@ -380,78 +463,148 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
         auto& positions = sc.positions; positions.clear();
 
+        uint64_t t0 = clock_ns();
+        uint64_t t_dec_end = 0, t_build_end = 0;
+
         if (all_lhg) {
-            // Decode each source into an ordered list of positions; the obs in
-            // each are already remapped to global acc + merged unitig dict.
-            auto& blocks  = sc.blocks;  blocks.clear();  blocks.resize(n_blocks);
-            auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
-            for (size_t bi = 0; bi < n_blocks; ++bi) {
-                const MergeRef& ref = refs[group_start + bi];
-                int fd = get_src_fd(ref.source_file_idx);
-                HogIndexEntry e;
-                e.hog_id = ref.hog_id;
-                e.data_offset = ref.lhg_data_offset;
-                e.data_length = ref.lhg_data_length;
-                if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, blocks[bi], dctx))
-                    throw std::runtime_error("failed to read .lhg HOG " + hog_id);
+            bool is_hot = (int(n_blocks) > hot_threshold);
 
-                const auto& remap = src_remap[ref.source_file_idx];
+            if (is_hot) {
+                // Hot path: allocate shared state, push decode tasks, help drain queue.
+                hot_states[g] = std::make_unique<HotHogState>();
+                hot_states[g]->blocks.resize(n_blocks);
+                hot_states[g]->src_pos.resize(n_blocks);
+                hot_states[g]->pending.store(int(n_blocks), std::memory_order_relaxed);
 
-                const uint8_t* p   = blocks[bi].pos_ptr;
-                const uint8_t* end = blocks[bi].end;
-                uint32_t n_positions = 0;
-                int n = read_varint(p, end, &n_positions);
-                if (!n) throw std::runtime_error("corrupt position count for HOG " + hog_id);
-                p += n;
-                src_pos[bi].reserve(n_positions);
-                auto& obs = sc.obs;
-                uint32_t prev_pos = 0;
-                for (uint32_t pi = 0; pi < n_positions; ++pi) {
-                    uint32_t hog_pos = 0;
-                    if (!decode_position(p, end, prev_pos, hog_pos, obs))
-                        throw std::runtime_error("corrupt position record for HOG " + hog_id);
-                    InvPosition ip;
-                    ip.hog_pos = hog_pos;
-                    ip.obs.reserve(obs.size());
-                    for (const auto& o : obs) {
-                        if (o.acc_idx >= remap.size())
-                            throw std::runtime_error("acc_idx out of source registry for HOG " + hog_id);
-                        uint32_t gacc = remap[o.acc_idx];
-                        if (o.unitig_idx >= blocks[bi].unitigs.size())
-                            throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
-                        uint32_t cnum = blocks[bi].unitigs[o.unitig_idx];
-                        mark_acc(gacc);
-                        ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                {
+                    std::lock_guard<std::mutex> lk(dq_mtx);
+                    for (size_t bi = 0; bi < n_blocks; ++bi)
+                        dq_decode.push_back({g, bi});
+                }
+
+                // Owner helps drain until all blocks for this group are done.
+                while (hot_states[g]->pending.load(std::memory_order_acquire) > 0) {
+                    HotDecodeTask dt{g, 0};
+                    bool got = false;
+                    {
+                        std::lock_guard<std::mutex> lk(dq_mtx);
+                        if (!dq_decode.empty()) {
+                            dt = dq_decode.front(); dq_decode.pop_front();
+                            got = true;
+                        }
                     }
-                    src_pos[bi].push_back(std::move(ip));
+                    if (got) decode_one_block(dt.g, dt.bi, dctx);
+                    else     std::this_thread::yield();
                 }
-            }
 
-            // K-way min-heap over (hog_pos, src_idx, cursor). Concatenate obs at
-            // equal hog_pos directly — sources are already position-ordered.
-            struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
-            auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
-            std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
-            for (size_t bi = 0; bi < n_blocks; ++bi)
-                if (!src_pos[bi].empty())
-                    heap.push({src_pos[bi][0].hog_pos, bi, 0});
-            while (!heap.empty()) {
-                uint32_t cur_pos = heap.top().hog_pos;
-                InvPosition out_pos;
-                out_pos.hog_pos = cur_pos;
-                while (!heap.empty() && heap.top().hog_pos == cur_pos) {
-                    HeapItem it = heap.top(); heap.pop();
-                    auto& obs = src_pos[it.src][it.cur].obs;
-                    out_pos.obs.insert(out_pos.obs.end(),
-                                       std::make_move_iterator(obs.begin()),
-                                       std::make_move_iterator(obs.end()));
-                    size_t next = it.cur + 1;
-                    if (next < src_pos[it.src].size())
-                        heap.push({src_pos[it.src][next].hog_pos, it.src, next});
+                t_dec_end = clock_ns();
+
+                // Rebuild positions from hot_states[g]->src_pos[]; re-map unitig_idx
+                // (which holds raw cnum from decode_one_block) through our local dict.
+                auto& src_pos = hot_states[g]->src_pos;
+                struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
+                auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
+                std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
+                for (size_t bi = 0; bi < n_blocks; ++bi)
+                    if (!src_pos[bi].empty())
+                        heap.push({src_pos[bi][0].hog_pos, bi, 0});
+                while (!heap.empty()) {
+                    uint32_t cur_pos = heap.top().hog_pos;
+                    InvPosition out_pos;
+                    out_pos.hog_pos = cur_pos;
+                    while (!heap.empty() && heap.top().hog_pos == cur_pos) {
+                        HeapItem it = heap.top(); heap.pop();
+                        for (auto& o : src_pos[it.src][it.cur].obs) {
+                            // o.unitig_idx holds cnum (set by decode_one_block).
+                            uint32_t gacc = o.acc_idx;
+                            uint32_t cnum = o.unitig_idx;
+                            mark_acc(gacc);
+                            out_pos.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                        }
+                        size_t next = it.cur + 1;
+                        if (next < src_pos[it.src].size())
+                            heap.push({src_pos[it.src][next].hog_pos, it.src, next});
+                    }
+                    std::sort(out_pos.obs.begin(), out_pos.obs.end(),
+                        [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+                    positions.push_back(std::move(out_pos));
                 }
-                std::sort(out_pos.obs.begin(), out_pos.obs.end(),
-                    [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
-                positions.push_back(std::move(out_pos));
+                // Hot HOGs: set n_accs conservatively to total accessions count.
+                if (sc.n_accs == 0) sc.n_accs = uint32_t(accessions.size());
+            } else {
+                // Cold path: existing inline decode logic.
+                auto& blocks  = sc.blocks;  blocks.clear();  blocks.resize(n_blocks);
+                auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
+                for (size_t bi = 0; bi < n_blocks; ++bi) {
+                    const MergeRef& ref = refs[group_start + bi];
+                    int fd = get_src_fd(ref.source_file_idx);
+                    HogIndexEntry e;
+                    e.hog_id = ref.hog_id;
+                    e.data_offset = ref.lhg_data_offset;
+                    e.data_length = ref.lhg_data_length;
+                    if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, blocks[bi], dctx))
+                        throw std::runtime_error("failed to read .lhg HOG " + hog_id);
+
+                    const auto& remap = src_remap[ref.source_file_idx];
+
+                    const uint8_t* p   = blocks[bi].pos_ptr;
+                    const uint8_t* end = blocks[bi].end;
+                    uint32_t n_positions = 0;
+                    int n = read_varint(p, end, &n_positions);
+                    if (!n) throw std::runtime_error("corrupt position count for HOG " + hog_id);
+                    p += n;
+                    src_pos[bi].reserve(n_positions);
+                    auto& obs = sc.obs;
+                    uint32_t prev_pos = 0;
+                    for (uint32_t pi = 0; pi < n_positions; ++pi) {
+                        uint32_t hog_pos = 0;
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs))
+                            throw std::runtime_error("corrupt position record for HOG " + hog_id);
+                        InvPosition ip;
+                        ip.hog_pos = hog_pos;
+                        ip.obs.reserve(obs.size());
+                        for (const auto& o : obs) {
+                            if (o.acc_idx >= remap.size())
+                                throw std::runtime_error("acc_idx out of source registry for HOG " + hog_id);
+                            uint32_t gacc = remap[o.acc_idx];
+                            if (o.unitig_idx >= blocks[bi].unitigs.size())
+                                throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
+                            uint32_t cnum = blocks[bi].unitigs[o.unitig_idx];
+                            mark_acc(gacc);
+                            ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                        }
+                        src_pos[bi].push_back(std::move(ip));
+                    }
+                }
+
+                t_dec_end = clock_ns();
+
+                // K-way min-heap over (hog_pos, src_idx, cursor). Concatenate obs at
+                // equal hog_pos directly — sources are already position-ordered.
+                struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
+                auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
+                std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
+                for (size_t bi = 0; bi < n_blocks; ++bi)
+                    if (!src_pos[bi].empty())
+                        heap.push({src_pos[bi][0].hog_pos, bi, 0});
+                while (!heap.empty()) {
+                    uint32_t cur_pos = heap.top().hog_pos;
+                    InvPosition out_pos;
+                    out_pos.hog_pos = cur_pos;
+                    while (!heap.empty() && heap.top().hog_pos == cur_pos) {
+                        HeapItem it = heap.top(); heap.pop();
+                        auto& obs = src_pos[it.src][it.cur].obs;
+                        out_pos.obs.insert(out_pos.obs.end(),
+                                           std::make_move_iterator(obs.begin()),
+                                           std::make_move_iterator(obs.end()));
+                        size_t next = it.cur + 1;
+                        if (next < src_pos[it.src].size())
+                            heap.push({src_pos[it.src][next].hog_pos, it.src, next});
+                    }
+                    std::sort(out_pos.obs.begin(), out_pos.obs.end(),
+                        [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+                    positions.push_back(std::move(out_pos));
+                }
             }
         } else {
             // Mixed/LHB groups: accumulate into a map, then sort (existing path).
@@ -572,6 +725,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 }
             }
 
+            t_dec_end = clock_ns();
+
             positions.reserve(inverted.size());
             for (auto& kv : inverted) {
                 std::sort(kv.second.begin(), kv.second.end(),
@@ -582,9 +737,13 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 [](const InvPosition& a, const InvPosition& b) { return a.hog_pos < b.hog_pos; });
         }
 
-        // Serialize inverted block.
+        // Serialize inverted block (build phase ends here).
         inv_raw.clear();
         serialize_inverted_block(inv_raw, unitigs, positions);
+        t_build_end = clock_ns();
+
+        tl_decode += t_dec_end - t0;
+        tl_build  += t_build_end - t_dec_end;
 
         // HOG-level zstd compress (worker-owned CCtx; level set per worker).
         size_t bound = ZSTD_compressBound(inv_raw.size());
@@ -593,6 +752,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                                     inv_raw.data(), inv_raw.size());
         if (ZSTD_isError(csz))
             throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
+
+        tl_compress += clock_ns() - t_build_end;
 
         // Raw fallback: if zstd doesn't shrink the block, store raw (high bit set).
         bool use_raw = (csz >= inv_raw.size());
@@ -625,17 +786,47 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, zstd_level);
         std::vector<uint8_t> cbuf_in, raw_block, inv_raw, hog_cbuf;
         WorkerScratch scratch;
+        uint64_t tl_decode = 0, tl_build = 0, tl_compress = 0;
         for (;;) {
             size_t g = next_group.fetch_add(1, std::memory_order_relaxed);
-            if (g >= groups.size() || failed.load(std::memory_order_relaxed)) break;
-            try {
-                process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf, scratch);
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(err_mtx);
-                if (!failed.exchange(true)) first_error = e.what();
-                break;
+            if (g < groups.size() && !failed.load(std::memory_order_relaxed)) {
+                try {
+                    process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
+                                  scratch, tl_decode, tl_build, tl_compress);
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(err_mtx);
+                    if (!failed.exchange(true)) first_error = e.what();
+                    break;
+                }
+                continue;
             }
+            // HOG queue exhausted; try to drain hot-decode tasks.
+            HotDecodeTask dt{0, 0};
+            bool got = false;
+            {
+                std::lock_guard<std::mutex> lk(dq_mtx);
+                if (!dq_decode.empty()) { dt = dq_decode.front(); dq_decode.pop_front(); got = true; }
+            }
+            if (got) {
+                try { decode_one_block(dt.g, dt.bi, dctx); }
+                catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(err_mtx);
+                    if (!failed.exchange(true)) first_error = e.what();
+                    break;
+                }
+                continue;
+            }
+            // Nothing to do: check if we can exit.
+            bool hog_done = (next_group.load(std::memory_order_relaxed) >= groups.size());
+            bool hot_empty;
+            { std::lock_guard<std::mutex> lk(dq_mtx); hot_empty = dq_decode.empty(); }
+            if (hog_done && hot_empty) break;
+            std::this_thread::yield();
         }
+        prof.ns_decode.fetch_add(tl_decode, std::memory_order_relaxed);
+        prof.ns_build.fetch_add(tl_build,   std::memory_order_relaxed);
+        prof.ns_compress.fetch_add(tl_compress, std::memory_order_relaxed);
+        prof.n_groups.fetch_add(1, std::memory_order_relaxed);
         ZSTD_freeCCtx(cctx);
         ZSTD_freeDCtx(dctx);
     };
@@ -649,6 +840,20 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         for (auto& th : pool) th.join();
     }
     if (failed.load()) throw std::runtime_error(first_error);
+
+    if (do_profile) {
+        uint64_t d = prof.ns_decode.load();
+        uint64_t b = prof.ns_build.load();
+        uint64_t c = prof.ns_compress.load();
+        uint64_t total = d + b + c;
+        if (total == 0) total = 1;
+        auto pct = [&](uint64_t x) { return int(x * 100 / total); };
+        auto secs = [](uint64_t x) { return double(x) / 1e9; };
+        std::fprintf(stderr, "profile[hogs]     n=%zu threads=%zu\n", n_groups, n_threads);
+        std::fprintf(stderr, "profile[decode]   %.1fs (%d%%)\n", secs(d), pct(d));
+        std::fprintf(stderr, "profile[build]    %.1fs (%d%%)\n", secs(b), pct(b));
+        std::fprintf(stderr, "profile[compress] %.1fs (%d%%)\n", secs(c), pct(c));
+    }
 
     // Open B output file pairs. With n_buckets==1 the paths carry no suffix, so
     // the output is byte-identical to the pre-bucketing single-output path.
