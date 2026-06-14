@@ -1,4 +1,5 @@
 #pragma once
+#include <ctime>
 #include "global.hpp"
 #include "batch.hpp"
 #include "container.hpp"
@@ -29,6 +30,41 @@ static inline uint64_t clock_ns() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
+
+// 8 MB write buffer: reduces per-HOG write() syscalls from 3 to ~0.003
+// (one flush per ~2730 HOGs instead of 3 syscalls per HOG).
+struct WriteBuffer {
+    static constexpr size_t CAP = 8u * 1024u * 1024u;
+    std::vector<uint8_t> buf;
+    WriteBuffer() { buf.reserve(CAP); }
+    void flush_to(int fd, const std::string& path) {
+        if (buf.empty()) return;
+        const char* p = reinterpret_cast<const char*>(buf.data());
+        size_t rem = buf.size(), done = 0;
+        while (done < rem) {
+            ssize_t r = ::write(fd, p + done, rem - done);
+            if (r <= 0) throw std::runtime_error("write failed: " + path);
+            done += size_t(r);
+        }
+        buf.clear();
+    }
+    void append(int fd, const std::string& path, const void* data, size_t n) {
+        if (buf.size() + n > CAP) flush_to(fd, path);
+        if (n > CAP) {
+            const char* p = reinterpret_cast<const char*>(data);
+            size_t rem = n, done = 0;
+            while (done < rem) {
+                ssize_t r = ::write(fd, p + done, rem - done);
+                if (r <= 0) throw std::runtime_error("write failed: " + path);
+                done += size_t(r);
+            }
+        } else {
+            buf.insert(buf.end(),
+                       reinterpret_cast<const uint8_t*>(data),
+                       reinterpret_cast<const uint8_t*>(data) + n);
+        }
+    }
+};
 
 // Merge N inputs (.lhb per-accession batches and/or already-inverted .lhg
 // shards) into one position-centric .lhg plus its .lhgi index. For .lhb inputs
@@ -344,6 +380,41 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         uint32_t             n_accs = 0;
     };
     std::vector<GroupResult> results(groups.size());
+
+    // Output files opened here (before process_group + pool) so the async
+    // writer thread can start immediately alongside the compute pool.
+    struct BucketOut {
+        UniqueFd               lhg_fd{-1};
+        UniqueFd               lhgi_fd{-1};
+        std::string            lhg_path;
+        std::string            lhgi_path;
+        uint64_t               write_pos = LHG_HEADER_SZ;
+        std::vector<HogIndexEntry> index_entries;
+        WriteBuffer            wbuf;
+    };
+    auto fmt3 = [](size_t b) {
+        char s[16]; std::snprintf(s, sizeof(s), "%03zu", b); return std::string(s);
+    };
+    std::vector<BucketOut> buckets(n_buckets_sz);
+    for (size_t b = 0; b < n_buckets_sz; ++b) {
+        BucketOut& bk = buckets[b];
+        bk.lhg_path  = (n_buckets_sz == 1) ? out_lhg  : out_lhg  + ".b" + fmt3(b);
+        bk.lhgi_path = (n_buckets_sz == 1) ? out_lhgi : out_lhgi + ".b" + fmt3(b);
+        bk.lhg_fd  = UniqueFd(open(bk.lhg_path.c_str(),  O_WRONLY | O_CREAT | O_TRUNC, 0644));
+        bk.lhgi_fd = UniqueFd(open(bk.lhgi_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+        if (bk.lhg_fd  < 0) throw std::runtime_error("cannot create: " + bk.lhg_path);
+        if (bk.lhgi_fd < 0) throw std::runtime_error("cannot create: " + bk.lhgi_path);
+        uint8_t fhdr[LHG_HEADER_SZ] = {};
+        memcpy(fhdr, LHG_FILE_MAGIC, 4); fhdr[4] = LHG_VERSION;
+        if (::write(bk.lhg_fd, fhdr, LHG_HEADER_SZ) != ssize_t(LHG_HEADER_SZ))
+            throw std::runtime_error("write header failed: " + bk.lhg_path);
+    }
+
+    // Per-result ready flag: worker stores true (release) after results[g] is
+    // fully populated; writer loads with acquire before reading.
+    std::unique_ptr<std::atomic<bool>[]> result_ready(new std::atomic<bool>[n_groups]);
+    for (size_t i = 0; i < n_groups; ++i)
+        result_ready[i].store(false, std::memory_order_relaxed);
 
     // Per-worker reusable containers — cleared (not reallocated) per group.
     struct WorkerScratch {
@@ -761,6 +832,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         gr.n_accs = sc.n_accs;
         if (use_raw) gr.payload.assign(inv_raw.begin(), inv_raw.end());
         else         gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + csz);
+        // Signal the async writer that this result slot is ready.
+        result_ready[g].store(true, std::memory_order_release);
     };
 
     // Fix 3 step 3: work-stealing across N workers. Each owns its zstd contexts.
@@ -829,6 +902,40 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         ZSTD_freeDCtx(dctx);
     };
 
+    // Async writer: streams results to NFS as workers produce them,
+    // overlapping I/O with computation. Single-threaded; no locking needed
+    // on buckets/write_pos/index_entries (only this thread touches them).
+    std::string writer_error;
+    auto writer_fn = [&]() {
+        try {
+            for (size_t g = 0; g < n_groups; ++g) {
+                while (!result_ready[g].load(std::memory_order_acquire)) {
+                    if (failed.load(std::memory_order_relaxed)) return;
+                    std::this_thread::yield();
+                }
+                GroupResult& gr = results[g];
+                BucketOut&   bk = buckets[group_bucket[g]];
+                uint64_t off = bk.write_pos;
+                uint8_t hdr8[8];
+                memcpy(hdr8, LHG_HOG_ENTRY_MAGIC, 4);
+                for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(gr.stored_sz >> (8*i));
+                bk.wbuf.append(bk.lhg_fd, bk.lhg_path, hdr8, 8);
+                bk.write_pos += 8;
+                bk.wbuf.append(bk.lhg_fd, bk.lhg_path, gr.payload.data(), gr.payload.size());
+                bk.write_pos += gr.payload.size();
+                bk.index_entries.push_back(
+                    {std::move(gr.hog_id), off, bk.write_pos - off, gr.n_accs});
+                { std::vector<uint8_t>().swap(gr.payload); }  // free RSS immediately
+            }
+            for (auto& bk : buckets) bk.wbuf.flush_to(bk.lhg_fd, bk.lhg_path);
+        } catch (const std::exception& e) {
+            writer_error = e.what();
+            failed.store(true, std::memory_order_relaxed);
+        }
+    };
+
+    // Start async writer then compute pool; both run concurrently.
+    std::thread writer_thread(writer_fn);
     if (groups.size() == 1) {
         worker();
     } else {
@@ -837,7 +944,10 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         for (size_t t = 0; t < n_threads; ++t) pool.emplace_back(worker);
         for (auto& th : pool) th.join();
     }
-    if (failed.load()) throw std::runtime_error(first_error);
+    writer_thread.join();
+    if (failed.load()) {
+        throw std::runtime_error(writer_error.empty() ? first_error : writer_error);
+    }
 
     if (do_profile) {
         uint64_t d = prof.ns_decode.load();
@@ -853,72 +963,13 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::fprintf(stderr, "profile[compress] %.1fs (%d%%)\n", secs(c), pct(c));
     }
 
-    // Open B output file pairs. With n_buckets==1 the paths carry no suffix, so
-    // the output is byte-identical to the pre-bucketing single-output path.
-    struct BucketOut {
-        UniqueFd               lhg_fd{-1};
-        UniqueFd               lhgi_fd{-1};
-        std::string            lhg_path;
-        std::string            lhgi_path;
-        uint64_t               write_pos = LHG_HEADER_SZ;  // after 16-byte LHGG header
-        std::vector<HogIndexEntry> index_entries;
-    };
-    auto fmt3 = [](size_t b) {
-        char s[16]; std::snprintf(s, sizeof(s), "%03zu", b); return std::string(s);
-    };
-    std::vector<BucketOut> buckets(n_buckets_sz);
-    for (size_t b = 0; b < n_buckets_sz; ++b) {
-        BucketOut& bk = buckets[b];
-        if (n_buckets_sz == 1) {
-            bk.lhg_path  = out_lhg;
-            bk.lhgi_path = out_lhgi;
-        } else {
-            bk.lhg_path  = out_lhg  + ".b" + fmt3(b);
-            bk.lhgi_path = out_lhgi + ".b" + fmt3(b);
-        }
-        bk.lhg_fd = UniqueFd(open(bk.lhg_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
-        if (bk.lhg_fd < 0) throw std::runtime_error("cannot create: " + bk.lhg_path);
-        bk.lhgi_fd = UniqueFd(open(bk.lhgi_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
-        if (bk.lhgi_fd < 0) throw std::runtime_error("cannot create: " + bk.lhgi_path);
-        // Placeholder LHGG header (index_offset backfilled at finalize).
-        uint8_t file_hdr[LHG_HEADER_SZ] = {};
-        memcpy(file_hdr, LHG_FILE_MAGIC, 4);
-        file_hdr[4] = LHG_VERSION;
-        if (::write(bk.lhg_fd, file_hdr, LHG_HEADER_SZ) != ssize_t(LHG_HEADER_SZ))
-            throw std::runtime_error("write header failed: " + bk.lhg_path);
-    }
-
-    auto write_fd_all = [](int fd, const std::string& path, const void* p, size_t n) {
-        const char* buf = (const char*)p; size_t done = 0;
-        while (done < n) {
-            ssize_t r = ::write(fd, buf + done, n - done);
-            if (r <= 0) throw std::runtime_error("write failed: " + path);
-            done += r;
-        }
-    };
-
-    // Fix 3 step 4: serial writer in HOG-sorted order; route each result to its
-    // bucket and assign per-bucket offsets.
-    for (size_t g = 0; g < results.size(); ++g) {
-        GroupResult& gr = results[g];
-        BucketOut& bk = buckets[group_bucket[g]];
-        uint64_t hog_data_offset = bk.write_pos;
-        write_fd_all(bk.lhg_fd, bk.lhg_path, LHG_HOG_ENTRY_MAGIC, 4); bk.write_pos += 4;
-        uint8_t csz4[4]; for (int i = 0; i < 4; ++i) csz4[i] = uint8_t(gr.stored_sz >> (8 * i));
-        write_fd_all(bk.lhg_fd, bk.lhg_path, csz4, 4); bk.write_pos += 4;
-        write_fd_all(bk.lhg_fd, bk.lhg_path, gr.payload.data(), gr.payload.size());
-        bk.write_pos += gr.payload.size();
-        uint64_t hog_data_length = bk.write_pos - hog_data_offset;
-        bk.index_entries.push_back({std::move(gr.hog_id), hog_data_offset, hog_data_length, gr.n_accs});
-    }
-
     // Finalize each bucket: LHGI section into the .lhg, backfill header, standalone .lhgi.
     size_t total_hogs = 0;
     for (size_t b = 0; b < n_buckets_sz; ++b) {
         BucketOut& bk = buckets[b];
         uint64_t index_offset = bk.write_pos;
         auto idx_bytes = build_index_bytes(bk.index_entries, accessions);
-        write_fd_all(bk.lhg_fd, bk.lhg_path, idx_bytes.data(), idx_bytes.size());
+        { WriteBuffer wb; wb.append(bk.lhg_fd, bk.lhg_path, idx_bytes.data(), idx_bytes.size()); wb.flush_to(bk.lhg_fd, bk.lhg_path); }
 
         uint8_t final_hdr[LHG_HEADER_SZ] = {};
         memcpy(final_hdr, LHG_FILE_MAGIC, 4);
@@ -927,7 +978,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         if (::pwrite(bk.lhg_fd, final_hdr, LHG_HEADER_SZ, 0) != ssize_t(LHG_HEADER_SZ))
             throw std::runtime_error("pwrite header failed: " + bk.lhg_path);
 
-        write_fd_all(bk.lhgi_fd, bk.lhgi_path, idx_bytes.data(), idx_bytes.size());
+        { WriteBuffer wb; wb.append(bk.lhgi_fd, bk.lhgi_path, idx_bytes.data(), idx_bytes.size()); wb.flush_to(bk.lhgi_fd, bk.lhgi_path); }
 
         total_hogs += bk.index_entries.size();
         std::cerr << "merge done: " << bk.index_entries.size() << " HOGs, "
