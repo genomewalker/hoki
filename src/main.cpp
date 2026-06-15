@@ -73,6 +73,7 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> inputs(pos.begin() + 2, pos.end());
         lhi::merge_batches(inputs, out_lhg, out_lhgi, zstd_level, hog_start, hog_end, acc_registry,
                            n_buckets, n_threads, do_profile, hot_threshold, out_compress_level);
+        // -zo N: N>=0 = ZSTD level for output (smaller, for transfer); default -1 = LZ4 (fast)
         return 0;
     }
 

@@ -208,8 +208,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int n_threads_override = 0,
                           bool do_profile = false,
                           int hot_threshold = 100,
-                          int /*out_compress_level*/ = -1) {
-    (void)zstd_level;  // output now uses LZ4; -z / -zo flags accepted but ignored
+                          int out_zstd_level = -1) {
+    // out_zstd_level: <0 = LZ4 output (fast, default), >=0 = ZSTD level (smaller, for transfer)
+    (void)zstd_level;
 
     // Pass 1: scan all inputs, collect per-HOG MergeRefs (offsets only).
     std::vector<MergeRef> refs;
@@ -463,8 +464,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     };
 
     // Per-group inversion + serialize + compress. Self-contained; uses only the
-    // caller's read-only state plus worker-owned zstd contexts/buffers.
-    auto process_group = [&](size_t g, ZSTD_DCtx* dctx,
+    // caller's read-only state plus worker-owned contexts/buffers.
+    auto process_group = [&](size_t g, ZSTD_CCtx* cctx, ZSTD_DCtx* dctx,
                              std::vector<uint8_t>& cbuf_in,
                              std::vector<uint8_t>& raw_block,
                              std::vector<uint8_t>& inv_raw,
@@ -831,35 +832,44 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         tl_decode += t_dec_end - t0;
         tl_build  += t_build_end - t_dec_end;
 
-        // HOG-level LZ4 compress: ~5× faster than ZSTD, ~60% ratio (vs ZSTD ~70%).
-        // stored_sz encoding: bit31=raw, bit30=lz4, bits29-0=payload_sz.
-        // LZ4 payload layout: [4-byte raw_sz LE][LZ4 compressed bytes].
+        // stored_sz: bit31=raw · bit30=ZSTD · else=LZ4
+        // LZ4 payload: [4B raw_sz LE][lz4 bytes]
         size_t raw_sz = inv_raw.size();
-        size_t lz4_bound = size_t(LZ4_compressBound(int(raw_sz)));
-        hog_cbuf.resize(4 + lz4_bound);
-        hog_cbuf[0] = uint8_t(raw_sz);
-        hog_cbuf[1] = uint8_t(raw_sz >> 8);
-        hog_cbuf[2] = uint8_t(raw_sz >> 16);
-        hog_cbuf[3] = uint8_t(raw_sz >> 24);
-        int lz4_csz = LZ4_compress_default(
-            reinterpret_cast<const char*>(inv_raw.data()),
-            reinterpret_cast<char*>(hog_cbuf.data() + 4),
-            int(raw_sz), int(lz4_bound));
-        size_t total_lz4 = (lz4_csz > 0) ? size_t(4 + lz4_csz) : raw_sz;
-        bool use_raw = (lz4_csz <= 0 || total_lz4 >= raw_sz);
+        size_t payload_sz = 0;
+        uint32_t stored_sz = 0;
+        bool use_raw = false;
+
+        if (out_zstd_level >= 0) {
+            size_t bound = ZSTD_compressBound(raw_sz);
+            hog_cbuf.resize(bound);
+            size_t csz = ZSTD_compress2(cctx, hog_cbuf.data(), bound,
+                                        inv_raw.data(), raw_sz);
+            if (ZSTD_isError(csz))
+                throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
+            use_raw = (csz >= raw_sz);
+            if (!use_raw) { payload_sz = csz; stored_sz = uint32_t(csz) | 0x40000000u; }
+        } else {
+            size_t lz4_bound = size_t(LZ4_compressBound(int(raw_sz)));
+            hog_cbuf.resize(4 + lz4_bound);
+            hog_cbuf[0] = uint8_t(raw_sz);       hog_cbuf[1] = uint8_t(raw_sz >> 8);
+            hog_cbuf[2] = uint8_t(raw_sz >> 16); hog_cbuf[3] = uint8_t(raw_sz >> 24);
+            int lcsz = LZ4_compress_default(reinterpret_cast<const char*>(inv_raw.data()),
+                                            reinterpret_cast<char*>(hog_cbuf.data() + 4),
+                                            int(raw_sz), int(lz4_bound));
+            size_t total = (lcsz > 0) ? size_t(4 + lcsz) : raw_sz;
+            use_raw = (lcsz <= 0 || total >= raw_sz);
+            if (!use_raw) { payload_sz = total; stored_sz = uint32_t(total); }
+        }
+        if (use_raw) { payload_sz = raw_sz; stored_sz = uint32_t(raw_sz) | 0x80000000u; }
 
         tl_compress += clock_ns() - t_build_end;
 
         GroupResult& gr = results[g];
         gr.hog_id = hog_id;
         gr.n_accs = sc.n_accs;
-        if (use_raw) {
-            gr.stored_sz = uint32_t(raw_sz) | 0x80000000u;
-            gr.payload.assign(inv_raw.begin(), inv_raw.end());
-        } else {
-            gr.stored_sz = uint32_t(total_lz4);  // bit31=0 → LZ4
-            gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + total_lz4);
-        }
+        gr.stored_sz = stored_sz;
+        if (use_raw) gr.payload.assign(inv_raw.begin(), inv_raw.end());
+        else         gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + payload_sz);
         // Signal the async writer that this result slot is ready.
         result_ready[g].store(true, std::memory_order_release);
     };
@@ -880,7 +890,10 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     if (n_threads == 0) n_threads = 1;
 
     auto worker = [&]() {
+        ZSTD_CCtx* cctx = ZSTD_createCCtx();
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
+        if (out_zstd_level >= 0)
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, out_zstd_level);
         std::vector<uint8_t> cbuf_in, raw_block, inv_raw, hog_cbuf;
         WorkerScratch scratch;
         uint64_t tl_decode = 0, tl_build = 0, tl_compress = 0;
@@ -888,7 +901,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             size_t g = next_group.fetch_add(1, std::memory_order_relaxed);
             if (g < groups.size() && !failed.load(std::memory_order_relaxed)) {
                 try {
-                    process_group(g, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
+                    process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
                                   scratch, tl_decode, tl_build, tl_compress);
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lk(err_mtx);
@@ -924,6 +937,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         prof.ns_build.fetch_add(tl_build,   std::memory_order_relaxed);
         prof.ns_compress.fetch_add(tl_compress, std::memory_order_relaxed);
         prof.n_groups.fetch_add(1, std::memory_order_relaxed);
+        ZSTD_freeCCtx(cctx);
         ZSTD_freeDCtx(dctx);
     };
 
