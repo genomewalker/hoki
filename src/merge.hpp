@@ -224,59 +224,102 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     // out_zstd_level: <0 = LZ4 output (fast, default), >=0 = ZSTD level (smaller, for transfer)
     (void)zstd_level;
 
-    // Pass 1: scan all inputs, collect per-HOG MergeRefs (offsets only).
-    std::vector<MergeRef> refs;
-    refs.reserve(input_paths.size() * 512);
+    // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.
+    size_t scan_threads = std::max<size_t>(1, std::min<size_t>(
+        n_threads_override > 0 ? size_t(n_threads_override) : std::thread::hardware_concurrency(),
+        input_paths.size()));
 
-    // Per-source local accession registry (.lhg only). Populated once per
-    // source instead of copied into every MergeRef.
+    std::vector<std::vector<MergeRef>> per_file_refs(input_paths.size());
     std::vector<std::vector<std::string>> source_accs(input_paths.size());
+    std::atomic<size_t> scan_next{0};
+    std::atomic<bool>   scan_failed{false};
+    std::string         scan_error;
+    std::mutex          scan_err_mtx;
 
-    for (size_t fi = 0; fi < input_paths.size(); ++fi) {
-        MergeRef::Kind kind = detect_input_kind(input_paths[fi]);
-        if (kind == MergeRef::Kind::LHB) {
-            std::string cur_acc;
-            bool ok = scan_batch_file(input_paths[fi], fi,
-                [&](const std::string& a) { cur_acc = a; },
-                [&](BatchBlockRef br) {
-                    MergeRef r;
-                    r.kind = MergeRef::Kind::LHB;
-                    r.hog_id = std::move(br.hog_id);
-                    r.lhb_acc_id = br.acc_id;
-                    r.source_file_idx = fi;
-                    r.lhb_shard_hdr_offset = uint64_t(br.shard_hdr_offset);
-                    refs.push_back(std::move(r));
-                });
-            if (!ok) throw std::runtime_error("cannot open batch: " + input_paths[fi]);
-        } else {
-            // .lhg: read its LHGI index; one MergeRef per HOG entry.
-            GlobalIndex idx;
-            if (!idx.load_from_lhg(input_paths[fi]))
-                throw std::runtime_error("cannot load .lhg index: " + input_paths[fi]);
-            source_accs[fi] = std::move(idx.accessions);
-            for (const auto& e : idx.entries) {
-                MergeRef r;
-                r.kind = MergeRef::Kind::LHG;
-                r.hog_id = e.hog_id;
-                r.source_file_idx = fi;
-                r.lhg_data_offset = e.data_offset;
-                r.lhg_data_length = e.data_length;
-                refs.push_back(std::move(r));
+    auto scan_worker = [&]() {
+        for (;;) {
+            size_t fi = scan_next.fetch_add(1, std::memory_order_relaxed);
+            if (fi >= input_paths.size() || scan_failed.load(std::memory_order_relaxed)) break;
+            try {
+                MergeRef::Kind kind = detect_input_kind(input_paths[fi]);
+                if (kind == MergeRef::Kind::LHB) {
+                    std::string cur_acc;
+                    bool ok = scan_batch_file(input_paths[fi], fi,
+                        [&](const std::string& a) { cur_acc = a; },
+                        [&](BatchBlockRef br) {
+                            MergeRef r;
+                            r.kind = MergeRef::Kind::LHB;
+                            r.hog_id = std::move(br.hog_id);
+                            r.lhb_acc_id = br.acc_id;
+                            r.source_file_idx = fi;
+                            r.lhb_shard_hdr_offset = uint64_t(br.shard_hdr_offset);
+                            per_file_refs[fi].push_back(std::move(r));
+                        });
+                    if (!ok) throw std::runtime_error("cannot open batch: " + input_paths[fi]);
+                } else {
+                    GlobalIndex idx;
+                    if (!idx.load_from_lhg(input_paths[fi]))
+                        throw std::runtime_error("cannot load .lhg index: " + input_paths[fi]);
+                    source_accs[fi] = std::move(idx.accessions);
+                    for (const auto& e : idx.entries) {
+                        MergeRef r;
+                        r.kind = MergeRef::Kind::LHG;
+                        r.hog_id = e.hog_id;
+                        r.source_file_idx = fi;
+                        r.lhg_data_offset = e.data_offset;
+                        r.lhg_data_length = e.data_length;
+                        per_file_refs[fi].push_back(std::move(r));
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(scan_err_mtx);
+                if (!scan_failed.exchange(true)) scan_error = e.what();
             }
+            if (input_paths.size() > 100 && (fi + 1) % 1000 == 0)
+                std::fprintf(stderr, "  scanned %zu/%zu inputs\r", fi + 1, input_paths.size());
         }
-        if (input_paths.size() > 100 && (fi + 1) % 1000 == 0)
-            std::cerr << "  scanned " << (fi + 1) << "/" << input_paths.size() << " inputs\r";
+    };
+
+    {
+        std::vector<std::thread> st;
+        st.reserve(scan_threads - 1);
+        for (size_t i = 1; i < scan_threads; ++i) st.emplace_back(scan_worker);
+        scan_worker();
+        for (auto& t : st) t.join();
     }
+    if (scan_failed.load()) throw std::runtime_error("scan failed: " + scan_error);
     if (input_paths.size() > 100) std::cerr << "\n";
+
+    // K-way merge: LHBs are pre-sorted by hog_id string (convert.hpp:215), so each
+    // per_file_refs[fi] is already sorted. O(N log K) replaces O(N log N) sort.
+    size_t total_refs = 0;
+    for (auto& v : per_file_refs) total_refs += v.size();
+    std::vector<MergeRef> refs;
+    refs.reserve(total_refs);
+    {
+        struct KM { std::string hid; size_t fi, idx; };
+        auto cmp = [](const KM& a, const KM& b) {
+            int c = a.hid.compare(b.hid);
+            if (c != 0) return c > 0;
+            return a.fi > b.fi;
+        };
+        std::priority_queue<KM, std::vector<KM>, decltype(cmp)> pq(cmp);
+        for (size_t fi = 0; fi < per_file_refs.size(); ++fi)
+            if (!per_file_refs[fi].empty())
+                pq.push({per_file_refs[fi][0].hog_id, fi, 0});
+        while (!pq.empty()) {
+            size_t fi  = pq.top().fi;
+            size_t idx = pq.top().idx;
+            pq.pop();
+            refs.push_back(std::move(per_file_refs[fi][idx]));
+            size_t nxt = idx + 1;
+            if (nxt < per_file_refs[fi].size())
+                pq.push({per_file_refs[fi][nxt].hog_id, fi, nxt});
+        }
+        for (auto& v : per_file_refs) { v.clear(); v.shrink_to_fit(); }
+    }
     std::cerr << "merge: " << refs.size() << " HOG-blocks from "
               << input_paths.size() << " inputs\n";
-
-    // (hog_id, source_file_idx) order makes HOG groups contiguous for streaming.
-    std::stable_sort(refs.begin(), refs.end(),
-        [](const MergeRef& a, const MergeRef& b) {
-            if (a.hog_id != b.hog_id) return a.hog_id < b.hog_id;
-            return a.source_file_idx < b.source_file_idx;
-        });
 
     // Global accession registry.
     std::vector<std::string> accessions;
@@ -313,6 +356,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     // One fd per source, opened lazily, kept alive for all of pass-2.
     struct SrcFile {
         UniqueFd fd{-1};
+        std::vector<uint8_t> buf;  // entire file in RAM for small files (LHBs); avoids pread per HOG
         SrcFile() = default;
         SrcFile(const SrcFile&) = delete;
         SrcFile& operator=(const SrcFile&) = delete;
@@ -329,6 +373,15 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 if (fd < 0) throw std::runtime_error("cannot open: " + input_paths[fi]);
                 posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
                 src_files[fi].fd = UniqueFd(fd);
+                // Buffer small files (LHBs) entirely in RAM — eliminates 60M pread syscalls.
+                struct stat st; off_t fsz = 0;
+                if (fstat(fd, &st) == 0) fsz = st.st_size;
+                if (fsz > 0 && fsz <= off_t(64 * 1024 * 1024)) {
+                    src_files[fi].buf.resize(size_t(fsz));
+                    ssize_t nr = ::read(fd, src_files[fi].buf.data(), size_t(fsz));
+                    if (nr != ssize_t(fsz))
+                        throw std::runtime_error("buffered read failed: " + input_paths[fi]);
+                }
                 fd_opened[fi].store(true, std::memory_order_release);
             }
         }
@@ -696,11 +749,19 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
                 if (ref.kind == MergeRef::Kind::LHB) {
                     uint32_t acc_idx = global_acc(ref.lhb_acc_id);
+                    const auto& sbuf = sf.buf;
+                    const size_t hdr_off = ref.lhb_shard_hdr_offset;
 
                     uint8_t hdr_bytes[28];
-                    ssize_t nr = ::pread(src_fd, hdr_bytes, sizeof(hdr_bytes), off_t(ref.lhb_shard_hdr_offset));
-                    if (nr != ssize_t(sizeof(hdr_bytes)))
-                        throw std::runtime_error("pread header failed: " + input_paths[ref.source_file_idx]);
+                    if (!sbuf.empty()) {
+                        if (hdr_off + sizeof(hdr_bytes) > sbuf.size())
+                            throw std::runtime_error("buf hdr OOB: " + input_paths[ref.source_file_idx]);
+                        memcpy(hdr_bytes, sbuf.data() + hdr_off, sizeof(hdr_bytes));
+                    } else {
+                        ssize_t nr = ::pread(src_fd, hdr_bytes, sizeof(hdr_bytes), off_t(hdr_off));
+                        if (nr != ssize_t(sizeof(hdr_bytes)))
+                            throw std::runtime_error("pread header failed: " + input_paths[ref.source_file_idx]);
+                    }
                     if (hdr_bytes[4] != SHARD_BLOCK_VERSION)
                         throw std::runtime_error("unsupported shard version in: " + input_paths[ref.source_file_idx]);
                     uint32_t compressed_sz = read_u32_le(hdr_bytes + 8);
@@ -711,15 +772,23 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     if (raw_sz > 512u * 1024 * 1024)
                         throw std::runtime_error("raw_sz OOB for HOG " + hog_id);
 
-                    cbuf_in.resize(compressed_sz);
-                    nr = ::pread(src_fd, cbuf_in.data(), compressed_sz,
-                                 off_t(ref.lhb_shard_hdr_offset) + sizeof(hdr_bytes));
-                    if (nr != ssize_t(compressed_sz))
-                        throw std::runtime_error("pread payload failed: " + input_paths[ref.source_file_idx]);
+                    const size_t pay_off = hdr_off + sizeof(hdr_bytes);
+                    const uint8_t* cdata;
+                    if (!sbuf.empty()) {
+                        if (pay_off + compressed_sz > sbuf.size())
+                            throw std::runtime_error("buf payload OOB: " + input_paths[ref.source_file_idx]);
+                        cdata = sbuf.data() + pay_off;
+                    } else {
+                        cbuf_in.resize(compressed_sz);
+                        ssize_t nr = ::pread(src_fd, cbuf_in.data(), compressed_sz, off_t(pay_off));
+                        if (nr != ssize_t(compressed_sz))
+                            throw std::runtime_error("pread payload failed: " + input_paths[ref.source_file_idx]);
+                        cdata = cbuf_in.data();
+                    }
 
                     raw_block.resize(raw_sz);
                     size_t rz = ZSTD_decompressDCtx(dctx, raw_block.data(), raw_sz,
-                                                    cbuf_in.data(), compressed_sz);
+                                                    cdata, compressed_sz);
                     if (ZSTD_isError(rz))
                         throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
 
