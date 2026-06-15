@@ -224,7 +224,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     // Per-source local accession registry (.lhg only). Populated once per
     // source instead of copied into every MergeRef (Fix 2).
     std::vector<std::vector<std::string>> source_accs(input_paths.size());
-    std::vector<uint8_t> source_versions(input_paths.size(), 4);
 
     for (size_t fi = 0; fi < input_paths.size(); ++fi) {
         MergeRef::Kind kind = detect_input_kind(input_paths[fi]);
@@ -248,7 +247,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             GlobalIndex idx;
             if (!idx.load_from_lhg(input_paths[fi]))
                 throw std::runtime_error("cannot load .lhg index: " + input_paths[fi]);
-            source_versions[fi] = idx.file_version;
             source_accs[fi] = std::move(idx.accessions);
             for (const auto& e : idx.entries) {
                 MergeRef r;
@@ -484,7 +482,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         e.hog_id      = ref.hog_id;
         e.data_offset = ref.lhg_data_offset;
         e.data_length = ref.lhg_data_length;
-        if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, hs.blocks[bi], source_versions[ref.source_file_idx]))
+        if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, hs.blocks[bi]))
             throw std::runtime_error("failed to read .lhg HOG " + hog_id + " block " + std::to_string(bi));
         hs.pending.fetch_sub(1, std::memory_order_release);
     };
@@ -588,7 +586,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
-                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs, source_versions[sfi]))
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
                             throw std::runtime_error("corrupt position record for HOG " + hog_id);
                         InvPosition ip;
                         ip.hog_pos = hog_pos;
@@ -651,7 +649,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     e.hog_id = ref.hog_id;
                     e.data_offset = ref.lhg_data_offset;
                     e.data_length = ref.lhg_data_length;
-                    if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, blocks[bi], source_versions[ref.source_file_idx]))
+                    if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, blocks[bi]))
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
                     const auto& remap = src_remap[ref.source_file_idx];
@@ -667,7 +665,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
-                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blocks[bi].local_accs, source_versions[ref.source_file_idx]))
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blocks[bi].local_accs))
                             throw std::runtime_error("corrupt position record for HOG " + hog_id);
                         InvPosition ip;
                         ip.hog_pos = hog_pos;
@@ -814,7 +812,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     e.data_offset = ref.lhg_data_offset;
                     e.data_length = ref.lhg_data_length;
                     InvBlock blk;
-                    if (!read_hog_inverted_fd(src_fd, input_paths[ref.source_file_idx], e, blk, source_versions[ref.source_file_idx]))
+                    if (!read_hog_inverted_fd(src_fd, input_paths[ref.source_file_idx], e, blk))
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
                     // Per-source acc remap: source's local acc registry → global.
@@ -830,7 +828,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
-                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs, source_versions[ref.source_file_idx]))
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
                             throw std::runtime_error("corrupt position record for HOG " + hog_id);
                         auto& dst = inverted[hog_pos];
                         for (const auto& o : obs) {
