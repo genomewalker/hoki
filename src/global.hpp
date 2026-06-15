@@ -65,7 +65,7 @@
 //         varint n_var; n_var × varint(delta local_acc_idx); n_var × uint8(codon_idx)
 //       else: n_obs × uint8(codon_idx)
 //
-//   Decompressed HOG payload — LHG_VERSION 7 (this file):
+//   Decompressed HOG payload — LHG_VERSION 8 (this file):
 //     [local acc dict + pident]
 //       varint n_local
 //       for each: varint delta_gacc, uint8 pident_u8
@@ -82,7 +82,7 @@
 //     [codon column — per position]
 //       for each position:
 //         uint8 consensus (or 0xFF = no consensus)
-//         if != 0xFF: varint n_var, n_var×varint(delta_lidx), n_var×uint8(codon)
+//         if != 0xFF: varint n_var, n_var×varint(delta_obs_ordinal), n_var×uint8(codon)
 //         else: n_obs × uint8 codon
 //
 //   Index section (at index_offset):
@@ -107,7 +107,7 @@ constexpr uint8_t LHG_FILE_MAGIC[4]      = {'L','H','G','G'};
 constexpr uint8_t LHG_INDEX_MAGIC[4]     = {'L','H','G','I'};
 constexpr uint8_t LHG_ACC_MAGIC[4]       = {'L','H','G','A'};
 constexpr uint8_t LHG_HOG_ENTRY_MAGIC[4] = {'L','H','H','E'};
-constexpr uint8_t LHG_VERSION            = 7;
+constexpr uint8_t LHG_VERSION            = 8;
 constexpr size_t  LHG_HEADER_SZ          = 16; // magic(4)+ver(1)+flags(1)+pad(2)+index_offset(8)
 
 struct HogIndexEntry {
@@ -226,7 +226,7 @@ struct InvPosition {
     std::vector<InvObs> obs;
 };
 
-// Serialize an inverted HOG block (v7 format).
+// Serialize an inverted HOG block (v8 format).
 // local_accs: sorted unique global acc_idx values for this HOG (obs remap global→local).
 // local_acc_pident: one byte per local acc = minimum pident across all HSPs for that acc.
 // positions: sorted ascending by hog_pos; each obs sorted ascending by (global) acc_idx.
@@ -259,8 +259,11 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
 
     uint32_t n_positions = uint32_t(positions.size());
 
-    // Collect obs counts and build tl_lidxs for all positions up-front (needed for codon column).
-    // We build 4 columns into separate buffers, then concatenate.
+    // Build 4 columns into separate buffers, then concatenate:
+    //   hdr_buf: position headers
+    //   acc_buf: acc column (all positions)
+    //   cnum_buf: cnum column (all positions, one varint per obs)
+    //   codon_buf: codon column (per position, using obs ordinals for variants)
     std::vector<uint8_t> hdr_buf, acc_buf, cnum_buf, codon_buf;
 
     // Position headers
@@ -272,36 +275,26 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
         write_varint(hdr_buf, uint32_t(pos.obs.size()));
     }
 
-    // Acc column + cnum column (all positions concatenated).
-    // Also collect per-position local idx arrays for codon column.
-    // We need them position-by-position for the codon delta encoding.
-    // Use a flat vector of vectors (one per position).
-    std::vector<std::vector<uint32_t>> all_lidxs(n_positions);
-
+    // Acc column (all positions concatenated) + cnum column (all positions concatenated).
     for (uint32_t pi = 0; pi < n_positions; ++pi) {
         const auto& pos = positions[pi];
         uint32_t n_obs = uint32_t(pos.obs.size());
-        all_lidxs[pi].resize(n_obs);
 
         uint32_t lacc_ptr = 0;
         uint32_t prev_li = 0;
         for (uint32_t i = 0; i < n_obs; ++i) {
             while (local_accs[lacc_ptr] < pos.obs[i].acc_idx) ++lacc_ptr;
             uint32_t li = lacc_ptr;
-            all_lidxs[pi][i] = li;
             write_varint(acc_buf, li - prev_li);
             prev_li = li;
+            write_varint(cnum_buf, pos.obs[i].cnum);
         }
-
-        // cnum column
-        for (const auto& o : pos.obs) write_varint(cnum_buf, o.cnum);
     }
 
-    // Codon column: per position
+    // Codon column: per position, consensus or explicit; variants keyed by obs ordinal.
     for (uint32_t pi = 0; pi < n_positions; ++pi) {
         const auto& pos = positions[pi];
         uint32_t n_obs = uint32_t(pos.obs.size());
-        const auto& lidxs = all_lidxs[pi];
 
         uint32_t counts[64] = {};
         for (const auto& o : pos.obs) counts[o.codon_idx & 0x3F]++;
@@ -315,11 +308,11 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
         } else {
             codon_buf.push_back(best);
             write_varint(codon_buf, n_var);
-            uint32_t prev_vli = 0;
+            uint32_t prev_ord = 0;
             for (uint32_t i = 0; i < n_obs; ++i) {
                 if (pos.obs[i].codon_idx != best) {
-                    write_varint(codon_buf, lidxs[i] - prev_vli);
-                    prev_vli = lidxs[i];
+                    write_varint(codon_buf, i - prev_ord);
+                    prev_ord = i;
                 }
             }
             for (const auto& o : pos.obs) if (o.codon_idx != best) codon_buf.push_back(o.codon_idx);
@@ -458,7 +451,7 @@ inline bool read_hog_inverted(const std::string& lhg_path,
     return read_hog_inverted_fd(fd, lhg_path, entry, out);
 }
 
-// Decode all positions in a v7 InvBlock.
+// Decode all positions in a v8 InvBlock.
 // Returns obs with acc_idx = LOCAL acc idx (caller resolves via blk.local_accs).
 inline std::vector<InvPosition> decode_block(const InvBlock& blk) {
     const uint8_t* p   = blk.pos_ptr;
@@ -503,67 +496,68 @@ inline std::vector<InvPosition> decode_block(const InvBlock& blk) {
         }
     }
 
-    // cnum column: total_obs varints
-    std::vector<uint32_t> all_cnum(total_obs);
-    for (uint32_t i = 0; i < total_obs; ++i) {
-        uint32_t c = 0;
-        n = read_varint(p, end, &c); if (!n) throw std::runtime_error("decode_block: corrupt cnum column");
-        p += n;
-        all_cnum[i] = c;
+    // Build InvPosition array: fill acc_idx; cnum filled in cnum column pass below.
+    std::vector<InvPosition> result(n_positions);
+    {
+        uint32_t obs_off = 0;
+        for (uint32_t pi = 0; pi < n_positions; ++pi) {
+            uint32_t nob = n_obs_vec[pi];
+            result[pi].hog_pos = pos_vals[pi];
+            result[pi].obs.resize(nob);
+            for (uint32_t i = 0; i < nob; ++i)
+                result[pi].obs[i].acc_idx = all_lidx[obs_off + i];
+            obs_off += nob;
+        }
     }
 
-    // Codon column + build InvPosition array
-    std::vector<InvPosition> result(n_positions);
-    uint32_t obs_off = 0;
+    // Cnum column (per-obs, global).
     for (uint32_t pi = 0; pi < n_positions; ++pi) {
-        uint32_t nob = n_obs_vec[pi];
-        result[pi].hog_pos = pos_vals[pi];
-        result[pi].obs.resize(nob);
-
-        // Fill acc_idx and cnum from flat columns
-        for (uint32_t i = 0; i < nob; ++i) {
-            result[pi].obs[i].acc_idx = all_lidx[obs_off + i];
-            result[pi].obs[i].cnum    = all_cnum[obs_off + i];
-        }
-
-        // Codon block
-        if (p >= end) throw std::runtime_error("decode_block: truncated codon block");
-        uint8_t consensus = *p++;
-        if (consensus == 0xFF) {
-            if (p + nob > end) throw std::runtime_error("decode_block: truncated explicit codons");
-            for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = *p++;
-        } else {
-            for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = consensus;
-            uint32_t n_var = 0;
-            n = read_varint(p, end, &n_var); if (!n) throw std::runtime_error("decode_block: corrupt n_var");
+        for (uint32_t i = 0; i < n_obs_vec[pi]; ++i) {
+            uint32_t c = 0;
+            n = read_varint(p, end, &c);
+            if (!n) throw std::runtime_error("decode_block: corrupt cnum column");
             p += n;
-            if (n_var > nob) throw std::runtime_error("decode_block: n_var > n_obs");
-
-            // Read variant local_acc_idxs (delta-encoded, relative to obs in this position)
-            static thread_local std::vector<uint32_t> tl_var_locals;
-            tl_var_locals.resize(n_var);
-            uint32_t prev_li = 0;
-            for (uint32_t vi = 0; vi < n_var; ++vi) {
-                uint32_t d = 0;
-                n = read_varint(p, end, &d); if (!n) throw std::runtime_error("decode_block: corrupt var lidx");
-                p += n;
-                prev_li += d;
-                tl_var_locals[vi] = prev_li;
-            }
-            if (p + n_var > end) throw std::runtime_error("decode_block: truncated var codons");
-
-            // Match variant lidxs to obs (obs are sorted by local_acc_idx)
-            uint32_t j = 0;
-            for (uint32_t vi = 0; vi < n_var; ++vi) {
-                uint8_t vc = *p++;
-                while (j < nob && all_lidx[obs_off + j] < tl_var_locals[vi]) ++j;
-                if (j >= nob || all_lidx[obs_off + j] != tl_var_locals[vi])
-                    throw std::runtime_error("decode_block: variant lidx not found in obs");
-                result[pi].obs[j].codon_idx = vc;
-                ++j;
-            }
+            result[pi].obs[i].cnum = c;
         }
-        obs_off += nob;
+    }
+
+    // Codon column: all positions sequentially, obs-ordinal-keyed variants.
+    {
+        uint32_t obs_off = 0;
+        static thread_local std::vector<uint32_t> tl_var_ords;
+        for (uint32_t pi = 0; pi < n_positions; ++pi) {
+            uint32_t nob = n_obs_vec[pi];
+            if (p >= end) throw std::runtime_error("decode_block: truncated codon block");
+            uint8_t consensus = *p++;
+            if (consensus == 0xFF) {
+                if (p + nob > end) throw std::runtime_error("decode_block: truncated explicit codons");
+                for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = *p++;
+            } else {
+                for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = consensus;
+                uint32_t n_var = 0;
+                n = read_varint(p, end, &n_var); if (!n) throw std::runtime_error("decode_block: corrupt n_var");
+                p += n;
+                if (n_var > nob) throw std::runtime_error("decode_block: n_var > n_obs");
+                tl_var_ords.resize(n_var);
+                uint32_t prev_ord = 0;
+                for (uint32_t vi = 0; vi < n_var; ++vi) {
+                    uint32_t d = 0;
+                    n = read_varint(p, end, &d); if (!n) throw std::runtime_error("decode_block: corrupt var ordinal");
+                    p += n;
+                    prev_ord += d;
+                    tl_var_ords[vi] = prev_ord;
+                }
+                if (p + n_var > end) throw std::runtime_error("decode_block: truncated var codons");
+                for (uint32_t vi = 0; vi < n_var; ++vi) {
+                    uint8_t vc = *p++;
+                    uint32_t ord = tl_var_ords[vi];
+                    if (ord >= nob) throw std::runtime_error("decode_block: var ordinal OOB");
+                    result[pi].obs[ord].codon_idx = vc;
+                }
+            }
+            obs_off += nob;
+        }
+        (void)obs_off;
     }
     return result;
 }

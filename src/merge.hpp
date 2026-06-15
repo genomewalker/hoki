@@ -443,7 +443,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::unordered_map<uint32_t, std::vector<InvObs>> inverted;
         std::vector<VarNTRecord> recs;
         std::vector<uint32_t>   contig_cnum;
-        // v7: per-HOG coverage/pident accumulators keyed by global acc_idx
+        // v8: per-HOG coverage/pident accumulators keyed by global acc_idx
         uint32_t hog_length = 0;
         std::unordered_map<uint32_t, uint32_t> acc_covered_aa_map;  // gacc → total covered AA
         std::unordered_map<uint32_t, uint8_t>  acc_pident_map;      // gacc → min pident_u8
@@ -758,7 +758,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         uint32_t cnum = contig_cnum[r.contig_idx];
                         uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
                         sc.hog_length = std::max(sc.hog_length, r.send + 1);
-                        sc.acc_covered_aa_map[acc_idx] += r.send - r.sstart + 1;
+                        uint32_t span = r.send - r.sstart + 1;
+                        sc.acc_covered_aa_map[acc_idx] += span;
                         {
                             auto [it2, ins] = sc.acc_pident_map.emplace(acc_idx, pu8);
                             if (!ins && pu8 < it2->second) it2->second = pu8;
