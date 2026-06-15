@@ -445,7 +445,10 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::vector<uint32_t>   contig_cnum;
         // v8: per-HOG coverage/pident accumulators keyed by global acc_idx
         uint32_t hog_length = 0;
-        std::unordered_map<uint32_t, uint32_t> acc_covered_aa_map;  // gacc → total covered AA
+        // .lhb sources: store raw HSP intervals; merged at serialize time to avoid double-counting overlaps
+        std::unordered_map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> acc_intervals_map;
+        // .lhg sources: pre-merged covered_aa summed directly (shards are HOG-disjoint, no overlap)
+        std::unordered_map<uint32_t, uint32_t> acc_covered_aa_map;
         std::unordered_map<uint32_t, uint8_t>  acc_pident_map;      // gacc → min pident_u8
     };
 
@@ -528,7 +531,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 auto& blocks  = hot_states[g]->blocks;
                 auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
                 // Init per-HOG accumulators
-                sc.hog_length = 0; sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
+                sc.hog_length = 0; sc.acc_intervals_map.clear(); sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
 
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
                     size_t sfi = refs[group_start + bi].source_file_idx;
@@ -601,7 +604,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 // Cold path
                 auto& blocks  = sc.blocks;  blocks.clear();  blocks.resize(n_blocks);
                 auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
-                sc.hog_length = 0; sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
+                sc.hog_length = 0; sc.acc_intervals_map.clear(); sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
 
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
                     const MergeRef& ref = refs[group_start + bi];
@@ -684,7 +687,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         } else {
             // Mixed/LHB groups: accumulate into a map, then sort.
             auto& inverted = sc.inverted; inverted.clear();
-            sc.hog_length = 0; sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
+            sc.hog_length = 0; sc.acc_intervals_map.clear(); sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
 
             for (size_t bi = 0; bi < n_blocks; ++bi) {
                 const MergeRef& ref = refs[group_start + bi];
@@ -758,8 +761,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         uint32_t cnum = contig_cnum[r.contig_idx];
                         uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
                         sc.hog_length = std::max(sc.hog_length, r.send + 1);
-                        uint32_t span = r.send - r.sstart + 1;
-                        sc.acc_covered_aa_map[acc_idx] += span;
+                        sc.acc_intervals_map[acc_idx].emplace_back(r.sstart, r.send);
                         {
                             auto [it2, ins] = sc.acc_pident_map.emplace(acc_idx, pu8);
                             if (!ins && pu8 < it2->second) it2->second = pu8;
@@ -834,6 +836,17 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         }
 
         // Build per-local-acc pident and covered_aa vectors from maps.
+        // covered_aa = merged .lhb intervals + direct .lhg sum (shards are HOG-disjoint).
+        auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
+            if (ivals.empty()) return 0;
+            std::sort(ivals.begin(), ivals.end());
+            uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
+            for (size_t k = 1; k < ivals.size(); ++k) {
+                if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
+                else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
+            }
+            return cov + ce - cs + 1;
+        };
         std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
         std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
         for (size_t li = 0; li < local_accs.size(); ++li) {
@@ -841,7 +854,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             auto it = sc.acc_pident_map.find(gacc);
             if (it != sc.acc_pident_map.end()) local_acc_pident[li] = it->second;
             auto it2 = sc.acc_covered_aa_map.find(gacc);
-            if (it2 != sc.acc_covered_aa_map.end()) covered_aa_v[li] = it2->second;
+            if (it2 != sc.acc_covered_aa_map.end()) covered_aa_v[li] += it2->second;
+            auto it3 = sc.acc_intervals_map.find(gacc);
+            if (it3 != sc.acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
         }
 
         // Serialize inverted block.
