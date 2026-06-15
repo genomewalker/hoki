@@ -444,12 +444,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::vector<uint32_t>   contig_cnum;
     };
 
-    // decode_one_block: pread + ZSTD decompress one source block into hot_states[g]->blocks[bi].
+    // decode_one_block: pread + LZ4 decompress one source block into hot_states[g]->blocks[bi].
     // Safe to call from any worker — each (g,bi) slot written by exactly one thread.
-    // Does NOT remap acc indices or build src_pos; that's done by the owner thread in
-    // bi=0..n_blocks-1 order after pending==0, preserving the cold-path traversal order
-    // so the unitig dict assignment is deterministic and output is byte-identical.
-    auto decode_one_block = [&](size_t g, size_t bi, ZSTD_DCtx* dctx) {
+    auto decode_one_block = [&](size_t g, size_t bi) {
         size_t group_start = groups[g].first;
         const std::string& hog_id = refs[group_start].hog_id;
         const MergeRef& ref = refs[group_start + bi];
@@ -460,7 +457,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         e.hog_id      = ref.hog_id;
         e.data_offset = ref.lhg_data_offset;
         e.data_length = ref.lhg_data_length;
-        if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, hs.blocks[bi], dctx))
+        if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, hs.blocks[bi]))
             throw std::runtime_error("failed to read .lhg HOG " + hog_id + " block " + std::to_string(bi));
         hs.pending.fetch_sub(1, std::memory_order_release);
     };
@@ -538,7 +535,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                             got = true;
                         }
                     }
-                    if (got) decode_one_block(dt.g, dt.bi, dctx);
+                    if (got) decode_one_block(dt.g, dt.bi);
                     else     std::this_thread::yield();
                 }
 
@@ -625,7 +622,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     e.hog_id = ref.hog_id;
                     e.data_offset = ref.lhg_data_offset;
                     e.data_length = ref.lhg_data_length;
-                    if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, blocks[bi], dctx))
+                    if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, blocks[bi]))
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
                     const auto& remap = src_remap[ref.source_file_idx];
@@ -781,7 +778,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     e.data_offset = ref.lhg_data_offset;
                     e.data_length = ref.lhg_data_length;
                     InvBlock blk;
-                    if (!read_hog_inverted_fd(src_fd, input_paths[ref.source_file_idx], e, blk, dctx))
+                    if (!read_hog_inverted_fd(src_fd, input_paths[ref.source_file_idx], e, blk))
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
                     // Per-source acc remap: source's local acc registry → global.
@@ -860,7 +857,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             gr.stored_sz = uint32_t(raw_sz) | 0x80000000u;
             gr.payload.assign(inv_raw.begin(), inv_raw.end());
         } else {
-            gr.stored_sz = uint32_t(total_lz4) | 0x40000000u;
+            gr.stored_sz = uint32_t(total_lz4);  // bit31=0 → LZ4
             gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + total_lz4);
         }
         // Signal the async writer that this result slot is ready.
@@ -908,7 +905,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 if (!dq_decode.empty()) { dt = dq_decode.front(); dq_decode.pop_front(); got = true; }
             }
             if (got) {
-                try { decode_one_block(dt.g, dt.bi, dctx); }
+                try { decode_one_block(dt.g, dt.bi); }
                 catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lk(err_mtx);
                     if (!failed.exchange(true)) first_error = e.what();

@@ -225,18 +225,18 @@ struct InvBlock {
 
 // pread one HOG entry's compressed payload from an already-open .lhg fd.
 // Thread-safe: pread carries no seek state. `dctx` may be nullptr → ZSTD_decompress.
+// stored_sz encoding: bit31=raw (payload is uncompressed), else payload is LZ4
+// with a 4-byte little-endian raw_sz header prepended.
 inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
-                                 const HogIndexEntry& entry, InvBlock& out,
-                                 ZSTD_DCtx* dctx = nullptr) {
-    (void)lhg_path;  // kept for signature symmetry / future diagnostics
+                                 const HogIndexEntry& entry, InvBlock& out) {
+    (void)lhg_path;
     uint8_t hoe[8];
     if (::pread(fd, hoe, 8, off_t(entry.data_offset)) != 8 ||
         memcmp(hoe, LHG_HOG_ENTRY_MAGIC, 4) != 0)
         throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
     uint32_t stored = read_u32_le(hoe + 4);
-    bool is_raw  = (stored >> 31) & 1;
-    bool is_lz4  = !is_raw && ((stored >> 30) & 1);
-    uint32_t payload_sz = stored & (is_raw ? 0x7FFFFFFFu : 0x3FFFFFFFu);
+    bool is_raw = (stored >> 31) & 1;
+    uint32_t payload_sz = stored & 0x7FFFFFFFu;
     if (payload_sz > 256u * 1024 * 1024) return false;
     std::vector<uint8_t> cbuf(payload_sz);
     if (::pread(fd, cbuf.data(), payload_sz, off_t(entry.data_offset) + 8) != ssize_t(payload_sz))
@@ -244,8 +244,8 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
 
     if (is_raw) {
         out.raw.assign(cbuf.begin(), cbuf.end());
-    } else if (is_lz4) {
-        if (payload_sz < 4) throw std::runtime_error("LZ4 HOG payload truncated: " + entry.hog_id);
+    } else {
+        if (payload_sz < 4) throw std::runtime_error("LZ4 payload truncated: " + entry.hog_id);
         uint32_t raw_sz = read_u32_le(cbuf.data());
         if (raw_sz > 256u * 1024 * 1024) throw std::runtime_error("LZ4 raw_sz OOB: " + entry.hog_id);
         out.raw.resize(raw_sz);
@@ -255,17 +255,6 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
             int(payload_sz - 4), int(raw_sz));
         if (dz < 0)
             throw std::runtime_error("LZ4 HOG decompress failed: " + entry.hog_id);
-    } else {
-        unsigned long long rsz = ZSTD_getFrameContentSize(cbuf.data(), payload_sz);
-        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
-            throw std::runtime_error("cannot determine raw size for HOG " + entry.hog_id);
-        out.raw.resize(size_t(rsz));
-        size_t dz = dctx
-            ? ZSTD_decompressDCtx(dctx, out.raw.data(), out.raw.size(), cbuf.data(), payload_sz)
-            : ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf.data(), payload_sz);
-        if (ZSTD_isError(dz))
-            throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
-        out.raw.resize(dz);
     }
 
     const uint8_t* p = out.raw.data();
@@ -308,9 +297,9 @@ inline bool read_hog_inverted(const std::string& lhg_path,
             throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
         uint32_t stored = 0;
         if (!fd_read_exact(fd, &stored, 4)) return false;
-        is_raw  = (stored >> 31) & 1;
-        is_lz4  = !is_raw && ((stored >> 30) & 1);
-        payload_sz = stored & (is_raw ? 0x7FFFFFFFu : 0x3FFFFFFFu);
+        is_raw = (stored >> 31) & 1;
+        is_lz4 = !is_raw;
+        payload_sz = stored & 0x7FFFFFFFu;
         if (payload_sz > 256u * 1024 * 1024) return false;
         cbuf.resize(payload_sz);
         if (!fd_read_exact(fd, cbuf.data(), payload_sz)) return false;
@@ -328,15 +317,6 @@ inline bool read_hog_inverted(const std::string& lhg_path,
             reinterpret_cast<char*>(out.raw.data()),
             int(payload_sz - 4), int(raw_sz));
         if (dz < 0) throw std::runtime_error("LZ4 HOG decompress failed: " + entry.hog_id);
-    } else {
-        unsigned long long rsz = ZSTD_getFrameContentSize(cbuf.data(), payload_sz);
-        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
-            throw std::runtime_error("cannot determine raw size for HOG " + entry.hog_id);
-        out.raw.resize(size_t(rsz));
-        size_t dz = ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf.data(), payload_sz);
-        if (ZSTD_isError(dz))
-            throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
-        out.raw.resize(dz);
     }
 
     const uint8_t* p = out.raw.data();
