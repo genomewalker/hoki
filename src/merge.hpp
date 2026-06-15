@@ -135,7 +135,7 @@ inline InvBlock merge_inv_blocks(
         uint32_t prev_pos = 0;
         for (uint32_t pi = 0; pi < n_positions; ++pi) {
             uint32_t hog_pos = 0;
-            if (!decode_position(p, end, prev_pos, hog_pos, obs))
+            if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
                 throw std::runtime_error("merge_inv_blocks: corrupt position record");
             auto& dst = merged[hog_pos];
             for (const auto& o : obs) {
@@ -145,7 +145,7 @@ inline InvBlock merge_inv_blocks(
                 if (o.unitig_idx >= blk.unitigs.size())
                     throw std::runtime_error("merge_inv_blocks: unitig_idx OOB");
                 uint32_t cnum = blk.unitigs[o.unitig_idx];
-                dst.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                dst.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum), o.pident_u8});
             }
         }
     }
@@ -466,6 +466,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::unordered_map<uint32_t, std::vector<InvObs>> inverted;
         std::vector<VarNTRecord> recs;
         std::vector<uint32_t>   contig_cnum;
+        // v6: per-HOG coverage accumulators (reset at start of each mixed/lhb group)
+        uint32_t hog_length = 0;
+        std::vector<uint32_t> covered_aa;
     };
 
     // decode_one_block: pread + LZ4 decompress one source block into hot_states[g]->blocks[bi].
@@ -571,7 +574,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 auto& blocks  = hot_states[g]->blocks;
                 auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
-                    const auto& remap = src_remap[refs[group_start + bi].source_file_idx];
+                    size_t sfi = refs[group_start + bi].source_file_idx;
+                    const auto& remap = src_remap[sfi];
                     const InvBlock& blk = blocks[bi];
                     const uint8_t* p   = blk.pos_ptr;
                     const uint8_t* end = blk.end;
@@ -584,7 +588,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
-                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs, source_versions[sfi]))
                             throw std::runtime_error("corrupt position record for HOG " + hog_id);
                         InvPosition ip;
                         ip.hog_pos = hog_pos;
@@ -597,7 +601,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                                 throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
                             uint32_t cnum = blk.unitigs[o.unitig_idx];
                             mark_acc(gacc);
-                            ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                            ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum), o.pident_u8});
                         }
                         src_pos[bi].push_back(std::move(ip));
                     }
@@ -663,7 +667,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
-                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blocks[bi].local_accs))
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blocks[bi].local_accs, source_versions[ref.source_file_idx]))
                             throw std::runtime_error("corrupt position record for HOG " + hog_id);
                         InvPosition ip;
                         ip.hog_pos = hog_pos;
@@ -676,7 +680,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                                 throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
                             uint32_t cnum = blocks[bi].unitigs[o.unitig_idx];
                             mark_acc(gacc);
-                            ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                            ip.obs.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum), o.pident_u8});
                         }
                         src_pos[bi].push_back(std::move(ip));
                     }
@@ -721,6 +725,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         } else {
             // Mixed/LHB groups: accumulate into a map, then sort (existing path).
             auto& inverted = sc.inverted; inverted.clear();
+            sc.hog_length = 0; sc.covered_aa.clear();
             for (size_t bi = 0; bi < n_blocks; ++bi) {
                 const MergeRef& ref = refs[group_start + bi];
                 SrcFile& sf = get_src_file(ref.source_file_idx);
@@ -791,10 +796,14 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         if (r.contig_idx >= contig_cnum.size())
                             throw std::runtime_error("contig_idx OOB in HOG " + hog_id);
                         uint32_t u_idx = unitig_idx_of(acc_idx, contig_cnum[r.contig_idx]);
+                        uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
+                        sc.hog_length = std::max(sc.hog_length, r.send + 1);
+                        if (u_idx >= sc.covered_aa.size()) sc.covered_aa.resize(u_idx + 1, 0);
+                        sc.covered_aa[u_idx] += r.send - r.sstart + 1;
                         for (const auto& o : r.vars) {
                             uint32_t hog_pos   = r.sstart + o.hog_offset;
                             uint8_t  codon_idx = uint8_t(o.packed_codon >> 2);
-                            inverted[hog_pos].push_back({acc_idx, codon_idx, u_idx});
+                            inverted[hog_pos].push_back({acc_idx, codon_idx, u_idx, pu8});
                         }
                     }
                 } else {
@@ -821,7 +830,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t prev_pos = 0;
                     for (uint32_t pi = 0; pi < n_positions; ++pi) {
                         uint32_t hog_pos = 0;
-                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
+                        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs, source_versions[ref.source_file_idx]))
                             throw std::runtime_error("corrupt position record for HOG " + hog_id);
                         auto& dst = inverted[hog_pos];
                         for (const auto& o : obs) {
@@ -832,7 +841,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                                 throw std::runtime_error("unitig_idx OOB for HOG " + hog_id);
                             uint32_t cnum = blk.unitigs[o.unitig_idx];
                             mark_acc(gacc);
-                            dst.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum)});
+                            dst.push_back({gacc, o.codon_idx, unitig_idx_of(gacc, cnum), o.pident_u8});
                         }
                     }
                 }
@@ -865,7 +874,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
         // Serialize inverted block (build phase ends here).
         inv_raw.clear();
-        serialize_inverted_block(inv_raw, unitigs, local_accs, positions);
+        serialize_inverted_block(inv_raw, unitigs, local_accs, positions, sc.hog_length, sc.covered_aa);
         t_build_end = clock_ns();
 
         tl_decode += t_dec_end - t0;

@@ -18,8 +18,8 @@ static void usage(const char* prog) {
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
         << "                  inputs may be .lhb or .lhg, mixed\n"
         << "  " << prog << " accregistry <out.acc> <shard.lhgi> [shard.lhgi ...]\n"
-        << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA]\n"
-        << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID>\n"
+        << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA] [--min-pident N]\n"
+        << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
 }
 
@@ -93,14 +93,19 @@ int main(int argc, char* argv[]) {
         std::string hog_id    = argv[4];
         uint32_t    pos       = uint32_t(std::stoul(argv[5]));
         std::optional<uint8_t> aa;
-        if (argc >= 7) aa = lhi::encode_aa(argv[6][0]);
+        uint8_t min_pident = 0;
+        for (int i = 6; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--min-pident" && i+1 < argc) min_pident = uint8_t(std::stoul(argv[++i]));
+            else if (aa == std::nullopt && a.size() == 1) aa = lhi::encode_aa(a[0]);
+        }
 
         lhi::GlobalIndex idx;
         if (!idx.load(lhgi_path) && !idx.load_from_lhg(lhg_path)) {
             std::cerr << "cannot load index from " << lhgi_path << "\n";
             return 1;
         }
-        lhi::query_saav(lhg_path, idx, hog_id, pos, aa);
+        lhi::query_saav(lhg_path, idx, hog_id, pos, aa, min_pident);
         return 0;
     }
 
@@ -109,13 +114,18 @@ int main(int argc, char* argv[]) {
         std::string lhg_path  = argv[2];
         std::string lhgi_path = argv[3];
         std::string hog_id    = argv[4];
+        uint8_t min_pident = 0;
+        for (int i = 5; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--min-pident" && i+1 < argc) min_pident = uint8_t(std::stoul(argv[++i]));
+        }
 
         lhi::GlobalIndex idx;
         if (!idx.load(lhgi_path) && !idx.load_from_lhg(lhg_path)) {
             std::cerr << "cannot load index from " << lhgi_path << "\n";
             return 1;
         }
-        lhi::query_freq(lhg_path, idx, hog_id);
+        lhi::query_freq(lhg_path, idx, hog_id, min_pident);
         return 0;
     }
 
