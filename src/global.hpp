@@ -329,7 +329,9 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
         throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
     uint32_t stored = read_u32_le(hoe_buf + 4);
     bool is_raw  = (stored >> 31) & 1;
-    bool is_zstd = !is_raw && ((stored >> 30) & 1);
+    // v4 blocks: bit31=raw, else ZSTD (no LZ4, no bit30 flag).
+    // v5+ blocks: bit31=raw, bit30=ZSTD, else LZ4.
+    bool is_zstd = !is_raw && (file_version < 5 || ((stored >> 30) & 1));
     uint32_t payload_sz = stored & (is_raw ? 0x7FFFFFFFu : 0x3FFFFFFFu);
     if (payload_sz > 256u * 1024 * 1024) return false;
 
