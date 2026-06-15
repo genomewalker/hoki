@@ -6,6 +6,7 @@
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <zstd.h>
 #include <lz4.h>
 #include <stdexcept>
@@ -13,7 +14,7 @@
 #include <cstdio>
 #include <optional>
 
-// .lhg — LHG Global file (LHG_VERSION 4: position-centric inverted format).
+// .lhg — LHG Global file (LHG_VERSION 4).
 // .lhgi — LHG Index: companion small file; load once, range-GET .lhg per HOG.
 //
 // .lhg layout:
@@ -36,7 +37,7 @@
 //     for each position (sorted ascending by hog_pos):
 //       varint hog_pos (delta from previous; first = absolute)
 //       varint n_obs
-//       acc_idx   column: n_obs delta-varints (first absolute, then deltas)
+//       n_obs delta-varints (acc_idx, delta from previous; first = absolute)
 //       codon_idx column: n_obs raw bytes (value 0-63 = packed_codon >> 2)
 //       unitig_idx column: n_obs varints (index into local unitig dict)
 //
@@ -190,14 +191,11 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
     write_varint(raw, uint32_t(positions.size()));
     uint32_t prev_pos = 0;
     for (const auto& pos : positions) {
-        write_varint(raw, pos.hog_pos - prev_pos);  // delta; first = absolute
+        write_varint(raw, pos.hog_pos - prev_pos);
         prev_pos = pos.hog_pos;
         write_varint(raw, uint32_t(pos.obs.size()));
         uint32_t prev = 0;
-        for (const auto& o : pos.obs) {
-            write_varint(raw, o.acc_idx - prev);
-            prev = o.acc_idx;
-        }
+        for (const auto& o : pos.obs) { write_varint(raw, o.acc_idx - prev); prev = o.acc_idx; }
         for (const auto& o : pos.obs) raw.push_back(o.codon_idx);
         for (const auto& o : pos.obs) write_varint(raw, o.unitig_idx);
     }
@@ -224,42 +222,44 @@ struct InvBlock {
 };
 
 // pread one HOG entry's compressed payload from an already-open .lhg fd.
-// Thread-safe: pread carries no seek state. `dctx` may be nullptr → ZSTD_decompress.
+// Thread-safe: pread carries no seek state.
 // stored_sz: bit31=raw · bit30=ZSTD · else=LZ4 (4B raw_sz header prepended)
 inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
                                  const HogIndexEntry& entry, InvBlock& out) {
     (void)lhg_path;
-    uint8_t hoe[8];
-    if (::pread(fd, hoe, 8, off_t(entry.data_offset)) != 8 ||
-        memcmp(hoe, LHG_HOG_ENTRY_MAGIC, 4) != 0)
+    uint8_t hoe_buf[8];
+    if (::pread(fd, hoe_buf, 8, off_t(entry.data_offset)) != 8) return false;
+    if (memcmp(hoe_buf, LHG_HOG_ENTRY_MAGIC, 4) != 0)
         throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
-    uint32_t stored = read_u32_le(hoe + 4);
+    uint32_t stored = read_u32_le(hoe_buf + 4);
     bool is_raw  = (stored >> 31) & 1;
     bool is_zstd = !is_raw && ((stored >> 30) & 1);
     uint32_t payload_sz = stored & (is_raw ? 0x7FFFFFFFu : 0x3FFFFFFFu);
     if (payload_sz > 256u * 1024 * 1024) return false;
-    std::vector<uint8_t> cbuf(payload_sz);
-    if (::pread(fd, cbuf.data(), payload_sz, off_t(entry.data_offset) + 8) != ssize_t(payload_sz))
+
+    std::vector<uint8_t> cbuf_owned(payload_sz);
+    if (::pread(fd, cbuf_owned.data(), payload_sz, off_t(entry.data_offset) + 8) != ssize_t(payload_sz))
         return false;
+    const uint8_t* cbuf = cbuf_owned.data();
 
     if (is_raw) {
-        out.raw.assign(cbuf.begin(), cbuf.end());
+        out.raw.assign(cbuf, cbuf + payload_sz);
     } else if (is_zstd) {
-        unsigned long long rsz = ZSTD_getFrameContentSize(cbuf.data(), payload_sz);
+        unsigned long long rsz = ZSTD_getFrameContentSize(cbuf, payload_sz);
         if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
             throw std::runtime_error("cannot determine ZSTD raw size for HOG " + entry.hog_id);
         out.raw.resize(size_t(rsz));
-        size_t dz = ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf.data(), payload_sz);
+        size_t dz = ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf, payload_sz);
         if (ZSTD_isError(dz))
             throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
         out.raw.resize(dz);
     } else {
         if (payload_sz < 4) throw std::runtime_error("LZ4 payload truncated: " + entry.hog_id);
-        uint32_t raw_sz = read_u32_le(cbuf.data());
+        uint32_t raw_sz = read_u32_le(cbuf);
         if (raw_sz > 256u * 1024 * 1024) throw std::runtime_error("LZ4 raw_sz OOB: " + entry.hog_id);
         out.raw.resize(raw_sz);
         int dz = LZ4_decompress_safe(
-            reinterpret_cast<const char*>(cbuf.data() + 4),
+            reinterpret_cast<const char*>(cbuf + 4),
             reinterpret_cast<char*>(out.raw.data()),
             int(payload_sz - 4), int(raw_sz));
         if (dz < 0)
@@ -367,7 +367,6 @@ inline bool decode_position(const uint8_t*& p, const uint8_t* end,
     prev_pos = hog_pos;
     uint32_t n_obs = 0;
     n = read_varint(p, end, &n_obs); if (!n) return false; p += n;
-    if (size_t(n_obs) > size_t(end - p)) return false;  // each obs ≥1 byte; bound before resize
     obs.resize(n_obs);
     uint32_t prev = 0;
     for (uint32_t i = 0; i < n_obs; ++i) {

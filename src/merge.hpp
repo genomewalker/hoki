@@ -18,6 +18,7 @@
 #include <set>
 #include <fstream>
 #include <queue>
+#include <numeric>
 #include <deque>
 #include <thread>
 #include <atomic>
@@ -301,25 +302,30 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         for (size_t i = 0; i < accs.size(); ++i) src_remap[fi][i] = global_acc(accs[i]);
     }
 
-    // Fix 1: one fd per source, opened lazily, kept alive for all of pass-2.
+    // One fd per source, opened lazily, kept alive for all of pass-2.
     // pread is positional, so a shared read-only fd is thread-safe on Linux.
-    std::vector<UniqueFd> src_fds;
-    src_fds.reserve(input_paths.size());
-    for (size_t i = 0; i < input_paths.size(); ++i) src_fds.emplace_back(-1);
+    struct SrcFile {
+        UniqueFd fd{-1};
+        SrcFile() = default;
+        SrcFile(const SrcFile&) = delete;
+        SrcFile& operator=(const SrcFile&) = delete;
+        SrcFile(SrcFile&&) = delete;
+    };
+    std::vector<SrcFile> src_files(input_paths.size());
     std::vector<std::atomic<bool>> fd_opened(input_paths.size());
     std::vector<std::mutex> fd_open_mtx(input_paths.size());
-    auto get_src_fd = [&](size_t fi) -> int {
+    auto get_src_file = [&](size_t fi) -> SrcFile& {
         if (!fd_opened[fi].load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lk(fd_open_mtx[fi]);
             if (!fd_opened[fi].load(std::memory_order_relaxed)) {
                 int fd = open(input_paths[fi].c_str(), O_RDONLY);
                 if (fd < 0) throw std::runtime_error("cannot open: " + input_paths[fi]);
                 posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-                src_fds[fi].fd = fd;
+                src_files[fi].fd = UniqueFd(fd);
                 fd_opened[fi].store(true, std::memory_order_release);
             }
         }
-        return src_fds[fi].fd;
+        return src_files[fi];
     };
 
     // Fix 3 step 1: pre-scan contiguous HOG groups (refs are stable_sorted by
@@ -357,6 +363,17 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     std::vector<size_t> group_bucket(n_groups);
     for (size_t g = 0; g < n_groups; ++g)
         group_bucket[g] = bucket_of(refs[groups[g].first].hog_id);
+
+    // Largest-first dispatch: process big HOGs first to minimise tail latency.
+    // Precompute per-group total compressed size for largest-first dispatch.
+    std::vector<uint64_t> group_sz(n_groups, 0);
+    for (size_t g = 0; g < n_groups; ++g)
+        for (size_t i = groups[g].first; i < groups[g].second; ++i)
+            group_sz[g] += refs[i].lhg_data_length;
+    std::vector<size_t> dispatch_order(n_groups);
+    std::iota(dispatch_order.begin(), dispatch_order.end(), 0);
+    std::sort(dispatch_order.begin(), dispatch_order.end(),
+              [&](size_t a, size_t b) { return group_sz[a] > group_sz[b]; });
 
     // Per-phase profiling counters (summed across all threads).
     struct ProfCounters {
@@ -451,14 +468,14 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         size_t group_start = groups[g].first;
         const std::string& hog_id = refs[group_start].hog_id;
         const MergeRef& ref = refs[group_start + bi];
-        int fd = get_src_fd(ref.source_file_idx);
+        SrcFile& sf = get_src_file(ref.source_file_idx);
         HotHogState& hs = *hot_states[g];
 
         HogIndexEntry e;
         e.hog_id      = ref.hog_id;
         e.data_offset = ref.lhg_data_offset;
         e.data_length = ref.lhg_data_length;
-        if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, hs.blocks[bi]))
+        if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, hs.blocks[bi]))
             throw std::runtime_error("failed to read .lhg HOG " + hog_id + " block " + std::to_string(bi));
         hs.pending.fetch_sub(1, std::memory_order_release);
     };
@@ -618,12 +635,12 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
                     const MergeRef& ref = refs[group_start + bi];
-                    int fd = get_src_fd(ref.source_file_idx);
+                    SrcFile& sf = get_src_file(ref.source_file_idx);
                     HogIndexEntry e;
                     e.hog_id = ref.hog_id;
                     e.data_offset = ref.lhg_data_offset;
                     e.data_length = ref.lhg_data_length;
-                    if (!read_hog_inverted_fd(fd, input_paths[ref.source_file_idx], e, blocks[bi]))
+                    if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, blocks[bi]))
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
 
                     const auto& remap = src_remap[ref.source_file_idx];
@@ -698,7 +715,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             auto& inverted = sc.inverted; inverted.clear();
             for (size_t bi = 0; bi < n_blocks; ++bi) {
                 const MergeRef& ref = refs[group_start + bi];
-                int src_fd = get_src_fd(ref.source_file_idx);
+                SrcFile& sf = get_src_file(ref.source_file_idx);
+                int src_fd = sf.fd;
 
                 if (ref.kind == MergeRef::Kind::LHB) {
                     uint32_t acc_idx = global_acc(ref.lhb_acc_id);
@@ -898,8 +916,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         WorkerScratch scratch;
         uint64_t tl_decode = 0, tl_build = 0, tl_compress = 0;
         for (;;) {
-            size_t g = next_group.fetch_add(1, std::memory_order_relaxed);
-            if (g < groups.size() && !failed.load(std::memory_order_relaxed)) {
+            size_t di = next_group.fetch_add(1, std::memory_order_relaxed);
+            if (di < dispatch_order.size() && !failed.load(std::memory_order_relaxed)) {
+                size_t g = dispatch_order[di];
                 try {
                     process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
                                   scratch, tl_decode, tl_build, tl_compress);
@@ -927,7 +946,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 continue;
             }
             // Nothing to do: check if we can exit.
-            bool hog_done = (next_group.load(std::memory_order_relaxed) >= groups.size());
+            bool hog_done = (next_group.load(std::memory_order_relaxed) >= dispatch_order.size());
             bool hot_empty;
             { std::lock_guard<std::mutex> lk(dq_mtx); hot_empty = dq_decode.empty(); }
             if (hog_done && hot_empty) break;
