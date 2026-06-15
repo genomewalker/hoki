@@ -302,21 +302,16 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
         for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
         uint32_t n_var = n_obs - best_cnt;
 
-        if (n_var == n_obs) {
-            codon_buf.push_back(0xFF);
-            for (const auto& o : pos.obs) codon_buf.push_back(o.codon_idx);
-        } else {
-            codon_buf.push_back(best);
-            write_varint(codon_buf, n_var);
-            uint32_t prev_ord = 0;
-            for (uint32_t i = 0; i < n_obs; ++i) {
-                if (pos.obs[i].codon_idx != best) {
-                    write_varint(codon_buf, i - prev_ord);
-                    prev_ord = i;
-                }
+        codon_buf.push_back(best);
+        write_varint(codon_buf, n_var);
+        uint32_t prev_ord = 0;
+        for (uint32_t i = 0; i < n_obs; ++i) {
+            if (pos.obs[i].codon_idx != best) {
+                write_varint(codon_buf, i - prev_ord);
+                prev_ord = i;
             }
-            for (const auto& o : pos.obs) if (o.codon_idx != best) codon_buf.push_back(o.codon_idx);
         }
+        for (const auto& o : pos.obs) if (o.codon_idx != best) codon_buf.push_back(o.codon_idx);
     }
 
     // Concatenate all sections
@@ -404,7 +399,7 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
     n = read_varint(p, out.end, &n_local);
     if (!n) throw std::runtime_error("corrupt local acc dict for HOG " + entry.hog_id);
     p += n;
-    if (n_local > 65536) throw std::runtime_error("n_local OOB for HOG " + entry.hog_id);
+    if (n_local > 100'000'000u) throw std::runtime_error("n_local OOB for HOG " + entry.hog_id);
     out.local_accs.resize(n_local);
     out.local_acc_pident.resize(n_local);
     {
@@ -523,41 +518,33 @@ inline std::vector<InvPosition> decode_block(const InvBlock& blk) {
 
     // Codon column: all positions sequentially, obs-ordinal-keyed variants.
     {
-        uint32_t obs_off = 0;
         static thread_local std::vector<uint32_t> tl_var_ords;
         for (uint32_t pi = 0; pi < n_positions; ++pi) {
             uint32_t nob = n_obs_vec[pi];
             if (p >= end) throw std::runtime_error("decode_block: truncated codon block");
             uint8_t consensus = *p++;
-            if (consensus == 0xFF) {
-                if (p + nob > end) throw std::runtime_error("decode_block: truncated explicit codons");
-                for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = *p++;
-            } else {
-                for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = consensus;
-                uint32_t n_var = 0;
-                n = read_varint(p, end, &n_var); if (!n) throw std::runtime_error("decode_block: corrupt n_var");
+            for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].codon_idx = consensus;
+            uint32_t n_var = 0;
+            n = read_varint(p, end, &n_var); if (!n) throw std::runtime_error("decode_block: corrupt n_var");
+            p += n;
+            if (n_var > nob) throw std::runtime_error("decode_block: n_var > n_obs");
+            tl_var_ords.resize(n_var);
+            uint32_t prev_ord = 0;
+            for (uint32_t vi = 0; vi < n_var; ++vi) {
+                uint32_t d = 0;
+                n = read_varint(p, end, &d); if (!n) throw std::runtime_error("decode_block: corrupt var ordinal");
                 p += n;
-                if (n_var > nob) throw std::runtime_error("decode_block: n_var > n_obs");
-                tl_var_ords.resize(n_var);
-                uint32_t prev_ord = 0;
-                for (uint32_t vi = 0; vi < n_var; ++vi) {
-                    uint32_t d = 0;
-                    n = read_varint(p, end, &d); if (!n) throw std::runtime_error("decode_block: corrupt var ordinal");
-                    p += n;
-                    prev_ord += d;
-                    tl_var_ords[vi] = prev_ord;
-                }
-                if (p + n_var > end) throw std::runtime_error("decode_block: truncated var codons");
-                for (uint32_t vi = 0; vi < n_var; ++vi) {
-                    uint8_t vc = *p++;
-                    uint32_t ord = tl_var_ords[vi];
-                    if (ord >= nob) throw std::runtime_error("decode_block: var ordinal OOB");
-                    result[pi].obs[ord].codon_idx = vc;
-                }
+                prev_ord += d;
+                tl_var_ords[vi] = prev_ord;
             }
-            obs_off += nob;
+            if (p + n_var > end) throw std::runtime_error("decode_block: truncated var codons");
+            for (uint32_t vi = 0; vi < n_var; ++vi) {
+                uint8_t vc = *p++;
+                uint32_t ord = tl_var_ords[vi];
+                if (ord >= nob) throw std::runtime_error("decode_block: var ordinal OOB");
+                result[pi].obs[ord].codon_idx = vc;
+            }
         }
-        (void)obs_off;
     }
     return result;
 }
