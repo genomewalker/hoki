@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <optional>
 
-// .lhg — LHG Global file (LHG_VERSION 4).
+// .lhg — LHG Global file.
 // .lhgi — LHG Index: companion small file; load once, range-GET .lhg per HOG.
 //
 // .lhg layout:
@@ -27,19 +27,28 @@
 //   Data section (HOGs sorted lexicographically):
 //     For each HOG entry:
 //       "LHHE" (4) magic
-//       stored_sz (4)  ← uint32 LE; high bit set = raw fallback, low 31 = payload size
-//       payload (stored_sz & 0x7FFFFFFF bytes; zstd frame or raw inverted block)
+//       stored_sz (4)  ← uint32 LE; bit31=raw · bit30=ZSTD · else=LZ4
+//       payload bytes
 //
-//   Decompressed HOG payload (inverted block):
-//     varint n_unitigs
-//     for each unitig: varint(contig_num)  ← uint32 numeric suffix only
+//   Decompressed HOG payload — LHG_VERSION 4:
+//     varint n_unitigs; per unitig: varint(contig_num)
 //     varint n_positions
-//     for each position (sorted ascending by hog_pos):
-//       varint hog_pos (delta from previous; first = absolute)
-//       varint n_obs
-//       n_obs delta-varints (acc_idx, delta from previous; first = absolute)
-//       codon_idx column: n_obs raw bytes (value 0-63 = packed_codon >> 2)
-//       unitig_idx column: n_obs varints (index into local unitig dict)
+//     per position: varint hog_pos_delta · varint n_obs
+//       n_obs × varint(delta global_acc_idx)
+//       n_obs × uint8(codon_idx)
+//       n_obs × varint(unitig_idx)
+//
+//   Decompressed HOG payload — LHG_VERSION 5 (this file):
+//     varint n_unitigs; per unitig: varint(contig_num)
+//     varint n_hog_accs; per local acc: varint(delta global_acc_idx)   ← HOG-local dict
+//     varint n_positions
+//     per position: varint hog_pos_delta · varint n_obs
+//       n_obs × varint(delta local_acc_idx)   ← 0..n_hog_accs-1; ~1 byte each
+//       n_obs × varint(unitig_idx)
+//       uint8 consensus_codon                  ← dominant codon (0xFF = all explicit)
+//       if consensus != 0xFF:
+//         varint n_var; n_var × varint(delta local_acc_idx); n_var × uint8(codon_idx)
+//       else: n_obs × uint8(codon_idx)
 //
 //   Index section (at index_offset):
 //     "LHGI" (4)
@@ -63,7 +72,8 @@ constexpr uint8_t LHG_FILE_MAGIC[4]      = {'L','H','G','G'};
 constexpr uint8_t LHG_INDEX_MAGIC[4]     = {'L','H','G','I'};
 constexpr uint8_t LHG_ACC_MAGIC[4]       = {'L','H','G','A'};
 constexpr uint8_t LHG_HOG_ENTRY_MAGIC[4] = {'L','H','H','E'};
-constexpr uint8_t LHG_VERSION            = 4;
+constexpr uint8_t LHG_VERSION            = 5;
+constexpr uint8_t LHG_VERSION_MIN        = 4;  // oldest version we can read
 constexpr size_t  LHG_HEADER_SZ          = 16; // magic(4)+ver(1)+flags(1)+pad(2)+index_offset(8)
 
 struct HogIndexEntry {
@@ -74,6 +84,7 @@ struct HogIndexEntry {
 };
 
 struct GlobalIndex {
+    uint8_t                    file_version = LHG_VERSION;
     std::vector<HogIndexEntry> entries;
     std::vector<std::string>   accessions;  // acc_idx → acc_id string
 
@@ -97,7 +108,8 @@ struct GlobalIndex {
         if (::read(fd, hdr, LHG_HEADER_SZ) != ssize_t(LHG_HEADER_SZ) ||
             memcmp(hdr, LHG_FILE_MAGIC, 4) != 0)
             return false;
-        if (hdr[4] != LHG_VERSION) return false;  // reject unknown version
+        if (hdr[4] < LHG_VERSION_MIN || hdr[4] > LHG_VERSION) return false;
+        file_version = hdr[4];
         uint64_t idx_off = 0;
         for (int i = 0; i < 8; ++i) idx_off |= uint64_t(hdr[8 + i]) << (8 * i);
         if (lseek(fd, off_t(idx_off), SEEK_SET) < 0) return false;
@@ -180,24 +192,72 @@ struct InvPosition {
     std::vector<InvObs> obs;
 };
 
-// Serialize an inverted HOG block to raw bytes (pre-compression).
-// unitigs = per-HOG local dict; positions sorted ascending by hog_pos,
-// each position's obs sorted ascending by acc_idx.
+// Serialize an inverted HOG block (v5 format).
+// local_accs: sorted unique global acc_idx values for this HOG (obs remap global→local).
+// positions: sorted ascending by hog_pos; each obs sorted ascending by (global) acc_idx.
 inline void serialize_inverted_block(std::vector<uint8_t>& raw,
                                      const std::vector<uint32_t>& unitigs,
+                                     const std::vector<uint32_t>& local_accs,
                                      const std::vector<InvPosition>& positions) {
+    // Unitig dict
     write_varint(raw, uint32_t(unitigs.size()));
-    for (const auto& cnum : unitigs) write_varint(raw, cnum);
+    for (auto c : unitigs) write_varint(raw, c);
+
+    // Per-HOG local acc dict (delta global acc_idx, sorted)
+    write_varint(raw, uint32_t(local_accs.size()));
+    uint32_t prev_gacc = 0;
+    for (auto g : local_accs) { write_varint(raw, g - prev_gacc); prev_gacc = g; }
+
     write_varint(raw, uint32_t(positions.size()));
     uint32_t prev_pos = 0;
     for (const auto& pos : positions) {
         write_varint(raw, pos.hog_pos - prev_pos);
         prev_pos = pos.hog_pos;
-        write_varint(raw, uint32_t(pos.obs.size()));
-        uint32_t prev = 0;
-        for (const auto& o : pos.obs) { write_varint(raw, o.acc_idx - prev); prev = o.acc_idx; }
-        for (const auto& o : pos.obs) raw.push_back(o.codon_idx);
+        uint32_t n_obs = uint32_t(pos.obs.size());
+        write_varint(raw, n_obs);
+
+        // Acc column: obs are sorted by acc_idx → forward scan in local_accs
+        // (O(n_obs + n_local) total) vs binary search (O(n_obs * log n_local)).
+        static thread_local std::vector<uint32_t> tl_lidxs;
+        tl_lidxs.resize(n_obs);
+        uint32_t lacc_ptr = 0;
+        uint32_t prev_li = 0;
+        for (uint32_t i = 0; i < n_obs; ++i) {
+            while (local_accs[lacc_ptr] < pos.obs[i].acc_idx) ++lacc_ptr;
+            uint32_t li = lacc_ptr;
+            tl_lidxs[i] = li;
+            write_varint(raw, li - prev_li);
+            prev_li = li;
+        }
+
+        // Unitig column
         for (const auto& o : pos.obs) write_varint(raw, o.unitig_idx);
+
+        // Codon column with consensus optimization.
+        uint32_t counts[64] = {};
+        for (const auto& o : pos.obs) counts[o.codon_idx & 0x3F]++;
+        uint8_t best = 0; uint32_t best_cnt = 0;
+        for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
+        uint32_t n_var = n_obs - best_cnt;
+
+        if (n_var == n_obs) {
+            // All different — no consensus worth writing
+            raw.push_back(0xFF);
+            for (const auto& o : pos.obs) raw.push_back(o.codon_idx);
+        } else {
+            raw.push_back(best);
+            write_varint(raw, n_var);
+            // Variant local_acc_idx list (sorted, delta-encoded)
+            uint32_t prev_vli = 0;
+            for (uint32_t i = 0; i < n_obs; ++i) {
+                if (pos.obs[i].codon_idx != best) {
+                    write_varint(raw, tl_lidxs[i] - prev_vli);
+                    prev_vli = tl_lidxs[i];
+                }
+            }
+            // Variant codon values
+            for (const auto& o : pos.obs) if (o.codon_idx != best) raw.push_back(o.codon_idx);
+        }
     }
 }
 
@@ -213,19 +273,23 @@ inline bool fd_read_exact(int fd, void* buf, size_t n) {
 }
 
 // Read + decompress one HOG entry's inverted payload into raw bytes.
-// Parses local unitig dict; leaves `p`/`end` positioned at the n_positions varint.
+// Parses local unitig dict (and local acc dict for v5+).
+// pos_ptr/end span from n_positions varint to end of decompressed payload.
 struct InvBlock {
-    std::vector<uint8_t>     raw;       // owns decompressed payload
-    std::vector<uint32_t>    unitigs;   // local unitig dict (contig numbers)
-    const uint8_t*           pos_ptr;   // → n_positions varint
-    const uint8_t*           end;
+    std::vector<uint8_t>     raw;        // owns decompressed payload
+    std::vector<uint32_t>    unitigs;    // local unitig dict (contig numbers)
+    std::vector<uint32_t>    local_accs; // v5: HOG-local global acc_idx list (empty = v4)
+    const uint8_t*           pos_ptr = nullptr;
+    const uint8_t*           end     = nullptr;
 };
 
-// pread one HOG entry's compressed payload from an already-open .lhg fd.
-// Thread-safe: pread carries no seek state.
-// stored_sz: bit31=raw · bit30=ZSTD · else=LZ4 (4B raw_sz header prepended)
+// Decompress raw HOG payload into out.raw and parse the header fields (unitig dict
+// and, for v5, per-HOG local acc list). Leaves pos_ptr at the n_positions varint.
+// file_version: pass the .lhg file's version byte (4 or 5).
+// Thread-safe: uses pread (no shared fd seek state).
 inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
-                                 const HogIndexEntry& entry, InvBlock& out) {
+                                 const HogIndexEntry& entry, InvBlock& out,
+                                 uint8_t file_version = LHG_VERSION) {
     (void)lhg_path;
     uint8_t hoe_buf[8];
     if (::pread(fd, hoe_buf, 8, off_t(entry.data_offset)) != 8) return false;
@@ -268,8 +332,9 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
 
     const uint8_t* p = out.raw.data();
     out.end = p + out.raw.size();
+    int n;
     uint32_t n_unitigs = 0;
-    int n = read_varint(p, out.end, &n_unitigs);
+    n = read_varint(p, out.end, &n_unitigs);
     if (!n) throw std::runtime_error("corrupt unitig dict for HOG " + entry.hog_id);
     p += n;
     if (n_unitigs > 65536) throw std::runtime_error("n_unitigs OOB for HOG " + entry.hog_id);
@@ -281,85 +346,47 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
         p += n;
         out.unitigs[i] = cnum;
     }
+
+    // v5: parse per-HOG local acc dict (global acc_idx values, delta-encoded).
+    out.local_accs.clear();
+    if (file_version >= 5) {
+        uint32_t n_local = 0;
+        n = read_varint(p, out.end, &n_local);
+        if (!n) throw std::runtime_error("corrupt local acc dict for HOG " + entry.hog_id);
+        p += n;
+        out.local_accs.resize(n_local);
+        uint32_t prev = 0;
+        for (uint32_t i = 0; i < n_local; ++i) {
+            uint32_t d = 0;
+            n = read_varint(p, out.end, &d);
+            if (!n) throw std::runtime_error("truncated local acc dict");
+            p += n;
+            prev += d;
+            out.local_accs[i] = prev;
+        }
+    }
+
     out.pos_ptr = p;
     return true;
 }
 
+// Open-and-read variant for query path (saav/freq). Delegates to read_hog_inverted_fd.
 inline bool read_hog_inverted(const std::string& lhg_path,
                               const HogIndexEntry& entry,
-                              InvBlock& out) {
-    bool is_raw = false;
-    bool is_lz4 = false;
-    uint32_t payload_sz = 0;
-    std::vector<uint8_t> cbuf;
-    {
-        UniqueFd fd(open(lhg_path.c_str(), O_RDONLY));
-        if (fd < 0) throw std::runtime_error("cannot open: " + lhg_path);
-        uint8_t fhdr[LHG_HEADER_SZ];
-        if (::read(fd, fhdr, LHG_HEADER_SZ) != ssize_t(LHG_HEADER_SZ) ||
-            memcmp(fhdr, LHG_FILE_MAGIC, 4) != 0 || fhdr[4] != LHG_VERSION)
-            throw std::runtime_error("bad or incompatible .lhg: " + lhg_path);
-        if (lseek(fd, off_t(entry.data_offset), SEEK_SET) < 0)
-            throw std::runtime_error("seek failed in: " + lhg_path);
-        uint8_t hoe_magic[4];
-        if (!fd_read_exact(fd, hoe_magic, 4) || memcmp(hoe_magic, LHG_HOG_ENTRY_MAGIC, 4) != 0)
-            throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
-        uint32_t stored = 0;
-        if (!fd_read_exact(fd, &stored, 4)) return false;
-        is_raw  = (stored >> 31) & 1;
-        is_lz4  = !is_raw && !((stored >> 30) & 1);
-        payload_sz = stored & (is_raw ? 0x7FFFFFFFu : 0x3FFFFFFFu);
-        if (payload_sz > 256u * 1024 * 1024) return false;
-        cbuf.resize(payload_sz);
-        if (!fd_read_exact(fd, cbuf.data(), payload_sz)) return false;
-    }
-
-    if (is_raw) {
-        out.raw.assign(cbuf.begin(), cbuf.end());
-    } else if (is_lz4) {
-        if (payload_sz < 4) throw std::runtime_error("LZ4 payload truncated: " + entry.hog_id);
-        uint32_t raw_sz = uint32_t(cbuf[0]) | (uint32_t(cbuf[1])<<8) | (uint32_t(cbuf[2])<<16) | (uint32_t(cbuf[3])<<24);
-        if (raw_sz > 256u * 1024 * 1024) throw std::runtime_error("LZ4 raw_sz OOB: " + entry.hog_id);
-        out.raw.resize(raw_sz);
-        int dz = LZ4_decompress_safe(
-            reinterpret_cast<const char*>(cbuf.data() + 4),
-            reinterpret_cast<char*>(out.raw.data()),
-            int(payload_sz - 4), int(raw_sz));
-        if (dz < 0) throw std::runtime_error("LZ4 HOG decompress failed: " + entry.hog_id);
-    } else {
-        unsigned long long rsz = ZSTD_getFrameContentSize(cbuf.data(), payload_sz);
-        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
-            throw std::runtime_error("cannot determine ZSTD raw size for HOG " + entry.hog_id);
-        out.raw.resize(size_t(rsz));
-        size_t dz = ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf.data(), payload_sz);
-        if (ZSTD_isError(dz))
-            throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
-        out.raw.resize(dz);
-    }
-
-    const uint8_t* p = out.raw.data();
-    out.end = p + out.raw.size();
-    uint32_t n_unitigs = 0;
-    int n = read_varint(p, out.end, &n_unitigs);
-    if (!n) throw std::runtime_error("corrupt unitig dict for HOG " + entry.hog_id);
-    p += n;
-    if (n_unitigs > 65536) throw std::runtime_error("n_unitigs OOB for HOG " + entry.hog_id);
-    out.unitigs.resize(n_unitigs);
-    for (uint32_t i = 0; i < n_unitigs; ++i) {
-        uint32_t cnum = 0;
-        n = read_varint(p, out.end, &cnum);
-        if (!n) throw std::runtime_error("truncated unitig dict");
-        p += n;
-        out.unitigs[i] = cnum;
-    }
-    out.pos_ptr = p;
-    return true;
+                              InvBlock& out,
+                              uint8_t file_version = LHG_VERSION) {
+    UniqueFd fd(open(lhg_path.c_str(), O_RDONLY));
+    if (fd < 0) throw std::runtime_error("cannot open: " + lhg_path);
+    return read_hog_inverted_fd(fd, lhg_path, entry, out, file_version);
 }
 
 // Decode one position's observation columns. Advances `p`.
+// local_accs: if non-empty (v5), maps local_acc_idx → global acc_idx.
+//             if empty (v4), local_acc_idx IS the (shard-local) global acc_idx.
 inline bool decode_position(const uint8_t*& p, const uint8_t* end,
                             uint32_t& prev_pos, uint32_t& hog_pos,
-                            std::vector<InvObs>& obs) {
+                            std::vector<InvObs>& obs,
+                            const std::vector<uint32_t>& local_accs = {}) {
     int n;
     uint32_t delta = 0;
     n = read_varint(p, end, &delta); if (!n) return false; p += n;
@@ -368,19 +395,69 @@ inline bool decode_position(const uint8_t*& p, const uint8_t* end,
     uint32_t n_obs = 0;
     n = read_varint(p, end, &n_obs); if (!n) return false; p += n;
     obs.resize(n_obs);
-    uint32_t prev = 0;
-    for (uint32_t i = 0; i < n_obs; ++i) {
-        uint32_t d = 0;
-        n = read_varint(p, end, &d); if (!n) return false; p += n;
-        prev += d;
-        obs[i].acc_idx = prev;
-    }
-    if (p + n_obs > end) return false;
-    for (uint32_t i = 0; i < n_obs; ++i) obs[i].codon_idx = *p++;
-    for (uint32_t i = 0; i < n_obs; ++i) {
-        uint32_t u = 0;
-        n = read_varint(p, end, &u); if (!n) return false; p += n;
-        obs[i].unitig_idx = u;
+
+    if (local_accs.empty()) {
+        // v4 fast path: no tl_local_idxs, no remapping overhead.
+        uint32_t prev = 0;
+        for (uint32_t i = 0; i < n_obs; ++i) {
+            uint32_t d = 0;
+            n = read_varint(p, end, &d); if (!n) return false; p += n;
+            prev += d;
+            obs[i].acc_idx = prev;
+        }
+        if (p + n_obs > end) return false;
+        for (uint32_t i = 0; i < n_obs; ++i) obs[i].codon_idx = *p++;
+        for (uint32_t i = 0; i < n_obs; ++i) {
+            uint32_t u = 0;
+            n = read_varint(p, end, &u); if (!n) return false; p += n;
+            obs[i].unitig_idx = u;
+        }
+    } else {
+        // v5: acc remap via local dict, unitig before codon, consensus codon encoding.
+        static thread_local std::vector<uint32_t> tl_local_idxs;
+        tl_local_idxs.resize(n_obs);
+        uint32_t prev_local = 0;
+        for (uint32_t i = 0; i < n_obs; ++i) {
+            uint32_t d = 0;
+            n = read_varint(p, end, &d); if (!n) return false; p += n;
+            prev_local += d;
+            tl_local_idxs[i] = prev_local;
+            obs[i].acc_idx = local_accs[prev_local];
+        }
+        for (uint32_t i = 0; i < n_obs; ++i) {
+            uint32_t u = 0;
+            n = read_varint(p, end, &u); if (!n) return false; p += n;
+            obs[i].unitig_idx = u;
+        }
+        if (p >= end) return false;
+        uint8_t consensus = *p++;
+        if (consensus == 0xFF) {
+            if (p + n_obs > end) return false;
+            for (uint32_t i = 0; i < n_obs; ++i) obs[i].codon_idx = *p++;
+        } else {
+            for (uint32_t i = 0; i < n_obs; ++i) obs[i].codon_idx = consensus;
+            uint32_t n_var = 0;
+            n = read_varint(p, end, &n_var); if (!n) return false; p += n;
+            if (n_var > n_obs) return false;
+            static thread_local std::vector<uint32_t> tl_var_locals;
+            tl_var_locals.resize(n_var);
+            uint32_t prev_li = 0;
+            for (uint32_t vi = 0; vi < n_var; ++vi) {
+                uint32_t d = 0;
+                n = read_varint(p, end, &d); if (!n) return false; p += n;
+                prev_li += d;
+                tl_var_locals[vi] = prev_li;
+            }
+            if (p + n_var > end) return false;
+            uint32_t j = 0;
+            for (uint32_t vi = 0; vi < n_var; ++vi) {
+                uint8_t vc = *p++;
+                while (j < n_obs && tl_local_idxs[j] < tl_var_locals[vi]) ++j;
+                if (j >= n_obs || tl_local_idxs[j] != tl_var_locals[vi]) return false;
+                obs[j].codon_idx = vc;
+                ++j;
+            }
+        }
     }
     return true;
 }
@@ -407,7 +484,7 @@ inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
         return;
     }
     InvBlock blk;
-    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+    if (!read_hog_inverted(lhg_path, *entry, blk, idx.file_version)) return;
 
     const uint8_t* p   = blk.pos_ptr;
     const uint8_t* end = blk.end;
@@ -422,7 +499,7 @@ inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
     uint32_t prev_pos = 0;
     for (uint32_t pi = 0; pi < n_positions; ++pi) {
         uint32_t hog_pos = 0;
-        if (!decode_position(p, end, prev_pos, hog_pos, obs))
+        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
             throw std::runtime_error("corrupt position record for HOG " + hog_id);
         if (hog_pos != pos) continue;
         for (const auto& o : obs) {
@@ -451,7 +528,7 @@ inline void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
         return;
     }
     InvBlock blk;
-    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+    if (!read_hog_inverted(lhg_path, *entry, blk, idx.file_version)) return;
 
     const uint8_t* p   = blk.pos_ptr;
     const uint8_t* end = blk.end;
@@ -466,7 +543,7 @@ inline void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
     uint32_t prev_pos = 0;
     for (uint32_t pi = 0; pi < n_positions; ++pi) {
         uint32_t hog_pos = 0;
-        if (!decode_position(p, end, prev_pos, hog_pos, obs))
+        if (!decode_position(p, end, prev_pos, hog_pos, obs, blk.local_accs))
             throw std::runtime_error("corrupt position record for HOG " + hog_id);
         // Count distinct accessions per codon at this position.
         // obs is sorted by acc_idx, but multiple unitigs may repeat an acc per
