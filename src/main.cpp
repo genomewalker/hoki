@@ -149,12 +149,13 @@ int main(int argc, char* argv[]) {
         std::mutex          serr_mtx;
 
         auto sworker = [&]() {
+            lhi::ShardScratch sc(accessions.size());
             for (;;) {
                 size_t hi = next_h.fetch_add(1, std::memory_order_relaxed);
                 if (hi >= hog_list.size() || sfailed.load(std::memory_order_relaxed)) break;
                 try {
                     results[hi] = lhi::merge_shard_compute_extents(
-                        hog_list[hi]->first, hog_list[hi]->second, tfd_ints, accessions);
+                        hog_list[hi]->first, hog_list[hi]->second, tfd_ints, sc);
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lk(serr_mtx);
                     if (!sfailed.exchange(true)) serr = e.what();
