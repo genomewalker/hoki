@@ -10,19 +10,9 @@
 #include <stdexcept>
 #include <cstring>
 
-// LHI Container: HOG-sharded append-only directory.
+// Shard block: the per-HOG record unit written into .lhb batch files.
 //
-// Layout:
-//   container.lhc/
-//     shards/<HOG_ID>.lhs   — one file per HOG, sequence of shard blocks
-//
-// Each .lhs file is a sequence of ShardBlock records written independently
-// by concurrent workers.  Writers hold a POSIX write lock (fcntl F_SETLKW)
-// for the duration of a single append — NFS-safe (unlike flock).
-// No global index is needed: the shard path is derived deterministically
-// from the HOG ID string.
-//
-// Shard block wire format:
+// Wire format:
 //   ShardBlockHeader (28 bytes)
 //   zstd-compressed payload (compressed_sz bytes)
 //
@@ -52,27 +42,8 @@ struct ShardBlockHeader {
 static_assert(sizeof(ShardBlockHeader) == 28);
 #pragma pack(pop)
 
-inline void posix_wlock(int fd) {
-    struct flock fl{};
-    fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET; fl.l_start = 0; fl.l_len = 0;
-    if (fcntl(fd, F_SETLKW, &fl) != 0)
-        throw std::runtime_error("fcntl F_WRLCK failed");
-}
-inline void posix_unlock(int fd) {
-    struct flock fl{};
-    fl.l_type = F_UNLCK; fl.l_whence = SEEK_SET; fl.l_start = 0; fl.l_len = 0;
-    fcntl(fd, F_SETLK, &fl);
-}
-
-// Convert a HOG ID string to a safe filename (replaces '/' ':' ' ' with '_').
-inline std::string hog_to_filename(const std::string& hog_id) {
-    std::string s = hog_id;
-    for (char& c : s) if (c == '/' || c == ':' || c == ' ') c = '_';
-    return s + ".lhs";
-}
 
 // Serialize local contig dict + VarNT block, compress, write to open fd.
-// Caller must hold the POSIX write lock (posix_wlock) on fd before calling.
 inline void write_shard_block(int fd,
                                const std::vector<std::string>& global_contigs,
                                std::vector<VarNTRecord>& recs,
@@ -143,78 +114,6 @@ inline void write_shard_block(int fd,
         throw std::runtime_error("shard write error");
 }
 
-// Open (or create) shard_path, lock, append one block, unlock, close.
-inline void flush_hog_shard(const std::filesystem::path& shard_path,
-                              const std::vector<std::string>& global_contigs,
-                              std::vector<VarNTRecord>& recs,
-                              int zstd_level) {
-    if (recs.empty()) return;
-    int fd = open(shard_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd < 0) throw std::runtime_error("cannot open shard: " + shard_path.string());
-    posix_wlock(fd);
-    try { write_shard_block(fd, global_contigs, recs, zstd_level); }
-    catch (...) { posix_unlock(fd); close(fd); throw; }
-    posix_unlock(fd);
-    close(fd);
-}
 
-// Read all shard blocks from a .lhs file.
-// For each block calls: cb(local_contigs, records)
-// Returns false if the file does not exist (HOG absent from container).
-template<typename Cb>
-inline bool read_shard_file(const std::string& path, Cb cb) {
-    UniqueFd fd(open(path.c_str(), O_RDONLY));
-    if (fd < 0) return false;
-
-    uint8_t hdr[28];
-    while (true) {
-        ssize_t nr = ::read(fd, hdr, sizeof(hdr));
-        if (nr == 0) break;
-        if (nr != ssize_t(sizeof(hdr)))
-            throw std::runtime_error("truncated shard header: " + path);
-        if (std::memcmp(hdr, SHARD_BLOCK_MAGIC, 4) != 0)
-            throw std::runtime_error("bad shard magic in: " + path);
-        if (hdr[4] != SHARD_BLOCK_VERSION)
-            throw std::runtime_error("unsupported shard version " +
-                std::to_string(hdr[4]) + " in: " + path);
-
-        uint32_t compressed_sz = read_u32_le(hdr + 8);
-        uint32_t raw_sz        = read_u32_le(hdr + 12);
-        if (compressed_sz > 256u * 1024 * 1024 || raw_sz > 512u * 1024 * 1024)
-            throw std::runtime_error("shard block size OOB in: " + path);
-
-        std::vector<uint8_t> cbuf(compressed_sz);
-        if (::read(fd, cbuf.data(), compressed_sz) != ssize_t(compressed_sz))
-            throw std::runtime_error("truncated shard data: " + path);
-
-        std::vector<uint8_t> raw(raw_sz);
-        size_t rz = ZSTD_decompress(raw.data(), raw_sz, cbuf.data(), compressed_sz);
-        if (ZSTD_isError(rz))
-            throw std::runtime_error(std::string("shard zstd: ") + ZSTD_getErrorName(rz));
-
-        const uint8_t* p = raw.data(), *end = p + raw.size();
-
-        uint32_t n_contigs = 0;
-        int n = read_varint(p, end, &n_contigs);
-        if (!n) throw std::runtime_error("corrupt contig dict in: " + path);
-        p += n;
-        std::vector<std::string> local_contigs(n_contigs);
-        for (uint32_t i = 0; i < n_contigs; ++i) {
-            uint32_t len = 0;
-            n = read_varint(p, end, &len);
-            if (!n || p + n + len > end) throw std::runtime_error("truncated contig dict");
-            p += n;
-            local_contigs[i].assign(reinterpret_cast<const char*>(p), len);
-            p += len;
-        }
-
-        std::vector<VarNTRecord> recs;
-        if (!deserialize_varnt_block(p, end, recs))
-            throw std::runtime_error("corrupt varnt block in: " + path);
-
-        cb(local_contigs, recs);
-    }
-    return true;
-}
 
 } // namespace lhi

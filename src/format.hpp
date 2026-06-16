@@ -133,10 +133,9 @@ inline void unpack_codon(uint8_t pk, char* out) {
 }
 
 // VarNT block (format v4): SoA columns, sstart-sorted, written by
-// serialize_varnt_block below. obs_aa and n_M are derived at read time, not stored.
+// serialize_varnt_block below. n_M is derived at read time, not stored.
 struct VarNTObs {
     uint32_t hog_offset;    // bit index into presence bitmap = (hog_pos - sstart)
-    uint8_t  obs_aa;        // derived in memory, not on disk
     uint8_t  packed_codon;
 };
 
@@ -270,7 +269,6 @@ inline bool deserialize_varnt_block(const uint8_t* p, const uint8_t* end,
                 VarNTObs obs;
                 obs.hog_offset   = b;
                 obs.packed_codon = uint8_t(ci6 << 2);  // 6→8 bit; low 2 bits always 0
-                obs.obs_aa       = codon_to_aa(obs.packed_codon);
                 r.vars.push_back(obs);
             }
         }

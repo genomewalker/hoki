@@ -197,7 +197,7 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
                 ++n_obs_dropped; continue;
             }
 
-            vr.vars.push_back({i, obs_aa, packed});
+            vr.vars.push_back({i, packed});
         }
 
         if (!vr.vars.empty())

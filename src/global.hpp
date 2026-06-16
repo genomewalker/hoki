@@ -118,7 +118,6 @@ struct HogIndexEntry {
 };
 
 struct GlobalIndex {
-    uint8_t                    file_version = LHG_VERSION;
     std::vector<HogIndexEntry> entries;
     std::vector<std::string>   accessions;  // acc_idx → acc_id string
 
@@ -143,7 +142,6 @@ struct GlobalIndex {
             memcmp(hdr, LHG_FILE_MAGIC, 4) != 0)
             return false;
         if (hdr[4] != LHG_VERSION) return false;
-        file_version = hdr[4];
         uint64_t idx_off = 0;
         for (int i = 0; i < 8; ++i) idx_off |= uint64_t(hdr[8 + i]) << (8 * i);
         if (lseek(fd, off_t(idx_off), SEEK_SET) < 0) return false;
@@ -315,17 +313,6 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
     raw.insert(raw.end(), codon_buf.begin(), codon_buf.end());
 }
 
-// Convenience overload: allocates scratch buffers locally (use only on cold paths).
-inline void serialize_inverted_block(std::vector<uint8_t>& raw,
-                                     const std::vector<uint32_t>& local_accs,
-                                     const std::vector<uint8_t>& local_acc_pident,
-                                     const std::vector<InvPosition>& positions,
-                                     uint32_t hog_length = 0,
-                                     const std::vector<uint32_t>& covered_aa = {}) {
-    std::vector<uint8_t> hdr, acc, cnum, codon;
-    serialize_inverted_block(raw, local_accs, local_acc_pident, positions,
-                             hog_length, covered_aa, hdr, acc, cnum, codon);
-}
 
 // Read exactly n bytes from fd; returns false on short read.
 inline bool fd_read_exact(int fd, void* buf, size_t n) {
@@ -405,7 +392,9 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
     n = read_varint(p, out.end, &n_local);
     if (!n) throw std::runtime_error("corrupt local acc dict for HOG " + entry.hog_id);
     p += n;
-    if (n_local > 100'000'000u) throw std::runtime_error("n_local OOB for HOG " + entry.hog_id);
+    // n_local is bounded only by the global accession count; allow the full uint32 range.
+    // ceiling: a HOG cannot reference more than UINT32_MAX accessions (acc_idx is uint32);
+    // a varint that decodes past that is genuine corruption, already rejected by read_varint.
     out.local_accs.resize(n_local);
     out.local_acc_pident.resize(n_local);
     {

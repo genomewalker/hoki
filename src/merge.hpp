@@ -3,6 +3,7 @@
 #include "global.hpp"
 #include "batch.hpp"
 #include "container.hpp"
+#include "partition.hpp"
 #include <lz4.h>
 #include <algorithm>
 #include <vector>
@@ -33,6 +34,8 @@ static inline uint64_t clock_ns() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
+
+namespace lhi {
 
 // 8 MB write buffer: reduces per-HOG write() syscalls from 3 to ~0.003
 // (one flush per ~2730 HOGs instead of 3 syscalls per HOG).
@@ -69,6 +72,8 @@ struct WriteBuffer {
     }
 };
 
+} // namespace lhi (WriteBuffer)
+
 // Merge N inputs (.lhb per-accession batches and/or already-inverted .lhg
 // shards) into one position-centric .lhg plus its .lhgi index. For .lhb inputs
 // inversion happens here; .lhg inputs are re-inverted into the global acc space.
@@ -103,81 +108,6 @@ inline MergeRef::Kind detect_input_kind(const std::string& path) {
     throw std::runtime_error("unrecognized magic (not .lhb/.lhg): " + path);
 }
 
-// Merge multiple InvBlocks (one per source .lhg) into a single InvBlock.
-// acc_remap[i] maps source i's local acc_idx → global acc_idx.
-inline InvBlock merge_inv_blocks(
-        std::vector<std::pair<InvBlock, std::vector<uint32_t>>> sources) {
-
-    // hog_pos → merged obs (acc_idx already global; cnum direct).
-    std::unordered_map<uint32_t, std::vector<InvObs>> merged;
-    std::unordered_map<uint32_t, uint32_t>  acc_covered_aa_map;
-    std::unordered_map<uint32_t, uint8_t>   acc_pident_map;
-    uint32_t hog_length = 0;
-
-    for (auto& [blk, remap] : sources) {
-        hog_length = std::max(hog_length, blk.hog_length);
-        // Propagate coverage and pident from blk (indexed by local acc)
-        for (size_t li = 0; li < blk.local_accs.size(); ++li) {
-            if (li >= remap.size()) continue;
-            uint32_t gacc = remap[li];
-            if (li < blk.covered_aa.size())
-                acc_covered_aa_map[gacc] += blk.covered_aa[li];
-            if (li < blk.local_acc_pident.size()) {
-                uint8_t pid = blk.local_acc_pident[li];
-                auto it = acc_pident_map.find(gacc);
-                if (it == acc_pident_map.end() || pid < it->second) acc_pident_map[gacc] = pid;
-            }
-        }
-
-        auto positions = decode_block(blk);
-        for (const auto& ip : positions) {
-            auto& dst = merged[ip.hog_pos];
-            for (const auto& o : ip.obs) {
-                uint32_t li = o.acc_idx;
-                if (li >= remap.size())
-                    throw std::runtime_error("merge_inv_blocks: acc_idx out of remap range");
-                uint32_t gacc = remap[li];
-                dst.push_back({gacc, o.codon_idx, o.cnum});
-            }
-        }
-    }
-
-    std::vector<InvPosition> positions;
-    positions.reserve(merged.size());
-    for (auto& kv : merged) {
-        std::sort(kv.second.begin(), kv.second.end(),
-            [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
-        positions.push_back({kv.first, std::move(kv.second)});
-    }
-    std::sort(positions.begin(), positions.end(),
-        [](const InvPosition& a, const InvPosition& b) { return a.hog_pos < b.hog_pos; });
-
-    // Build local_accs sorted
-    std::vector<uint32_t> local_accs;
-    {
-        std::unordered_set<uint32_t> seen;
-        for (const auto& pos : positions) for (const auto& o : pos.obs) seen.insert(o.acc_idx);
-        local_accs.assign(seen.begin(), seen.end());
-        std::sort(local_accs.begin(), local_accs.end());
-    }
-
-    std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
-    std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
-    for (size_t li = 0; li < local_accs.size(); ++li) {
-        uint32_t gacc = local_accs[li];
-        auto it = acc_pident_map.find(gacc);
-        if (it != acc_pident_map.end()) local_acc_pident[li] = it->second;
-        auto it2 = acc_covered_aa_map.find(gacc);
-        if (it2 != acc_covered_aa_map.end()) covered_aa_v[li] = it2->second;
-    }
-
-    InvBlock out;
-    serialize_inverted_block(out.raw, local_accs, local_acc_pident, positions, hog_length, covered_aa_v);
-    out.pos_ptr = nullptr;
-    out.end     = out.raw.data() + out.raw.size();
-    return out;
-}
-
 // accregistry subcommand: collect unique acc_ids from .lhgi LHGA sections,
 // sort, write one per line (plain text, no header).
 inline void build_acc_registry(const std::vector<std::string>& lhgi_paths,
@@ -209,10 +139,415 @@ inline std::vector<std::string> load_acc_registry(const std::string& path) {
     return accs;
 }
 
+// Result produced by parallel compute workers; written serially by the main thread.
+struct ShardResult {
+    std::string hog_id;
+    uint32_t stored_sz = 0;  // with flag bits (0x40000000=zstd, 0x80000000=raw)
+    uint32_t n_accs    = 0;
+    std::vector<uint8_t> payload;
+};
+
+// Invert one per-HOG .lhp shard into a ShardResult without touching the output fd.
+// Safe to call from multiple threads simultaneously (all state is local).
+inline ShardResult merge_shard_compute(
+        const std::string& lhp_path,
+        const std::vector<std::string>& accessions,
+        int out_zstd_level = 3) {
+
+    ShardResult res;
+    {
+        size_t s = lhp_path.find_last_of('/');
+        std::string base = (s == std::string::npos) ? lhp_path : lhp_path.substr(s + 1);
+        size_t d = base.rfind(".lhp");
+        res.hog_id = (d == std::string::npos) ? base : base.substr(0, d);
+    }
+
+    size_t n_acc = accessions.size();
+    UniqueFd fd(open(lhp_path.c_str(), O_RDONLY));
+    if (fd < 0) throw std::runtime_error("cannot open shard: " + lhp_path);
+    struct stat st;
+    if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed: " + lhp_path);
+    std::vector<uint8_t> buf(size_t(st.st_size));
+    if (st.st_size > 0 && !fd_read_exact(fd, buf.data(), buf.size()))
+        throw std::runtime_error("truncated shard: " + lhp_path);
+    if (buf.size() < LHP_HEADER_SZ || memcmp(buf.data(), LHP_FILE_MAGIC, 4) != 0)
+        throw std::runtime_error("bad .lhp magic: " + lhp_path);
+    if (buf[4] != LHP_VERSION)
+        throw std::runtime_error("unsupported .lhp version in: " + lhp_path);
+
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+
+    std::vector<uint32_t> seen_epoch(n_acc, 0);
+    uint32_t epoch = 1, n_accs = 0;
+    std::vector<uint32_t> seen_accs;
+    auto mark_acc = [&](uint32_t gacc) {
+        if (seen_epoch[gacc] != epoch) { seen_epoch[gacc] = epoch; ++n_accs; seen_accs.push_back(gacc); }
+    };
+
+    std::vector<std::pair<uint32_t, InvObs>> flat_inv;
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> acc_intervals_map;
+    std::unordered_map<uint32_t, uint8_t> acc_pident_map;
+    uint32_t hog_length = 0;
+    std::vector<uint8_t> raw_block;
+    std::vector<uint32_t> contig_cnum;
+    std::vector<VarNTRecord> recs;
+
+    const uint8_t* cur = buf.data() + LHP_HEADER_SZ;
+    const uint8_t* eof = buf.data() + buf.size();
+    while (cur + sizeof(PartitionEntry) <= eof) {
+        PartitionEntry ent;
+        memcpy(&ent, cur, sizeof(PartitionEntry));
+        cur += sizeof(PartitionEntry);
+        if (cur + ent.compressed_sz > eof) throw std::runtime_error("truncated entry in: " + lhp_path);
+        if (ent.raw_sz > 512u * 1024 * 1024) throw std::runtime_error("raw_sz OOB in: " + lhp_path);
+        uint32_t acc_idx = ent.acc_idx;
+
+        raw_block.resize(ent.raw_sz);
+        size_t rz = ZSTD_decompressDCtx(dctx, raw_block.data(), ent.raw_sz, cur, ent.compressed_sz);
+        cur += ent.compressed_sz;
+        if (ZSTD_isError(rz)) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
+        }
+
+        const uint8_t* p   = raw_block.data();
+        const uint8_t* end = p + rz;
+        uint32_t n_contigs = 0;
+        int n = read_varint(p, end, &n_contigs);
+        if (!n) throw std::runtime_error("corrupt contig dict for HOG " + res.hog_id);
+        p += n;
+        if (n_contigs > 65536) throw std::runtime_error("n_contigs OOB for HOG " + res.hog_id);
+        contig_cnum.clear(); contig_cnum.resize(n_contigs);
+        for (uint32_t j = 0; j < n_contigs; ++j) {
+            uint32_t len = 0;
+            n = read_varint(p, end, &len);
+            if (!n || p + n + len > end) throw std::runtime_error("truncated contig dict");
+            p += n;
+            std::string_view uid(reinterpret_cast<const char*>(p), len);
+            p += len;
+            // cnum: numeric field immediately after first '_' (ACC_N or Logan ACC_N_metadata...)
+            uint32_t cnum = j;
+            {
+                auto fs = uid.find('_');
+                if (fs != std::string_view::npos && fs + 1 < uid.size()) {
+                    auto fe = uid.find('_', fs + 1);
+                    auto part = (fe != std::string_view::npos) ? uid.substr(fs+1, fe-fs-1) : uid.substr(fs+1);
+                    uint32_t v = 0;
+                    auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
+                    if (cr.ec == std::errc{}) cnum = v;
+                }
+            }
+            contig_cnum[j] = cnum;
+        }
+
+        recs.clear();
+        if (!deserialize_varnt_block(p, end, recs))
+            throw std::runtime_error("corrupt varnt block for HOG " + res.hog_id);
+
+        mark_acc(acc_idx);
+        for (const auto& r : recs) {
+            if (r.contig_idx >= contig_cnum.size())
+                throw std::runtime_error("contig_idx OOB in HOG " + res.hog_id);
+            uint32_t cnum = contig_cnum[r.contig_idx];
+            uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
+            hog_length = std::max(hog_length, r.send + 1);
+            acc_intervals_map[acc_idx].emplace_back(r.sstart, r.send);
+            {
+                auto [it2, ins] = acc_pident_map.emplace(acc_idx, pu8);
+                if (!ins && pu8 < it2->second) it2->second = pu8;
+            }
+            for (const auto& o : r.vars) {
+                uint32_t hog_pos   = r.sstart + o.hog_offset;
+                uint8_t  codon_idx = uint8_t(o.packed_codon >> 2);
+                flat_inv.emplace_back(hog_pos, InvObs{acc_idx, codon_idx, cnum});
+            }
+        }
+    }
+    ZSTD_freeDCtx(dctx);
+
+    uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
+    for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
+    std::vector<uint32_t> cs_count(max_pos + 1, 0), cs_pidx(max_pos + 1, UINT32_MAX);
+    for (const auto& e : flat_inv) ++cs_count[e.first];
+    std::vector<InvPosition> positions;
+    for (uint32_t pp = 0; pp <= max_pos; ++pp) {
+        if (!cs_count[pp]) continue;
+        cs_pidx[pp] = uint32_t(positions.size());
+        InvPosition ip; ip.hog_pos = pp; ip.obs.reserve(cs_count[pp]);
+        positions.push_back(std::move(ip));
+    }
+    for (auto& e : flat_inv) positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
+    for (auto& pos : positions)
+        std::sort(pos.obs.begin(), pos.obs.end(),
+                  [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+
+    std::vector<uint32_t> local_accs = std::move(seen_accs);
+    std::sort(local_accs.begin(), local_accs.end());
+
+    auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
+        if (ivals.empty()) return 0;
+        std::sort(ivals.begin(), ivals.end());
+        uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
+        for (size_t k = 1; k < ivals.size(); ++k) {
+            if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
+            else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
+        }
+        return cov + ce - cs + 1;
+    };
+    std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
+    std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
+    for (size_t li = 0; li < local_accs.size(); ++li) {
+        uint32_t gacc = local_accs[li];
+        auto it = acc_pident_map.find(gacc);
+        if (it != acc_pident_map.end()) local_acc_pident[li] = it->second;
+        auto it3 = acc_intervals_map.find(gacc);
+        if (it3 != acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
+    }
+
+    std::vector<uint8_t> inv_raw, hdr_buf, acc_b, cnum_b, codon_b;
+    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
+                             covered_aa_v, hdr_buf, acc_b, cnum_b, codon_b);
+
+    size_t raw_sz = inv_raw.size();
+    std::vector<uint8_t> hog_cbuf;
+    uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
+    if (out_zstd_level >= 0) {
+        size_t bound = ZSTD_compressBound(raw_sz);
+        hog_cbuf.resize(bound);
+        size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
+        bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
+        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
+        else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
+    } else {
+        hog_cbuf.resize(4 + size_t(LZ4_compressBound(int(raw_sz))));
+        hog_cbuf[0] = uint8_t(raw_sz);       hog_cbuf[1] = uint8_t(raw_sz >> 8);
+        hog_cbuf[2] = uint8_t(raw_sz >> 16); hog_cbuf[3] = uint8_t(raw_sz >> 24);
+        int lcsz = LZ4_compress_default(reinterpret_cast<const char*>(inv_raw.data()),
+                                        reinterpret_cast<char*>(hog_cbuf.data() + 4),
+                                        int(raw_sz), int(hog_cbuf.size() - 4));
+        size_t total = (lcsz > 0) ? size_t(4 + lcsz) : raw_sz;
+        bool use_raw = (lcsz <= 0 || total >= raw_sz);
+        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
+        else         { stored_sz = uint32_t(total);                 payload = hog_cbuf.data(); payload_sz = total; }
+    }
+
+    res.stored_sz = stored_sz;
+    res.n_accs    = n_accs;
+    res.payload.assign(payload, payload + payload_sz);
+    return res;
+}
+
+// Invert one HOG from indexed partition files (tN.lhp + partition.idx).
+// Preads extents from already-open thread fds; never opens a per-HOG file.
+inline ShardResult merge_shard_compute_extents(
+        const std::string& hog_id,
+        const std::vector<PartitionIndexExtent>& extents,
+        const std::vector<int>& thread_fds,
+        const std::vector<std::string>& accessions,
+        int out_zstd_level = 3) {
+
+    ShardResult res;
+    res.hog_id = hog_id;
+    size_t n_acc = accessions.size();
+
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+
+    std::vector<uint32_t> seen_epoch(n_acc, 0);
+    uint32_t epoch = 1, n_accs = 0;
+    std::vector<uint32_t> seen_accs;
+    auto mark_acc = [&](uint32_t gacc) {
+        if (seen_epoch[gacc] != epoch) { seen_epoch[gacc] = epoch; ++n_accs; seen_accs.push_back(gacc); }
+    };
+
+    std::vector<std::pair<uint32_t, InvObs>> flat_inv;
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> acc_intervals_map;
+    std::unordered_map<uint32_t, uint8_t> acc_pident_map;
+    uint32_t hog_length = 0;
+    std::vector<uint8_t> raw_block, extent_buf;
+    std::vector<uint32_t> contig_cnum;
+    std::vector<VarNTRecord> recs;
+
+    for (const auto& ext : extents) {
+        if (ext.thread_idx >= thread_fds.size())
+            throw std::runtime_error("extent thread_idx OOB for HOG " + hog_id);
+        int tfd = thread_fds[ext.thread_idx];
+        extent_buf.resize(ext.entry_len);
+        if (::pread(tfd, extent_buf.data(), ext.entry_len, off_t(ext.entry_offset))
+                != ssize_t(ext.entry_len))
+            throw std::runtime_error("pread extent failed for HOG " + hog_id);
+
+        if (ext.entry_len < sizeof(PartitionEntry))
+            throw std::runtime_error("extent too small for HOG " + hog_id);
+        PartitionEntry ent;
+        memcpy(&ent, extent_buf.data(), sizeof(PartitionEntry));
+        if (ent.raw_sz > 512u * 1024 * 1024)
+            throw std::runtime_error("raw_sz OOB for HOG " + hog_id);
+        const uint8_t* cdata = extent_buf.data() + sizeof(PartitionEntry);
+        uint32_t acc_idx = ent.acc_idx;
+
+        raw_block.resize(ent.raw_sz);
+        size_t rz = ZSTD_decompressDCtx(dctx, raw_block.data(), ent.raw_sz, cdata, ent.compressed_sz);
+        if (ZSTD_isError(rz)) {
+            ZSTD_freeDCtx(dctx);
+            throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
+        }
+
+        const uint8_t* p   = raw_block.data();
+        const uint8_t* end = p + rz;
+        uint32_t n_contigs = 0;
+        int n = read_varint(p, end, &n_contigs);
+        if (!n) throw std::runtime_error("corrupt contig dict for HOG " + hog_id);
+        p += n;
+        contig_cnum.clear(); contig_cnum.resize(n_contigs);
+        for (uint32_t j = 0; j < n_contigs; ++j) {
+            uint32_t len = 0;
+            n = read_varint(p, end, &len);
+            if (!n || p + n + len > end) throw std::runtime_error("truncated contig dict for HOG " + hog_id);
+            p += n;
+            std::string_view uid(reinterpret_cast<const char*>(p), len);
+            p += len;
+            // cnum: numeric field immediately after first '_' (ACC_N or Logan ACC_N_metadata...)
+            uint32_t cnum = j;
+            {
+                auto fs = uid.find('_');
+                if (fs != std::string_view::npos && fs + 1 < uid.size()) {
+                    auto fe = uid.find('_', fs + 1);
+                    auto part = (fe != std::string_view::npos) ? uid.substr(fs+1, fe-fs-1) : uid.substr(fs+1);
+                    uint32_t v = 0;
+                    auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
+                    if (cr.ec == std::errc{}) cnum = v;
+                }
+            }
+            contig_cnum[j] = cnum;
+        }
+        recs.clear();
+        if (!deserialize_varnt_block(p, end, recs))
+            throw std::runtime_error("corrupt varnt block for HOG " + hog_id);
+
+        mark_acc(acc_idx);
+        for (const auto& r : recs) {
+            if (r.contig_idx >= contig_cnum.size())
+                throw std::runtime_error("contig_idx OOB in HOG " + hog_id);
+            uint32_t cnum = contig_cnum[r.contig_idx];
+            uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
+            hog_length = std::max(hog_length, r.send + 1);
+            acc_intervals_map[acc_idx].emplace_back(r.sstart, r.send);
+            {
+                auto [it2, ins] = acc_pident_map.emplace(acc_idx, pu8);
+                if (!ins && pu8 < it2->second) it2->second = pu8;
+            }
+            for (const auto& o : r.vars) {
+                uint32_t hog_pos   = r.sstart + o.hog_offset;
+                uint8_t  codon_idx = uint8_t(o.packed_codon >> 2);
+                flat_inv.emplace_back(hog_pos, InvObs{acc_idx, codon_idx, cnum});
+            }
+        }
+    }
+    ZSTD_freeDCtx(dctx);
+
+    uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
+    for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
+    std::vector<uint32_t> cs_count(max_pos + 1, 0), cs_pidx(max_pos + 1, UINT32_MAX);
+    for (const auto& e : flat_inv) ++cs_count[e.first];
+    std::vector<InvPosition> positions;
+    for (uint32_t pp = 0; pp <= max_pos; ++pp) {
+        if (!cs_count[pp]) continue;
+        cs_pidx[pp] = uint32_t(positions.size());
+        InvPosition ip; ip.hog_pos = pp; ip.obs.reserve(cs_count[pp]);
+        positions.push_back(std::move(ip));
+    }
+    for (auto& e : flat_inv) positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
+    for (auto& pos : positions)
+        std::sort(pos.obs.begin(), pos.obs.end(),
+                  [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+
+    std::vector<uint32_t> local_accs = std::move(seen_accs);
+    std::sort(local_accs.begin(), local_accs.end());
+
+    auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
+        if (ivals.empty()) return 0;
+        std::sort(ivals.begin(), ivals.end());
+        uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
+        for (size_t k = 1; k < ivals.size(); ++k) {
+            if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
+            else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
+        }
+        return cov + ce - cs + 1;
+    };
+    std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
+    std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
+    for (size_t li = 0; li < local_accs.size(); ++li) {
+        uint32_t gacc = local_accs[li];
+        auto it = acc_pident_map.find(gacc);
+        if (it != acc_pident_map.end()) local_acc_pident[li] = it->second;
+        auto it3 = acc_intervals_map.find(gacc);
+        if (it3 != acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
+    }
+
+    std::vector<uint8_t> inv_raw, hdr_buf, acc_b, cnum_b, codon_b;
+    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
+                             covered_aa_v, hdr_buf, acc_b, cnum_b, codon_b);
+
+    size_t raw_sz = inv_raw.size();
+    std::vector<uint8_t> hog_cbuf;
+    uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
+    if (out_zstd_level >= 0) {
+        size_t bound = ZSTD_compressBound(raw_sz);
+        hog_cbuf.resize(bound);
+        size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
+        bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
+        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
+        else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
+    } else {
+        hog_cbuf.resize(4 + size_t(LZ4_compressBound(int(raw_sz))));
+        hog_cbuf[0] = uint8_t(raw_sz);       hog_cbuf[1] = uint8_t(raw_sz >> 8);
+        hog_cbuf[2] = uint8_t(raw_sz >> 16); hog_cbuf[3] = uint8_t(raw_sz >> 24);
+        int lcsz = LZ4_compress_default(reinterpret_cast<const char*>(inv_raw.data()),
+                                        reinterpret_cast<char*>(hog_cbuf.data() + 4),
+                                        int(raw_sz), int(hog_cbuf.size() - 4));
+        size_t total = (lcsz > 0) ? size_t(4 + lcsz) : raw_sz;
+        bool use_raw = (lcsz <= 0 || total >= raw_sz);
+        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
+        else         { stored_sz = uint32_t(total);                 payload = hog_cbuf.data(); payload_sz = total; }
+    }
+
+    res.stored_sz = stored_sz;
+    res.n_accs    = n_accs;
+    res.payload.assign(payload, payload + payload_sz);
+    return res;
+}
+
+// Single-threaded sequential wrapper kept for compatibility with the old serial path.
+inline void merge_shard_file(const std::string& lhp_path, const std::string& acc_reg_path,
+                             GlobalIndex& gi, int fd_out, WriteBuffer& wb,
+                             int out_zstd_level = 3) {
+    if (gi.accessions.empty())
+        gi.accessions = load_partition_acc_registry(acc_reg_path);
+    auto res = merge_shard_compute(lhp_path, gi.accessions, out_zstd_level);
+
+    uint64_t cur_off;
+    {
+        off_t pos_now = lseek(fd_out, 0, SEEK_CUR);
+        cur_off = (pos_now < 0) ? 0 : uint64_t(pos_now);
+        cur_off += wb.buf.size();
+    }
+    uint8_t hdr8[8];
+    memcpy(hdr8, LHG_HOG_ENTRY_MAGIC, 4);
+    for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(res.stored_sz >> (8*i));
+    wb.append(fd_out, lhp_path, hdr8, 8);
+    wb.append(fd_out, lhp_path, res.payload.data(), res.payload.size());
+
+    HogIndexEntry e;
+    e.hog_id       = std::move(res.hog_id);
+    e.data_offset  = cur_off;
+    e.data_length  = uint64_t(8) + res.payload.size();
+    e.n_accessions = res.n_accs;
+    gi.entries.push_back(std::move(e));
+}
+
 inline void merge_batches(const std::vector<std::string>& input_paths,
                           const std::string& out_lhg,
                           const std::string& out_lhgi,
-                          int zstd_level = 19,
                           const std::string& hog_range_start = "",
                           const std::string& hog_range_end   = "",
                           const std::string& acc_registry_path = "",
@@ -222,7 +557,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int hot_threshold = 100,
                           int out_zstd_level = -1) {
     // out_zstd_level: <0 = LZ4 output (fast, default), >=0 = ZSTD level (smaller, for transfer)
-    (void)zstd_level;
 
     // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.
     size_t scan_threads = std::max<size_t>(1, std::min<size_t>(
@@ -486,6 +820,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::vector<uint32_t>   seen_epoch;
         uint32_t                epoch = 0;
         uint32_t                n_accs = 0;
+        std::vector<uint32_t>   seen_accs;   // distinct gaccs this group; cleared, not realloc'd
         std::vector<InvPosition> positions;
         // all_lhg path
         std::vector<InvBlock>   blocks;
@@ -543,12 +878,12 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         if (sc.seen_epoch.size() < accessions.size()) sc.seen_epoch.assign(accessions.size(), 0);
         ++sc.epoch;
         sc.n_accs = 0;
-        std::vector<uint32_t> seen_accs;
-        auto mark_acc = [&sc, &seen_accs](uint32_t gacc) {
+        sc.seen_accs.clear();
+        auto mark_acc = [&sc](uint32_t gacc) {
             if (sc.seen_epoch[gacc] != sc.epoch) {
                 sc.seen_epoch[gacc] = sc.epoch;
                 ++sc.n_accs;
-                seen_accs.push_back(gacc);
+                sc.seen_accs.push_back(gacc);
             }
         };
 
@@ -562,43 +897,15 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         uint64_t t_dec_end = 0, t_build_end = 0;
 
         if (all_lhg) {
-            bool is_hot = (int(n_blocks) > hot_threshold);
-
-            if (is_hot) {
-                hot_states[g] = std::make_unique<HotHogState>();
-                hot_states[g]->blocks.resize(n_blocks);
-                hot_states[g]->pending.store(int(n_blocks), std::memory_order_relaxed);
-
-                {
-                    std::lock_guard<std::mutex> lk(dq_mtx);
-                    for (size_t bi = 0; bi < n_blocks; ++bi)
-                        dq_decode.push_back({g, bi});
-                }
-
-                while (hot_states[g]->pending.load(std::memory_order_acquire) > 0) {
-                    HotDecodeTask dt{g, 0};
-                    bool got = false;
-                    {
-                        std::lock_guard<std::mutex> lk(dq_mtx);
-                        if (!dq_decode.empty()) {
-                            dt = dq_decode.front(); dq_decode.pop_front();
-                            got = true;
-                        }
-                    }
-                    if (got) decode_one_block(dt.g, dt.bi);
-                    else     std::this_thread::yield();
-                }
-
-                t_dec_end = clock_ns();
-
-                auto& blocks  = hot_states[g]->blocks;
+            // Shared tail for both decode strategies: `blocks` holds the n_blocks decoded
+            // InvBlocks; accumulate coverage/pident, remap to global acc space, then K-way
+            // heap-merge the per-block position streams into `positions`.
+            auto merge_lhg_blocks = [&](std::vector<InvBlock>& blocks) {
                 auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
-                // Init per-HOG accumulators
                 sc.hog_length = 0; sc.acc_intervals_map.clear(); sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
 
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
-                    size_t sfi = refs[group_start + bi].source_file_idx;
-                    const auto& remap = src_remap[sfi];
+                    const auto& remap = src_remap[refs[group_start + bi].source_file_idx];
                     const InvBlock& blk = blocks[bi];
 
                     sc.hog_length = std::max(sc.hog_length, blk.hog_length);
@@ -632,7 +939,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     }
                 }
 
-                // K-way min-heap merge
+                // K-way min-heap merge of the per-block position streams.
                 struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
                 auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
                 std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
@@ -663,12 +970,34 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     }
                     positions.push_back(std::move(out_pos));
                 }
-            } else {
-                // Cold path
-                auto& blocks  = sc.blocks;  blocks.clear();  blocks.resize(n_blocks);
-                auto& src_pos = sc.src_pos; src_pos.clear(); src_pos.resize(n_blocks);
-                sc.hog_length = 0; sc.acc_intervals_map.clear(); sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
+            };
 
+            bool is_hot = (int(n_blocks) > hot_threshold);
+            if (is_hot) {
+                // Hot path: fan the per-block pread+decompress out to the worker pool.
+                hot_states[g] = std::make_unique<HotHogState>();
+                hot_states[g]->blocks.resize(n_blocks);
+                hot_states[g]->pending.store(int(n_blocks), std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(dq_mtx);
+                    for (size_t bi = 0; bi < n_blocks; ++bi)
+                        dq_decode.push_back({g, bi});
+                }
+                while (hot_states[g]->pending.load(std::memory_order_acquire) > 0) {
+                    HotDecodeTask dt{g, 0};
+                    bool got = false;
+                    {
+                        std::lock_guard<std::mutex> lk(dq_mtx);
+                        if (!dq_decode.empty()) { dt = dq_decode.front(); dq_decode.pop_front(); got = true; }
+                    }
+                    if (got) decode_one_block(dt.g, dt.bi);
+                    else     std::this_thread::yield();
+                }
+                t_dec_end = clock_ns();
+                merge_lhg_blocks(hot_states[g]->blocks);
+            } else {
+                // Cold path: decode all blocks inline on this thread.
+                auto& blocks = sc.blocks; blocks.clear(); blocks.resize(n_blocks);
                 for (size_t bi = 0; bi < n_blocks; ++bi) {
                     const MergeRef& ref = refs[group_start + bi];
                     SrcFile& sf = get_src_file(ref.source_file_idx);
@@ -678,74 +1007,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     e.data_length = ref.lhg_data_length;
                     if (!read_hog_inverted_fd(sf.fd, input_paths[ref.source_file_idx], e, blocks[bi]))
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
-
-                    const auto& remap = src_remap[ref.source_file_idx];
-                    const InvBlock& blk = blocks[bi];
-
-                    sc.hog_length = std::max(sc.hog_length, blk.hog_length);
-                    for (size_t li = 0; li < blk.local_accs.size(); ++li) {
-                        if (li >= remap.size()) continue;
-                        uint32_t gacc = remap[li];
-                        if (li < blk.covered_aa.size())
-                            sc.acc_covered_aa_map[gacc] += blk.covered_aa[li];
-                        if (li < blk.local_acc_pident.size()) {
-                            uint8_t pid = blk.local_acc_pident[li];
-                            auto it = sc.acc_pident_map.find(gacc);
-                            if (it == sc.acc_pident_map.end() || pid < it->second) sc.acc_pident_map[gacc] = pid;
-                        }
-                    }
-
-                    auto blk_positions = decode_block(blk);
-                    src_pos[bi].reserve(blk_positions.size());
-                    for (auto& ip : blk_positions) {
-                        InvPosition out_ip;
-                        out_ip.hog_pos = ip.hog_pos;
-                        out_ip.obs.reserve(ip.obs.size());
-                        for (const auto& o : ip.obs) {
-                            uint32_t li = o.acc_idx;
-                            if (li >= remap.size())
-                                throw std::runtime_error("acc_idx out of source registry for HOG " + hog_id);
-                            uint32_t gacc = remap[li];
-                            mark_acc(gacc);
-                            out_ip.obs.push_back({gacc, o.codon_idx, o.cnum});
-                        }
-                        src_pos[bi].push_back(std::move(out_ip));
-                    }
                 }
-
                 t_dec_end = clock_ns();
-
-                // K-way min-heap merge
-                struct HeapItem { uint32_t hog_pos; size_t src; size_t cur; };
-                auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.hog_pos > b.hog_pos; };
-                std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
-                for (size_t bi = 0; bi < n_blocks; ++bi)
-                    if (!src_pos[bi].empty())
-                        heap.push({src_pos[bi][0].hog_pos, bi, 0});
-                sc.per_block_obs.resize(n_blocks);
-                while (!heap.empty()) {
-                    uint32_t cur_pos = heap.top().hog_pos;
-                    InvPosition out_pos;
-                    out_pos.hog_pos = cur_pos;
-                    while (!heap.empty() && heap.top().hog_pos == cur_pos) {
-                        HeapItem it = heap.top(); heap.pop();
-                        auto& obs = src_pos[it.src][it.cur].obs;
-                        sc.per_block_obs[it.src].insert(sc.per_block_obs[it.src].end(),
-                                                        std::make_move_iterator(obs.begin()),
-                                                        std::make_move_iterator(obs.end()));
-                        size_t next = it.cur + 1;
-                        if (next < src_pos[it.src].size())
-                            heap.push({src_pos[it.src][next].hog_pos, it.src, next});
-                    }
-                    { size_t tot = 0; for (size_t bi = 0; bi < n_blocks; ++bi) tot += sc.per_block_obs[bi].size(); out_pos.obs.reserve(tot); }
-                    for (size_t bi = 0; bi < n_blocks; ++bi) {
-                        out_pos.obs.insert(out_pos.obs.end(),
-                                           std::make_move_iterator(sc.per_block_obs[bi].begin()),
-                                           std::make_move_iterator(sc.per_block_obs[bi].end()));
-                        sc.per_block_obs[bi].clear();
-                    }
-                    positions.push_back(std::move(out_pos));
-                }
+                merge_lhg_blocks(blocks);
             }
         } else {
             // Mixed/LHB groups: accumulate into a flat (pos, obs) vector, sort once.
@@ -915,7 +1179,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         }
 
         // Build per-HOG local acc dict from seen_accs (populated by mark_acc above).
-        std::vector<uint32_t> local_accs = std::move(seen_accs);
+        std::vector<uint32_t> local_accs = std::move(sc.seen_accs);
         std::sort(local_accs.begin(), local_accs.end());
 
         // Build per-local-acc pident and covered_aa vectors from maps.
