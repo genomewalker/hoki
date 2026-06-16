@@ -30,8 +30,8 @@ static void usage(const char* prog) {
         << "  " << prog << " ingest  -a ACC|auto [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out_part_dir/>\n"
         << "                  TSV → partition dir directly (no intermediate .lhb). One job per input file.\n"
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
-        << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> <part_dir> [part_dir2 ...]\n"
-        << "                  accepts one or more partition dirs (from ingest or partition)\n"
+        << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> (<part_dir> ...|-)  \n"
+        << "                  dirs as args or one per line on stdin (-); handles 38M+ dirs\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA] [--min-pident N]\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
@@ -141,7 +141,15 @@ int main(int argc, char* argv[]) {
         if (pos.size() < 3) { usage(argv[0]); return 1; }
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
-        std::vector<std::string> part_dirs(pos.begin() + 2, pos.end());
+        std::vector<std::string> part_dirs;
+        if (pos.size() == 3 && pos[2] == "-") {
+            std::string line;
+            while (std::getline(std::cin, line))
+                if (!line.empty()) part_dirs.push_back(line);
+        } else {
+            part_dirs.assign(pos.begin() + 2, pos.end());
+        }
+        if (part_dirs.empty()) { std::cerr << "no partition dirs\n"; return 1; }
 
         // Load all acc.registry files; build merged sorted global accession list.
         std::vector<std::vector<std::string>> dir_accs(part_dirs.size());
