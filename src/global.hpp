@@ -8,7 +8,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <zstd.h>
-#include <lz4.h>
 #include <stdexcept>
 #include <cstring>
 #include <cstdio>
@@ -27,7 +26,7 @@
 //   Data section (HOGs sorted lexicographically):
 //     For each HOG entry:
 //       "LHHE" (4) magic
-//       stored_sz (4)  ← uint32 LE; bit31=raw · bit30=ZSTD · else=LZ4
+//       stored_sz (4)  ← uint32 LE; bit31=raw · bit30=ZSTD
 //       payload bytes
 //
 //   Decompressed HOG payload — LHG_VERSION 4:
@@ -371,16 +370,7 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
             throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
         out.raw.resize(dz);
     } else {
-        if (payload_sz < 4) throw std::runtime_error("LZ4 payload truncated: " + entry.hog_id);
-        uint32_t raw_sz = read_u32_le(cbuf);
-        if (raw_sz > 256u * 1024 * 1024) throw std::runtime_error("LZ4 raw_sz OOB: " + entry.hog_id);
-        out.raw.resize(raw_sz);
-        int dz = LZ4_decompress_safe(
-            reinterpret_cast<const char*>(cbuf + 4),
-            reinterpret_cast<char*>(out.raw.data()),
-            int(payload_sz - 4), int(raw_sz));
-        if (dz < 0)
-            throw std::runtime_error("LZ4 HOG decompress failed: " + entry.hog_id);
+        throw std::runtime_error("unsupported compression in HOG entry: " + entry.hog_id);
     }
 
     const uint8_t* p = out.raw.data();

@@ -10,8 +10,8 @@ list(PREPEND CMAKE_PREFIX_PATH
 
 find_package(zstd REQUIRED)
 
-add_executable(hoki src/main.cpp third_party/lz4/lib/lz4.c)
-target_include_directories(hoki PRIVATE src third_party/lz4/lib)
+add_executable(hoki src/main.cpp)
+target_include_directories(hoki PRIVATE src)
 
 if(TARGET zstd::libzstd_shared)
     target_link_libraries(hoki PRIVATE zstd::libzstd_shared)

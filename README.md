@@ -110,7 +110,6 @@ counting-sort by position, serialize column-oriented inverted block, compress, w
 `LHHE` entry. Groups are dispatched largest-first to balance threads. A dedicated
 writer thread serializes output in HOG-ID order.
 
-`-zo -1` selects LZ4 instead of zstd for output (faster build, ~15% larger file).
 `--buckets N` writes N sharded `.lhg`/`.lhgi` pairs.
 `--hot-threshold N` sets the minimum block count for parallel decode of a single HOG.
 
@@ -254,7 +253,6 @@ Per-HOG entry (sorted lex by HOG ID):
   [4]  stored_sz  uint32 LE
          bit 31 = 1  → raw (uncompressed); payload = stored_sz & 0x7FFFFFFF bytes
          bit 30 = 1  → zstd frame
-         else        → LZ4 frame (4-byte raw_sz LE prefix)
   payload (stored_sz & 0x3FFFFFFF bytes)
 
 Decompressed HOG payload:

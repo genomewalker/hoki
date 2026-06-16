@@ -60,7 +60,7 @@ int main(int argc, char* argv[]) {
         int n_threads = 0;  // 0 = hardware_concurrency
         bool do_profile = false;
         int hot_threshold = 100;
-        int out_compress_level = 3;  // ZSTD level 3; pass -zo -1 to force LZ4
+        int out_compress_level = 3;
         std::vector<std::string> pos;  // out_lhg, out_lhgi, inputs...
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -79,7 +79,6 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> inputs(pos.begin() + 2, pos.end());
         lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end, acc_registry,
                            n_buckets, n_threads, do_profile, hot_threshold, out_compress_level);
-        // -zo N: ZSTD level (default 3); -zo -1 forces LZ4 (faster build, larger file)
         return 0;
     }
 

@@ -4,7 +4,6 @@
 #include "batch.hpp"
 #include "container.hpp"
 #include "partition.hpp"
-#include <lz4.h>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -311,24 +310,13 @@ inline ShardResult merge_shard_compute(
     size_t raw_sz = inv_raw.size();
     std::vector<uint8_t> hog_cbuf;
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
-    if (out_zstd_level >= 0) {
+    {
         size_t bound = ZSTD_compressBound(raw_sz);
         hog_cbuf.resize(bound);
         size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
         bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
         if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
         else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
-    } else {
-        hog_cbuf.resize(4 + size_t(LZ4_compressBound(int(raw_sz))));
-        hog_cbuf[0] = uint8_t(raw_sz);       hog_cbuf[1] = uint8_t(raw_sz >> 8);
-        hog_cbuf[2] = uint8_t(raw_sz >> 16); hog_cbuf[3] = uint8_t(raw_sz >> 24);
-        int lcsz = LZ4_compress_default(reinterpret_cast<const char*>(inv_raw.data()),
-                                        reinterpret_cast<char*>(hog_cbuf.data() + 4),
-                                        int(raw_sz), int(hog_cbuf.size() - 4));
-        size_t total = (lcsz > 0) ? size_t(4 + lcsz) : raw_sz;
-        bool use_raw = (lcsz <= 0 || total >= raw_sz);
-        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
-        else         { stored_sz = uint32_t(total);                 payload = hog_cbuf.data(); payload_sz = total; }
     }
 
     res.stored_sz = stored_sz;
@@ -491,24 +479,13 @@ inline ShardResult merge_shard_compute_extents(
     size_t raw_sz = inv_raw.size();
     std::vector<uint8_t> hog_cbuf;
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
-    if (out_zstd_level >= 0) {
+    {
         size_t bound = ZSTD_compressBound(raw_sz);
         hog_cbuf.resize(bound);
         size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
         bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
         if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
         else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
-    } else {
-        hog_cbuf.resize(4 + size_t(LZ4_compressBound(int(raw_sz))));
-        hog_cbuf[0] = uint8_t(raw_sz);       hog_cbuf[1] = uint8_t(raw_sz >> 8);
-        hog_cbuf[2] = uint8_t(raw_sz >> 16); hog_cbuf[3] = uint8_t(raw_sz >> 24);
-        int lcsz = LZ4_compress_default(reinterpret_cast<const char*>(inv_raw.data()),
-                                        reinterpret_cast<char*>(hog_cbuf.data() + 4),
-                                        int(raw_sz), int(hog_cbuf.size() - 4));
-        size_t total = (lcsz > 0) ? size_t(4 + lcsz) : raw_sz;
-        bool use_raw = (lcsz <= 0 || total >= raw_sz);
-        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
-        else         { stored_sz = uint32_t(total);                 payload = hog_cbuf.data(); payload_sz = total; }
     }
 
     res.stored_sz = stored_sz;
@@ -556,7 +533,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           bool do_profile = false,
                           int hot_threshold = 100,
                           int out_zstd_level = -1) {
-    // out_zstd_level: <0 = LZ4 output (fast, default), >=0 = ZSTD level (smaller, for transfer)
+    // out_zstd_level: ZSTD compression level (default 3)
 
     // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.
     size_t scan_threads = std::max<size_t>(1, std::min<size_t>(
@@ -1215,13 +1192,12 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         tl_decode += t_dec_end - t0;
         tl_build  += t_build_end - t_dec_end;
 
-        // stored_sz: bit31=raw · bit30=ZSTD · else=LZ4
         size_t raw_sz = inv_raw.size();
         size_t payload_sz = 0;
         uint32_t stored_sz = 0;
         bool use_raw = false;
 
-        if (out_zstd_level >= 0) {
+        {
             size_t bound = ZSTD_compressBound(raw_sz);
             hog_cbuf.resize(bound);
             size_t csz = ZSTD_compress2(cctx, hog_cbuf.data(), bound,
@@ -1230,17 +1206,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
             use_raw = (csz >= raw_sz);
             if (!use_raw) { payload_sz = csz; stored_sz = uint32_t(csz) | 0x40000000u; }
-        } else {
-            size_t lz4_bound = size_t(LZ4_compressBound(int(raw_sz)));
-            hog_cbuf.resize(4 + lz4_bound);
-            hog_cbuf[0] = uint8_t(raw_sz);       hog_cbuf[1] = uint8_t(raw_sz >> 8);
-            hog_cbuf[2] = uint8_t(raw_sz >> 16); hog_cbuf[3] = uint8_t(raw_sz >> 24);
-            int lcsz = LZ4_compress_default(reinterpret_cast<const char*>(inv_raw.data()),
-                                            reinterpret_cast<char*>(hog_cbuf.data() + 4),
-                                            int(raw_sz), int(lz4_bound));
-            size_t total = (lcsz > 0) ? size_t(4 + lcsz) : raw_sz;
-            use_raw = (lcsz <= 0 || total >= raw_sz);
-            if (!use_raw) { payload_sz = total; stored_sz = uint32_t(total); }
         }
         if (use_raw) { payload_sz = raw_sz; stored_sz = uint32_t(raw_sz) | 0x80000000u; }
 
@@ -1269,8 +1234,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     auto worker = [&]() {
         ZSTD_CCtx* cctx = ZSTD_createCCtx();
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
-        if (out_zstd_level >= 0)
-            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, out_zstd_level);
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, out_zstd_level);
         std::vector<uint8_t> cbuf_in, raw_block, inv_raw, hog_cbuf;
         WorkerScratch scratch;
         uint64_t tl_decode = 0, tl_build = 0, tl_compress = 0;
