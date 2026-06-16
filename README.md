@@ -32,8 +32,8 @@ parallel -j 32 'hoki ingest -a auto {} parts/{/.}/' ::: inputs/*.tsv
 aws s3 cp s3://serratus-rayan/beetles/logan_jun9_26_run/diamond/DRR000001/DRR000001.diamond.jun9_26.txt - \
     | hoki ingest -a auto - parts/DRR000001/
 
-# Phase 2: merge all partition dirs → final index (stdin to avoid ARG_MAX)
-find parts/ -mindepth 1 -maxdepth 1 -type d | hoki merge-shard -t 192 out.lhg out.lhgi -
+# Phase 2: merge — pass the parent dir; merge-shard scans it via opendir, no shell, no ARG_MAX
+hoki merge-shard -t 192 out.lhg out.lhgi parts/
 ```
 
 `--hog-range START END` restricts HOGs processed (for cluster jobs splitting the HOG list across nodes).
@@ -114,11 +114,17 @@ hoki merge-shard [-t N=nproc] [--hog-range START END] \
 ```
 
 Accepts one or more partition dirs (from `ingest` or `partition`).
-Pass `-` as the sole dir argument to read dir paths one per line from stdin — avoids
-shell ARG\_MAX with millions of dirs (38M accessions → 38M dirs):
+Three calling conventions, all avoiding shell ARG\_MAX:
 
 ```bash
-find parts/ -mindepth 1 -maxdepth 1 -type d | hoki merge-shard -t 192 out.lhg out.lhgi -
+# 1. Parent dir (recommended) — merge-shard calls opendir internally, no shell expansion
+hoki merge-shard -t 192 out.lhg out.lhgi parts/
+
+# 2. Stdin — one dir path per line
+cat manifest.txt | hoki merge-shard -t 192 out.lhg out.lhgi -
+
+# 3. Explicit list — fine for small N
+hoki merge-shard -t 4 out.lhg out.lhgi parts/A/ parts/B/
 ```
 
 Loads all `acc.registry` files, builds a merged sorted global accession list,

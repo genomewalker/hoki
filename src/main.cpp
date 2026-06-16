@@ -30,8 +30,8 @@ static void usage(const char* prog) {
         << "  " << prog << " ingest  -a ACC|auto [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out_part_dir/>\n"
         << "                  TSV → partition dir directly (no intermediate .lhb). One job per input file.\n"
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
-        << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> (<part_dir> ...|-)  \n"
-        << "                  dirs as args or one per line on stdin (-); handles 38M+ dirs\n"
+        << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> <part_dir>...|<parent_dir>|-\n"
+        << "                  parent_dir (no partition.idx at root): scanned via opendir — no shell, no ARG_MAX\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA] [--min-pident N]\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
@@ -141,11 +141,33 @@ int main(int argc, char* argv[]) {
         if (pos.size() < 3) { usage(argv[0]); return 1; }
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
+        // Resolve part_dirs from args, stdin, or parent-dir scan.
+        // A single arg that is a directory without partition.idx is treated as a
+        // parent dir: its immediate children are enumerated via opendir (no shell,
+        // no ARG_MAX — works with 38M subdirs).
         std::vector<std::string> part_dirs;
+        auto is_partition_dir = [](const std::string& d) {
+            struct stat st{};
+            std::string p = d + "/partition.idx";
+            return ::stat(p.c_str(), &st) == 0;
+        };
         if (pos.size() == 3 && pos[2] == "-") {
             std::string line;
             while (std::getline(std::cin, line))
                 if (!line.empty()) part_dirs.push_back(line);
+        } else if (pos.size() == 3 && !is_partition_dir(pos[2])) {
+            // parent dir: scan immediate children
+            const std::string& parent = pos[2];
+            DIR* dh = ::opendir(parent.c_str());
+            if (!dh) { std::cerr << "cannot open dir: " << parent << "\n"; return 1; }
+            struct dirent* ent;
+            while ((ent = ::readdir(dh))) {
+                if (ent->d_name[0] == '.') continue;
+                std::string child = parent + "/" + ent->d_name;
+                if (is_partition_dir(child)) part_dirs.push_back(child);
+            }
+            ::closedir(dh);
+            std::sort(part_dirs.begin(), part_dirs.end());
         } else {
             part_dirs.assign(pos.begin() + 2, pos.end());
         }
