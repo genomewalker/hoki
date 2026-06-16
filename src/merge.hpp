@@ -115,184 +115,9 @@ struct ShardResult {
     std::vector<uint8_t> payload;
 };
 
-// Invert one per-HOG .lhp shard into a ShardResult without touching the output fd.
-// Safe to call from multiple threads simultaneously (all state is local).
-inline ShardResult merge_shard_compute(
-        const std::string& lhp_path,
-        const std::vector<std::string>& accessions,
-        int out_zstd_level = 3) {
+// merge_shard_compute + merge_shard_file deleted: read old per-HOG .lhp format
+// (LHGP magic) which partition no longer writes. Active path: merge_shard_compute_extents.
 
-    ShardResult res;
-    {
-        size_t s = lhp_path.find_last_of('/');
-        std::string base = (s == std::string::npos) ? lhp_path : lhp_path.substr(s + 1);
-        size_t d = base.rfind(".lhp");
-        res.hog_id = (d == std::string::npos) ? base : base.substr(0, d);
-    }
-
-    size_t n_acc = accessions.size();
-    UniqueFd fd(open(lhp_path.c_str(), O_RDONLY));
-    if (fd < 0) throw std::runtime_error("cannot open shard: " + lhp_path);
-    struct stat st;
-    if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed: " + lhp_path);
-    std::vector<uint8_t> buf(size_t(st.st_size));
-    if (st.st_size > 0 && !fd_read_exact(fd, buf.data(), buf.size()))
-        throw std::runtime_error("truncated shard: " + lhp_path);
-    if (buf.size() < LHP_HEADER_SZ || memcmp(buf.data(), LHP_FILE_MAGIC, 4) != 0)
-        throw std::runtime_error("bad .lhp magic: " + lhp_path);
-    if (buf[4] != LHP_VERSION)
-        throw std::runtime_error("unsupported .lhp version in: " + lhp_path);
-
-    ZSTD_DCtx* dctx = ZSTD_createDCtx();
-
-    std::vector<uint32_t> seen_epoch(n_acc, 0);
-    uint32_t epoch = 1, n_accs = 0;
-    std::vector<uint32_t> seen_accs;
-    auto mark_acc = [&](uint32_t gacc) {
-        if (seen_epoch[gacc] != epoch) { seen_epoch[gacc] = epoch; ++n_accs; seen_accs.push_back(gacc); }
-    };
-
-    std::vector<std::pair<uint32_t, InvObs>> flat_inv;
-    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t,uint32_t>>> acc_intervals_map;
-    std::unordered_map<uint32_t, uint8_t> acc_pident_map;
-    uint32_t hog_length = 0;
-    std::vector<uint8_t> raw_block;
-    std::vector<uint32_t> contig_cnum;
-    std::vector<VarNTRecord> recs;
-
-    const uint8_t* cur = buf.data() + LHP_HEADER_SZ;
-    const uint8_t* eof = buf.data() + buf.size();
-    while (cur + sizeof(PartitionEntry) <= eof) {
-        PartitionEntry ent;
-        memcpy(&ent, cur, sizeof(PartitionEntry));
-        cur += sizeof(PartitionEntry);
-        if (cur + ent.compressed_sz > eof) throw std::runtime_error("truncated entry in: " + lhp_path);
-        if (ent.raw_sz > 512u * 1024 * 1024) throw std::runtime_error("raw_sz OOB in: " + lhp_path);
-        uint32_t acc_idx = ent.acc_idx;
-
-        raw_block.resize(ent.raw_sz);
-        size_t rz = ZSTD_decompressDCtx(dctx, raw_block.data(), ent.raw_sz, cur, ent.compressed_sz);
-        cur += ent.compressed_sz;
-        if (ZSTD_isError(rz)) {
-            ZSTD_freeDCtx(dctx);
-            throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
-        }
-
-        const uint8_t* p   = raw_block.data();
-        const uint8_t* end = p + rz;
-        uint32_t n_contigs = 0;
-        int n = read_varint(p, end, &n_contigs);
-        if (!n) throw std::runtime_error("corrupt contig dict for HOG " + res.hog_id);
-        p += n;
-        if (n_contigs > 65536) throw std::runtime_error("n_contigs OOB for HOG " + res.hog_id);
-        contig_cnum.clear(); contig_cnum.resize(n_contigs);
-        for (uint32_t j = 0; j < n_contigs; ++j) {
-            uint32_t len = 0;
-            n = read_varint(p, end, &len);
-            if (!n || p + n + len > end) throw std::runtime_error("truncated contig dict");
-            p += n;
-            std::string_view uid(reinterpret_cast<const char*>(p), len);
-            p += len;
-            // cnum: numeric field immediately after first '_' (ACC_N or Logan ACC_N_metadata...)
-            uint32_t cnum = j;
-            {
-                auto fs = uid.find('_');
-                if (fs != std::string_view::npos && fs + 1 < uid.size()) {
-                    auto fe = uid.find('_', fs + 1);
-                    auto part = (fe != std::string_view::npos) ? uid.substr(fs+1, fe-fs-1) : uid.substr(fs+1);
-                    uint32_t v = 0;
-                    auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
-                    if (cr.ec == std::errc{}) cnum = v;
-                }
-            }
-            contig_cnum[j] = cnum;
-        }
-
-        recs.clear();
-        if (!deserialize_varnt_block(p, end, recs))
-            throw std::runtime_error("corrupt varnt block for HOG " + res.hog_id);
-
-        mark_acc(acc_idx);
-        for (const auto& r : recs) {
-            if (r.contig_idx >= contig_cnum.size())
-                throw std::runtime_error("contig_idx OOB in HOG " + res.hog_id);
-            uint32_t cnum = contig_cnum[r.contig_idx];
-            uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
-            hog_length = std::max(hog_length, r.send + 1);
-            acc_intervals_map[acc_idx].emplace_back(r.sstart, r.send);
-            {
-                auto [it2, ins] = acc_pident_map.emplace(acc_idx, pu8);
-                if (!ins && pu8 < it2->second) it2->second = pu8;
-            }
-            for (const auto& o : r.vars) {
-                uint32_t hog_pos   = r.sstart + o.hog_offset;
-                uint8_t  codon_idx = uint8_t(o.packed_codon >> 2);
-                flat_inv.emplace_back(hog_pos, InvObs{acc_idx, codon_idx, cnum});
-            }
-        }
-    }
-    ZSTD_freeDCtx(dctx);
-
-    uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
-    for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
-    std::vector<uint32_t> cs_count(max_pos + 1, 0), cs_pidx(max_pos + 1, UINT32_MAX);
-    for (const auto& e : flat_inv) ++cs_count[e.first];
-    std::vector<InvPosition> positions;
-    for (uint32_t pp = 0; pp <= max_pos; ++pp) {
-        if (!cs_count[pp]) continue;
-        cs_pidx[pp] = uint32_t(positions.size());
-        InvPosition ip; ip.hog_pos = pp; ip.obs.reserve(cs_count[pp]);
-        positions.push_back(std::move(ip));
-    }
-    for (auto& e : flat_inv) positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
-    for (auto& pos : positions)
-        std::sort(pos.obs.begin(), pos.obs.end(),
-                  [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
-
-    std::vector<uint32_t> local_accs = std::move(seen_accs);
-    std::sort(local_accs.begin(), local_accs.end());
-
-    auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
-        if (ivals.empty()) return 0;
-        std::sort(ivals.begin(), ivals.end());
-        uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
-        for (size_t k = 1; k < ivals.size(); ++k) {
-            if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
-            else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
-        }
-        return cov + ce - cs + 1;
-    };
-    std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
-    std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
-    for (size_t li = 0; li < local_accs.size(); ++li) {
-        uint32_t gacc = local_accs[li];
-        auto it = acc_pident_map.find(gacc);
-        if (it != acc_pident_map.end()) local_acc_pident[li] = it->second;
-        auto it3 = acc_intervals_map.find(gacc);
-        if (it3 != acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
-    }
-
-    std::vector<uint8_t> inv_raw, hdr_buf, acc_b, cnum_b, codon_b;
-    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
-                             covered_aa_v, hdr_buf, acc_b, cnum_b, codon_b);
-
-    size_t raw_sz = inv_raw.size();
-    std::vector<uint8_t> hog_cbuf;
-    uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
-    {
-        size_t bound = ZSTD_compressBound(raw_sz);
-        hog_cbuf.resize(bound);
-        size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
-        bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
-        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
-        else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
-    }
-
-    res.stored_sz = stored_sz;
-    res.n_accs    = n_accs;
-    res.payload.assign(payload, payload + payload_sz);
-    return res;
-}
 
 // Invert one HOG from indexed partition files (tN.lhp + partition.idx).
 // Preads extents from already-open thread fds; never opens a per-HOG file.
@@ -463,33 +288,6 @@ inline ShardResult merge_shard_compute_extents(
     return res;
 }
 
-// Single-threaded sequential wrapper kept for compatibility with the old serial path.
-inline void merge_shard_file(const std::string& lhp_path, const std::string& acc_reg_path,
-                             GlobalIndex& gi, int fd_out, WriteBuffer& wb,
-                             int out_zstd_level = 3) {
-    if (gi.accessions.empty())
-        gi.accessions = load_partition_acc_registry(acc_reg_path);
-    auto res = merge_shard_compute(lhp_path, gi.accessions, out_zstd_level);
-
-    uint64_t cur_off;
-    {
-        off_t pos_now = lseek(fd_out, 0, SEEK_CUR);
-        cur_off = (pos_now < 0) ? 0 : uint64_t(pos_now);
-        cur_off += wb.buf.size();
-    }
-    uint8_t hdr8[8];
-    memcpy(hdr8, LHG_HOG_ENTRY_MAGIC, 4);
-    for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(res.stored_sz >> (8*i));
-    wb.append(fd_out, lhp_path, hdr8, 8);
-    wb.append(fd_out, lhp_path, res.payload.data(), res.payload.size());
-
-    HogIndexEntry e;
-    e.hog_id       = std::move(res.hog_id);
-    e.data_offset  = cur_off;
-    e.data_length  = uint64_t(8) + res.payload.size();
-    e.n_accessions = res.n_accs;
-    gi.entries.push_back(std::move(e));
-}
 
 inline void merge_batches(const std::vector<std::string>& input_paths,
                           const std::string& out_lhg,
@@ -500,7 +298,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int n_threads_override = 0,
                           bool do_profile = false,
                           int hot_threshold = 100,
-                          int out_zstd_level = -1) {
+                          int out_zstd_level = 3) {
     // out_zstd_level: ZSTD compression level (default 3)
 
     // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.

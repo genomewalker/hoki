@@ -31,7 +31,7 @@
 namespace lhi {
 
 constexpr uint8_t LHP_FILE_MAGIC[4]   = {'L','H','G','P'};
-constexpr uint8_t LHP_VERSION         = 1;
+constexpr uint8_t LHP_VERSION         = 2;
 constexpr size_t  LHP_HEADER_SZ       = 8;  // magic(4)+ver(1)+flags(1)+pad(2)
 
 constexpr uint8_t LHP_INDEX_MAGIC[4]  = {'L','H','P','I'};
@@ -43,10 +43,8 @@ struct PartitionEntry {
     uint32_t compressed_sz;
     uint32_t raw_sz;
     uint32_t n_records;
-    uint32_t min_sstart;
-    uint32_t max_send;
 };
-static_assert(sizeof(PartitionEntry) == 24);
+static_assert(sizeof(PartitionEntry) == 16);
 #pragma pack(pop)
 
 // Location of a single HOG's PartitionEntry+payload within a thread file.
@@ -347,8 +345,6 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
                         ent.compressed_sz = br.compressed_sz;
                         ent.raw_sz        = br.raw_sz;
                         ent.n_records     = 0;
-                        ent.min_sstart    = br.min_sstart;
-                        ent.max_send      = br.max_send;
                         payload.resize(br.compressed_sz);
                         off_t pay_off = br.shard_hdr_offset + 28;
                         if (::pread(sfd, payload.data(), br.compressed_sz, pay_off)

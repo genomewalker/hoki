@@ -201,7 +201,7 @@ int main(int argc, char* argv[]) {
             wb.append(fd_out, out_lhg, hdr8, 8);
             wb.append(fd_out, out_lhg, r.payload.data(), r.payload.size());
             data_pos += uint64_t(8) + r.payload.size();
-            { std::vector<uint8_t>().swap(r.payload); }
+            r.payload = {};
         }
         wb.flush_to(fd_out, out_lhg);
 

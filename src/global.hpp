@@ -29,42 +29,7 @@
 //       stored_sz (4)  ← uint32 LE; bit31=raw · bit30=ZSTD
 //       payload bytes
 //
-//   Decompressed HOG payload — LHG_VERSION 4:
-//     varint n_unitigs; per unitig: varint(contig_num)
-//     varint n_positions
-//     per position: varint hog_pos_delta · varint n_obs
-//       n_obs × varint(delta global_acc_idx)
-//       n_obs × uint8(codon_idx)
-//       n_obs × varint(unitig_idx)
-//
-//   Decompressed HOG payload — LHG_VERSION 5:
-//     varint n_unitigs; per unitig: varint(contig_num)
-//     varint n_hog_accs; per local acc: varint(delta global_acc_idx)   ← HOG-local dict
-//     varint n_positions
-//     per position: varint hog_pos_delta · varint n_obs
-//       n_obs × varint(delta local_acc_idx)
-//       n_obs × varint(unitig_idx)
-//       uint8 consensus_codon (0xFF = all explicit)
-//       if consensus != 0xFF:
-//         varint n_var; n_var × varint(delta local_acc_idx); n_var × uint8(codon_idx)
-//       else: n_obs × uint8(codon_idx)
-//
-//   Decompressed HOG payload — LHG_VERSION 6:
-//     varint n_unitigs; per unitig: varint(contig_num)
-//     varint n_hog_accs; per local acc: varint(delta global_acc_idx)
-//     varint hog_length                              ← protein length in AA (0 = unknown)
-//     n_unitigs × varint(covered_aa)                 ← AA positions covered per unitig
-//     varint n_positions
-//     per position: varint hog_pos_delta · varint n_obs
-//       n_obs × varint(delta local_acc_idx)
-//       n_obs × varint(unitig_idx)
-//       n_obs × uint8(pident_u8)                     ← round(pident); 0 = unknown
-//       uint8 consensus_codon (0xFF = all explicit)
-//       if consensus != 0xFF:
-//         varint n_var; n_var × varint(delta local_acc_idx); n_var × uint8(codon_idx)
-//       else: n_obs × uint8(codon_idx)
-//
-//   Decompressed HOG payload — LHG_VERSION 8 (this file):
+//   Decompressed HOG payload — LHG_VERSION 8 (current):
 //     [local acc dict + pident]
 //       varint n_local
 //       for each: varint delta_gacc, uint8 pident_u8
