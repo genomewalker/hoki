@@ -17,7 +17,8 @@
 static void usage(const char* prog) {
     std::cerr
         << "hoki — HOG codon Index\n"
-        << "  " << prog << " convert -a ACC [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
+        << "  " << prog << " convert -a ACC|auto [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb|out_dir/>\n"
+        << "                  -a auto: detect acc from qseqid prefix (before first '_'), writes out_dir/ACC.lhb\n"
         << "  " << prog << " merge   [-zo LVL=3] [--buckets N=1] [--hog-range START END]\n"
         << "                  [--profile] [--hot-threshold N=100]\n"
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
@@ -49,7 +50,7 @@ int main(int argc, char* argv[]) {
             else if (lhb_path.empty())        lhb_path        = a;
         }
         if (lhb_path.empty() || opts.acc_id.empty()) { usage(argv[0]); return 1; }
-        lhi::convert(in_path, lhb_path, opts);
+        lhi::convert_dispatch(in_path, lhb_path, opts);
         return 0;
     }
 

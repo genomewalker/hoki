@@ -12,11 +12,13 @@
 #include <algorithm>
 #include <cstring>
 #include <charconv>
+#include <memory>
+#include <sys/stat.h>
 
 namespace lhi {
 
 struct ConvertOptions {
-    std::string acc_id;          // SRA/ENA accession (required for .lhb output)
+    std::string acc_id;          // SRA/ENA accession; "auto" = extract from qseqid prefix
     int    zstd_level = 9;
     float  min_pident = 0.0f;
     double max_evalue = 1.0;
@@ -62,6 +64,8 @@ inline void revcomp_codon(uint8_t c[3]) {
     c[0]=t[0]; c[1]=t[1]; c[2]=t[2];
 }
 
+using SvDict = std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>>;
+
 // Convert a diamond blastx TSV (outfmt 6 + qseq_translated + full_qseq columns)
 // to a .lhb batch file.  All HOGs go into a single output file; no per-HOG shards.
 inline void convert(const std::string& tsv_path, const std::string& lhb_path,
@@ -71,7 +75,6 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
 
     BatchWriter batch(lhb_path, opts.acc_id);
 
-    using SvDict = std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>>;
     SvDict hog_dict, contig_dict;
     std::vector<std::string> hog_strings, contig_strings;
 
@@ -219,6 +222,173 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
     std::cerr << "convert: " << n_written << " records, " << n_skipped
               << " records skipped, " << n_obs_dropped << " observations dropped → "
               << lhb_path << "\n";
+}
+
+// Multi-accession convert: acc_id detected from qseqid prefix (before first '_').
+// out_dir is created if it doesn't exist; writes out_dir/ACC.lhb per accession.
+inline void convert_multi(const std::string& tsv_path, const std::string& out_dir,
+                          ConvertOptions opts) {
+    if (mkdir(out_dir.c_str(), 0755) != 0 && errno != EEXIST)
+        throw std::runtime_error("cannot create output dir: " + out_dir);
+
+    struct AccState {
+        std::unique_ptr<BatchWriter> writer;
+        SvDict contig_dict;
+        std::vector<std::string> contig_strings;
+        std::unordered_map<uint32_t, std::vector<VarNTRecord>> batches;
+    };
+    std::unordered_map<std::string, AccState> acc_states;
+
+    SvDict hog_dict;
+    std::vector<std::string> hog_strings;
+
+    std::istream* in = &std::cin;
+    std::ifstream fin;
+    if (tsv_path != "-") {
+        fin.open(tsv_path);
+        if (!fin) throw std::runtime_error("cannot open: " + tsv_path);
+        in = &fin;
+    }
+
+    std::string line;
+    uint64_t lineno = 0, n_written = 0, n_skipped = 0, n_obs_dropped = 0;
+
+    auto intern = [](SvDict& d, std::vector<std::string>& v, std::string_view s) -> uint32_t {
+        auto it = d.find(s);
+        if (it != d.end()) return it->second;
+        uint32_t idx = uint32_t(v.size());
+        v.emplace_back(s);
+        d.emplace(v.back(), idx);
+        return idx;
+    };
+
+    while (std::getline(*in, line)) {
+        ++lineno;
+        if (line.empty() || line[0] == '#') continue;
+
+        std::array<std::string_view, 14> f{};
+        size_t fi = 0;
+        const char* p = line.data(), *ep = p + line.size(), *fp = p;
+        while (p <= ep && fi < 14) {
+            if (p == ep || *p == '\t') { f[fi++] = {fp, size_t(p-fp)}; fp = p+1; }
+            ++p;
+        }
+        if (fi < 13) { if (opts.verbose) std::cerr << "skip L" << lineno << ": " << fi << " fields\n"; ++n_skipped; continue; }
+        bool has_nt = (fi == 14 && !f[col::full_qseq].empty());
+
+        float  pident = 0.0f;
+        double ev     = 0.0;
+        std::from_chars(f[col::pident].data(), f[col::pident].data() + f[col::pident].size(), pident);
+        std::from_chars(f[col::evalue].data(),  f[col::evalue].data()  + f[col::evalue].size(),  ev);
+
+        if (pident < opts.min_pident) { ++n_skipped; continue; }
+        if (ev     > opts.max_evalue) { ++n_skipped; continue; }
+        if (pident == 100.0f)         { ++n_skipped; continue; }
+
+        uint32_t sstart = 0, send = 0, qstart = 0, qend = 0, qlen = 0;
+        {
+            auto fc = [](std::string_view sv, uint32_t& out) -> bool {
+                auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out);
+                return ec == std::errc{};
+            };
+            if (!fc(f[col::sstart], sstart) || !fc(f[col::send], send) ||
+                !fc(f[col::qstart], qstart) || !fc(f[col::qend], qend) ||
+                !fc(f[col::qlen],   qlen)) {
+                if (opts.verbose) std::cerr << "parse error L" << lineno << "\n";
+                ++n_skipped; continue;
+            }
+        }
+        if (sstart > send) { ++n_skipped; continue; }
+
+        // Extract accession from qseqid prefix before first '_'
+        std::string_view qseqid = f[col::qseqid];
+        auto us = qseqid.find('_');
+        std::string acc(us != std::string_view::npos ? qseqid.substr(0, us) : qseqid);
+
+        AccState& st = acc_states[acc];
+        if (!st.writer) {
+            std::string path = out_dir + "/" + acc + ".lhb";
+            st.writer = std::make_unique<BatchWriter>(path, acc);
+        }
+
+        uint32_t hog_idx    = intern(hog_dict, hog_strings, extract_hog(f[col::sseqid]));
+        uint32_t contig_idx = intern(st.contig_dict, st.contig_strings, qseqid);
+        int8_t   qframe     = make_qframe(f[col::qstrand], qstart, qend, qlen);
+        auto     ar         = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
+
+        VarNTRecord vr;
+        vr.contig_idx = contig_idx;
+        vr.sstart     = sstart; vr.send = send;
+        vr.qframe     = qframe;
+        vr.pident     = pident; vr.evalue = ev;
+
+        std::string_view full_nt = has_nt ? f[col::full_qseq] : std::string_view{};
+        uint32_t span = send - sstart + 1;
+
+        for (uint32_t i = 0; i < span; ++i) {
+            uint8_t obs_aa = ar.aas[i];
+            if (obs_aa == AA_GAP || obs_aa == AA_UNK) { ++n_obs_dropped; continue; }
+            uint32_t q_off = ar.qseq_offsets[i];
+            if (q_off == UINT32_MAX || full_nt.empty()) { ++n_obs_dropped; continue; }
+
+            uint8_t c0, c1, c2;
+            if (qframe > 0) {
+                size_t cs = size_t(qstart-1) + size_t(q_off)*3;
+                if (cs+2 >= full_nt.size()) { ++n_obs_dropped; continue; }
+                c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
+            } else {
+                if (size_t(q_off)*3 + 3 > size_t(qstart)) { ++n_obs_dropped; continue; }
+                size_t cs = size_t(qstart-1) - size_t(q_off)*3 - 2;
+                if (cs+2 >= full_nt.size()) { ++n_obs_dropped; continue; }
+                c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
+                uint8_t tmp[3]={c0,c1,c2}; revcomp_codon(tmp); c0=tmp[0]; c1=tmp[1]; c2=tmp[2];
+            }
+
+            auto is_acgt = [](uint8_t b) { return b=='A'||b=='C'||b=='G'||b=='T'; };
+            if (!is_acgt(c0) || !is_acgt(c1) || !is_acgt(c2)) { ++n_obs_dropped; continue; }
+
+            uint8_t raw3[3]={c0,c1,c2};
+            uint8_t packed = pack_codon(raw3);
+            if (codon_to_aa(packed) != obs_aa) {
+                if (opts.verbose) std::cerr << "codon/AA mismatch L" << lineno << "\n";
+                ++n_obs_dropped; continue;
+            }
+            vr.vars.push_back({i, packed});
+        }
+
+        if (!vr.vars.empty())
+            st.batches[hog_idx].push_back(std::move(vr));
+        ++n_written;
+    }
+
+    // Flush each accession's batches in HOG-ID order
+    for (auto& [acc, st] : acc_states) {
+        std::vector<uint32_t> sorted_idxs;
+        sorted_idxs.reserve(st.batches.size());
+        for (auto& [hog_idx, recs] : st.batches)
+            if (!recs.empty()) sorted_idxs.push_back(hog_idx);
+        std::sort(sorted_idxs.begin(), sorted_idxs.end(),
+            [&](uint32_t a, uint32_t b) { return hog_strings[a] < hog_strings[b]; });
+        for (auto hog_idx : sorted_idxs) {
+            auto it = st.batches.find(hog_idx);
+            if (it != st.batches.end() && !it->second.empty())
+                st.writer->write_block(hog_strings[hog_idx], st.contig_strings, it->second, opts.zstd_level);
+        }
+        st.writer->finalize();
+    }
+
+    std::cerr << "convert: " << n_written << " records, " << n_skipped
+              << " records skipped, " << n_obs_dropped << " observations dropped, "
+              << acc_states.size() << " accessions → " << out_dir << "/\n";
+}
+
+// Dispatcher: routes to convert_multi when acc_id == "auto", else single-acc convert.
+inline void convert_dispatch(const std::string& tsv_path, const std::string& out_path,
+                             ConvertOptions opts) {
+    if (opts.acc_id == "auto")
+        convert_multi(tsv_path, out_path, opts);
+    else
+        convert(tsv_path, out_path, opts);
 }
 
 } // namespace lhi

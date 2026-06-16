@@ -21,18 +21,24 @@ hoki merge out.lhg out.lhgi *.lhb      # single inversion pass
 
 ### Large-scale (S3 / NFS — two-phase)
 
-```
-# Phase 1: partition — one batch per accession, write indexed per-thread files
-hoki convert -a ACC in.tsv ACC.lhb
-hoki partition out_dir/ *.lhb           # writes t0.lhp…tN.lhp + partition.idx + acc.registry
+```bash
+# Phase 1: convert — one job per concatenated TSV batch (parallelise with GNU parallel or AWS Batch)
+# Each batch file contains many accessions; -a auto splits them into per-acc .lhb files
+for f in batches/*.tsv.gz; do
+    stem=$(basename $f .tsv.gz)
+    zcat $f | hoki convert -a auto - lhbs/$stem/
+done
 
-# Phase 2: merge-shard — parallel inversion directly from the index
-hoki merge-shard [-t N] [--hog-range START END] out_dir/ out.lhg out.lhgi
+# Phase 2: partition — scatter all .lhb → per-thread indexed files (single large instance)
+hoki partition -t 192 part/ lhbs/**/*.lhb
+
+# Phase 3: merge-shard — parallel inversion (same instance)
+hoki merge-shard -t 192 part/ out.lhg out.lhgi
 ```
 
 S3 example (stdin supported via `-`):
 ```bash
-aws s3 cp s3://bucket/ACC.diamond.tsv - | hoki convert -a ACC - ACC.lhb
+aws s3 cp s3://bucket/batch_001.tsv.gz - | zcat | hoki convert -a auto - lhbs/batch_001/
 ```
 
 `--hog-range START END` lets cluster jobs process HOG ranges in parallel (split the
@@ -43,19 +49,25 @@ sorted HOG list from `partition.idx` across array jobs).
 ## `hoki convert`
 
 ```
-hoki convert -a ACC [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] in.tsv out.lhb
+hoki convert -a ACC    [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] in.tsv out.lhb
+hoki convert -a auto   [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] in.tsv out_dir/
 ```
 
 Input: 14-col diamond blastx TSV (`qseqid qstart qend qlen qstrand sseqid sstart
 send slen pident evalue cigar qseq_translated full_qseq`).
 
 `sseqid` must be an OMA HOG ID (`bpgv2|N0.HOG...` or `panbarley.bpgv2|N0.HOG...`).
-`qseqid` identifies the source assembly unitig (e.g. Logan: `ACC_N_ka:f:...`).
+`qseqid` identifies the source assembly unitig (Logan format: `ACC_N_ka:f:...`).
 `full_qseq` is consumed for ACGT validation and discarded.
+
+**`-a auto`** — multi-accession mode: extracts the accession from the `qseqid` prefix
+(everything before the first `_`). `out_dir/` is created automatically; one `ACC.lhb`
+file is written per detected accession. Useful when input TSVs are concatenated across
+many accessions (e.g. Rayan/Logan batches of thousands of accessions per file).
 
 Skips: non-ACGT codon triplets; round-trip failures `codon_to_aa(pack(nt3)) != observed_aa`.
 
-Writes one ShardBlock per HOG into `.lhb`, zstd-compressed at level `LVL`.
+Writes one ShardBlock per HOG per accession into `.lhb`, zstd-compressed at level `LVL`.
 
 ## `hoki partition`
 
