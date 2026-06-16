@@ -113,14 +113,6 @@ writer thread serializes output in HOG-ID order.
 `--buckets N` writes N sharded `.lhg`/`.lhgi` pairs.
 `--hot-threshold N` sets the minimum block count for parallel decode of a single HOG.
 
-## `hoki accregistry`
-
-```
-hoki accregistry out.acc shard.lhgi [shard.lhgi ...]
-```
-
-Merges the accession registries from multiple `.lhgi` files into a single `.acc` file.
-
 ## `hoki saav`
 
 ```

@@ -276,7 +276,6 @@ inline std::vector<std::string> load_partition_acc_registry(const std::string& p
 // No per-HOG files; one FD open per thread throughout; no concat step.
 inline void partition_lhbs(const std::vector<std::string>& input_paths,
                            const std::string& out_dir,
-                           const std::string& acc_registry_path = "",
                            int n_threads_override = 0) {
     std::filesystem::create_directories(out_dir);
 
@@ -284,11 +283,8 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
         n_threads_override > 0 ? size_t(n_threads_override) : std::thread::hardware_concurrency(),
         std::max<size_t>(1, input_paths.size())));
 
-    // Build accession registry
     std::vector<std::string> accessions;
-    if (!acc_registry_path.empty()) {
-        accessions = load_partition_acc_registry(acc_registry_path);
-    } else {
+    {
         std::set<std::string> uniq;
         std::mutex uniq_mtx;
         std::atomic<size_t> hn{0};

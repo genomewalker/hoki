@@ -107,37 +107,6 @@ inline MergeRef::Kind detect_input_kind(const std::string& path) {
     throw std::runtime_error("unrecognized magic (not .lhb/.lhg): " + path);
 }
 
-// accregistry subcommand: collect unique acc_ids from .lhgi LHGA sections,
-// sort, write one per line (plain text, no header).
-inline void build_acc_registry(const std::vector<std::string>& lhgi_paths,
-                               const std::string& out_path) {
-    std::set<std::string> accs;
-    for (const auto& path : lhgi_paths) {
-        GlobalIndex idx;
-        if (!idx.load(path) && !idx.load_from_lhg(path))
-            throw std::runtime_error("cannot load index: " + path);
-        for (const auto& a : idx.accessions) accs.insert(a);
-    }
-    std::ofstream out(out_path, std::ios::trunc);
-    if (!out) throw std::runtime_error("cannot create: " + out_path);
-    for (const auto& a : accs) out << a << "\n";
-    std::cerr << "accregistry: " << accs.size() << " accessions from "
-              << lhgi_paths.size() << " indexes → " << out_path << "\n";
-}
-
-// Load a global acc registry (one acc_id per line; position = global acc_idx).
-inline std::vector<std::string> load_acc_registry(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("cannot open acc registry: " + path);
-    std::vector<std::string> accs;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) accs.push_back(line);
-    }
-    return accs;
-}
-
 // Result produced by parallel compute workers; written serially by the main thread.
 struct ShardResult {
     std::string hog_id;
@@ -527,7 +496,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           const std::string& out_lhgi,
                           const std::string& hog_range_start = "",
                           const std::string& hog_range_end   = "",
-                          const std::string& acc_registry_path = "",
                           int n_buckets = 1,
                           int n_threads_override = 0,
                           bool do_profile = false,
@@ -633,17 +601,12 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
               << input_paths.size() << " inputs\n";
 
     // Global accession registry.
-    std::vector<std::string> accessions;
-    if (!acc_registry_path.empty()) {
-        accessions = load_acc_registry(acc_registry_path);
-    } else {
-        std::set<std::string> uniq;
-        for (const auto& r : refs)
-            if (r.kind == MergeRef::Kind::LHB) uniq.insert(r.lhb_acc_id);
-        for (const auto& accs : source_accs)
-            for (const auto& a : accs) uniq.insert(a);
-        accessions.assign(uniq.begin(), uniq.end());
-    }
+    std::set<std::string> uniq;
+    for (const auto& r : refs)
+        if (r.kind == MergeRef::Kind::LHB) uniq.insert(r.lhb_acc_id);
+    for (const auto& accs : source_accs)
+        for (const auto& a : accs) uniq.insert(a);
+    std::vector<std::string> accessions(uniq.begin(), uniq.end());
 
     std::unordered_map<std::string, uint32_t> acc_id_to_idx;
     acc_id_to_idx.reserve(accessions.size() * 2);

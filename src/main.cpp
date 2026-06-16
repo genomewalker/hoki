@@ -18,14 +18,13 @@ static void usage(const char* prog) {
     std::cerr
         << "hoki — HOG codon Index\n"
         << "  " << prog << " convert -a ACC [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out.lhb>\n"
-        << "  " << prog << " merge   [-zo LVL=3] [--buckets N=1] [--acc-registry file.acc] [--hog-range START END]\n"
+        << "  " << prog << " merge   [-zo LVL=3] [--buckets N=1] [--hog-range START END]\n"
         << "                  [--profile] [--hot-threshold N=100]\n"
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
         << "                  inputs may be .lhb or .lhg, mixed\n"
-        << "  " << prog << " partition   [-t N] [--acc-registry file.registry] <out_dir> <input1.lhb> [input2.lhb ...]\n"
+        << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
         << "  " << prog << " merge-shard [-t N] [--hog-range START END] <partition_dir> <out.lhg> <out.lhgi>\n"
         << "                  partition_dir must contain partition.idx, acc.registry, t0.lhp ...\n"
-        << "  " << prog << " accregistry <out.acc> <shard.lhgi> [shard.lhgi ...]\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA] [--min-pident N]\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
@@ -55,17 +54,16 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "merge") {
-        std::string acc_registry, hog_start, hog_end;
+        std::string hog_start, hog_end;
         int n_buckets = 1;
-        int n_threads = 0;  // 0 = hardware_concurrency
+        int n_threads = 0;
         bool do_profile = false;
         int hot_threshold = 100;
         int out_compress_level = 3;
-        std::vector<std::string> pos;  // out_lhg, out_lhgi, inputs...
+        std::vector<std::string> pos;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "--acc-registry" && i+1 < argc)  acc_registry      = argv[++i];
-            else if (a == "--hog-range" && i+2 < argc) { hog_start = argv[++i]; hog_end = argv[++i]; }
+            if      (a == "--hog-range" && i+2 < argc) { hog_start = argv[++i]; hog_end = argv[++i]; }
             else if (a == "-zo" && i+1 < argc)              out_compress_level= std::stoi(argv[++i]);
             else if (a == "--buckets" && i+1 < argc)        n_buckets         = std::stoi(argv[++i]);
             else if (a == "-t"        && i+1 < argc)        n_threads         = std::stoi(argv[++i]);
@@ -77,25 +75,23 @@ int main(int argc, char* argv[]) {
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
         std::vector<std::string> inputs(pos.begin() + 2, pos.end());
-        lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end, acc_registry,
+        lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end,
                            n_buckets, n_threads, do_profile, hot_threshold, out_compress_level);
         return 0;
     }
 
     if (mode == "partition") {
-        std::string acc_registry;
         int n_threads = 0;
         std::vector<std::string> pos;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "--acc-registry" && i+1 < argc) acc_registry = argv[++i];
-            else if (a == "-t" && i+1 < argc)             n_threads    = std::stoi(argv[++i]);
+            if (a == "-t" && i+1 < argc) n_threads = std::stoi(argv[++i]);
             else pos.emplace_back(a);
         }
         if (pos.size() < 2) { usage(argv[0]); return 1; }
         std::string out_dir = pos[0];
         std::vector<std::string> inputs(pos.begin() + 1, pos.end());
-        lhi::partition_lhbs(inputs, out_dir, acc_registry, n_threads);
+        lhi::partition_lhbs(inputs, out_dir, n_threads);
         return 0;
     }
 
@@ -231,15 +227,6 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "merge-shard done: " << gi.entries.size() << " HOGs, "
                   << gi.accessions.size() << " accessions → " << out_lhg << " (-t " << nt << ")\n";
-        return 0;
-    }
-
-    if (mode == "accregistry") {
-        if (argc < 4) { usage(argv[0]); return 1; }
-        std::string out_acc = argv[2];
-        std::vector<std::string> lhgis;
-        for (int i = 3; i < argc; ++i) lhgis.emplace_back(argv[i]);
-        lhi::build_acc_registry(lhgis, out_acc);
         return 0;
     }
 
