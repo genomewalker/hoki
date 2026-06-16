@@ -146,11 +146,14 @@ struct ShardScratch {
 
 // Invert one HOG from indexed partition files (tN.lhp + partition.idx).
 // Preads extents from already-open thread fds; never opens a per-HOG file.
+// fd_acc_remap[flat_fd_idx] → vector mapping local acc_idx → global acc_idx.
+// Empty means identity (single partition dir, no remapping needed).
 inline ShardResult merge_shard_compute_extents(
         const std::string& hog_id,
         const std::vector<PartitionIndexExtent>& extents,
         const std::vector<int>& thread_fds,
         ShardScratch& sc,
+        const std::vector<const std::vector<uint32_t>*>& fd_acc_remap = {},
         int out_zstd_level = 3) {
 
     ShardResult res;
@@ -193,6 +196,11 @@ inline ShardResult merge_shard_compute_extents(
             throw std::runtime_error("extent too small for HOG " + hog_id);
         PartitionEntry ent;
         memcpy(&ent, extent_buf.data(), sizeof(PartitionEntry));
+        if (!fd_acc_remap.empty() && ext.thread_idx < fd_acc_remap.size()
+                && fd_acc_remap[ext.thread_idx]) {
+            const auto& rm = *fd_acc_remap[ext.thread_idx];
+            if (ent.acc_idx < rm.size()) ent.acc_idx = rm[ent.acc_idx];
+        }
         if (ent.raw_sz > 512u * 1024 * 1024)
             throw std::runtime_error("raw_sz OOB for HOG " + hog_id);
         const uint8_t* cdata = extent_buf.data() + sizeof(PartitionEntry);

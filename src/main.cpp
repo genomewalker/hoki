@@ -1,4 +1,7 @@
 #include "convert.hpp"
+#include "ingest.hpp"
+#include <dirent.h>
+#include <sys/stat.h>
 #include "merge.hpp"
 #include "partition.hpp"
 #include "global.hpp"
@@ -12,6 +15,7 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <set>
 #include <sys/stat.h>
 
 static void usage(const char* prog) {
@@ -23,9 +27,11 @@ static void usage(const char* prog) {
         << "                  [--profile] [--hot-threshold N=100]\n"
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
         << "                  inputs may be .lhb or .lhg, mixed\n"
+        << "  " << prog << " ingest  -a ACC|auto [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out_part_dir/>\n"
+        << "                  TSV → partition dir directly (no intermediate .lhb). One job per input file.\n"
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
-        << "  " << prog << " merge-shard [-t N] [--hog-range START END] <partition_dir> <out.lhg> <out.lhgi>\n"
-        << "                  partition_dir must contain partition.idx, acc.registry, t0.lhp ...\n"
+        << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> <part_dir> [part_dir2 ...]\n"
+        << "                  accepts one or more partition dirs (from ingest or partition)\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA] [--min-pident N]\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
@@ -51,6 +57,24 @@ int main(int argc, char* argv[]) {
         }
         if (lhb_path.empty() || opts.acc_id.empty()) { usage(argv[0]); return 1; }
         lhi::convert_dispatch(in_path, lhb_path, opts);
+        return 0;
+    }
+
+    if (mode == "ingest") {
+        lhi::ConvertOptions opts;
+        std::string in_path, out_dir;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "-a" && i+1 < argc) opts.acc_id     = argv[++i];
+            else if (a == "-z" && i+1 < argc) opts.zstd_level = std::stoi(argv[++i]);
+            else if (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
+            else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
+            else if (a == "-v")               opts.verbose    = true;
+            else if (in_path.empty())         in_path         = a;
+            else if (out_dir.empty())         out_dir         = a;
+        }
+        if (in_path.empty() || out_dir.empty() || opts.acc_id.empty()) { usage(argv[0]); return 1; }
+        lhi::ingest(in_path, out_dir, opts);
         return 0;
     }
 
@@ -89,9 +113,17 @@ int main(int argc, char* argv[]) {
             if (a == "-t" && i+1 < argc) n_threads = std::stoi(argv[++i]);
             else pos.emplace_back(a);
         }
-        if (pos.size() < 2) { usage(argv[0]); return 1; }
+        if (pos.empty()) { usage(argv[0]); return 1; }
         std::string out_dir = pos[0];
         std::vector<std::string> inputs(pos.begin() + 1, pos.end());
+        // "-" or no positional inputs → read paths from stdin (one per line)
+        if (inputs.size() == 1 && inputs[0] == "-") inputs.clear();
+        if (inputs.empty()) {
+            std::string line;
+            while (std::getline(std::cin, line))
+                if (!line.empty()) inputs.push_back(line);
+        }
+        if (inputs.empty()) { std::cerr << "partition: no input files\n"; return 1; }
         lhi::partition_lhbs(inputs, out_dir, n_threads);
         return 0;
     }
@@ -107,33 +139,66 @@ int main(int argc, char* argv[]) {
             else pos.emplace_back(a);
         }
         if (pos.size() < 3) { usage(argv[0]); return 1; }
-        std::string part_dir = pos[0];
-        std::string out_lhg  = pos[1];
-        std::string out_lhgi = pos[2];
-        std::string idx_path = part_dir + "/partition.idx";
-        std::string acc_path = part_dir + "/acc.registry";
+        std::string out_lhg  = pos[0];
+        std::string out_lhgi = pos[1];
+        std::vector<std::string> part_dirs(pos.begin() + 2, pos.end());
 
-        uint32_t n_tfiles = 0;
-        auto part_idx = lhi::load_partition_index(idx_path, n_tfiles);
-        auto accessions = lhi::load_partition_acc_registry(acc_path);
+        // Load all acc.registry files; build merged sorted global accession list.
+        std::vector<std::vector<std::string>> dir_accs(part_dirs.size());
+        for (size_t d = 0; d < part_dirs.size(); ++d)
+            dir_accs[d] = lhi::load_partition_acc_registry(part_dirs[d] + "/acc.registry");
 
-        // Open all thread files read-only; shared by all workers (pread is thread-safe).
+        std::vector<std::string> accessions;
+        {
+            std::set<std::string> seen;
+            for (auto& v : dir_accs)
+                for (auto& s : v) seen.insert(s);
+            accessions.assign(seen.begin(), seen.end());
+        }
+
+        // Per-dir local→global acc_idx remap table.
+        std::vector<std::vector<uint32_t>> dir_remap(part_dirs.size());
+        for (size_t d = 0; d < part_dirs.size(); ++d) {
+            dir_remap[d].resize(dir_accs[d].size());
+            for (uint32_t li = 0; li < uint32_t(dir_accs[d].size()); ++li) {
+                auto it = std::lower_bound(accessions.begin(), accessions.end(), dir_accs[d][li]);
+                dir_remap[d][li] = uint32_t(it - accessions.begin());
+            }
+        }
+
+        // Open all thread files; track which dir each flat fd belongs to.
         std::vector<lhi::UniqueFd> tfds;
         std::vector<int>           tfd_ints;
-        tfds.reserve(n_tfiles); tfd_ints.reserve(n_tfiles);
-        for (uint32_t t = 0; t < n_tfiles; ++t) {
-            std::string tp = part_dir + "/t" + std::to_string(t) + ".lhp";
-            int raw = ::open(tp.c_str(), O_RDONLY);
-            if (raw < 0) { std::cerr << "cannot open: " << tp << "\n"; return 1; }
-            tfds.emplace_back(raw);
-            tfd_ints.push_back(raw);
+        std::vector<const std::vector<uint32_t>*> fd_acc_remap; // parallel to tfd_ints
+
+        std::map<std::string, std::vector<lhi::PartitionIndexExtent>> merged_idx;
+
+        for (size_t d = 0; d < part_dirs.size(); ++d) {
+            uint32_t n_tfiles = 0;
+            auto dir_idx = lhi::load_partition_index(part_dirs[d] + "/partition.idx", n_tfiles);
+            uint32_t fd_base = uint32_t(tfd_ints.size());
+            for (uint32_t t = 0; t < n_tfiles; ++t) {
+                std::string tp = part_dirs[d] + "/t" + std::to_string(t) + ".lhp";
+                int raw = ::open(tp.c_str(), O_RDONLY);
+                if (raw < 0) { std::cerr << "cannot open: " << tp << "\n"; return 1; }
+                tfds.emplace_back(raw);
+                tfd_ints.push_back(raw);
+                fd_acc_remap.push_back(&dir_remap[d]);
+            }
+            for (auto& [hog, exts] : dir_idx) {
+                auto& dst = merged_idx[hog];
+                for (auto ext : exts) {
+                    ext.thread_idx += fd_base;
+                    dst.push_back(ext);
+                }
+            }
         }
 
         // Filter HOGs by range
         using HogEntry = std::pair<const std::string, std::vector<lhi::PartitionIndexExtent>>;
         std::vector<const HogEntry*> hog_list;
-        hog_list.reserve(part_idx.size());
-        for (const auto& kv : part_idx) {
+        hog_list.reserve(merged_idx.size());
+        for (const auto& kv : merged_idx) {
             if (!hog_range_start.empty() && kv.first < hog_range_start) continue;
             if (!hog_range_end.empty()   && kv.first > hog_range_end)   continue;
             hog_list.push_back(&kv);
@@ -156,7 +221,7 @@ int main(int argc, char* argv[]) {
                 if (hi >= hog_list.size() || sfailed.load(std::memory_order_relaxed)) break;
                 try {
                     results[hi] = lhi::merge_shard_compute_extents(
-                        hog_list[hi]->first, hog_list[hi]->second, tfd_ints, sc);
+                        hog_list[hi]->first, hog_list[hi]->second, tfd_ints, sc, fd_acc_remap);
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> lk(serr_mtx);
                     if (!sfailed.exchange(true)) serr = e.what();
@@ -228,7 +293,8 @@ int main(int argc, char* argv[]) {
         { lhi::WriteBuffer w3; w3.append(fi, out_lhgi, idx_bytes.data(), idx_bytes.size()); w3.flush_to(fi, out_lhgi); }
 
         std::cerr << "merge-shard done: " << gi.entries.size() << " HOGs, "
-                  << gi.accessions.size() << " accessions → " << out_lhg << " (-t " << nt << ")\n";
+                  << gi.accessions.size() << " accessions, "
+                  << part_dirs.size() << " partition dir(s) → " << out_lhg << " (-t " << nt << ")\n";
         return 0;
     }
 
