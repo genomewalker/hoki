@@ -2,7 +2,7 @@
 
 Position-centric inverted index over diamond blastx codon observations, keyed by OMA HOG.
 
-**Deps**: C++17, zstd ≥1.4, lz4, cmake ≥3.16.
+**Deps**: C++17, zstd ≥1.4, cmake ≥3.16.
 
 ```
 cmake -B build -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
@@ -36,14 +36,14 @@ aws s3 cp s3://bucket/ACC.diamond.tsv - | hoki convert -a ACC - ACC.lhb
 ```
 
 `--hog-range START END` lets cluster jobs process HOG ranges in parallel (split the
-sorted HOG list from `partition.idx` across array jobs, then `hoki accregistry` to merge).
+sorted HOG list from `partition.idx` across array jobs).
 
 ---
 
 ## `hoki convert`
 
 ```
-hoki convert -a ACC [-z LVL=3] [-p MINPID=0] [-e MAXEV=1e-3] [-v] in.tsv out.lhb
+hoki convert -a ACC [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] in.tsv out.lhb
 ```
 
 Input: 14-col diamond blastx TSV (`qseqid qstart qend qlen qstrand sseqid sstart
@@ -119,12 +119,12 @@ writer thread serializes output in HOG-ID order.
 hoki saav lhg lhgi HOG_ID POS [AA] [--min-pident N]
 ```
 
-TSV stdout: `acc_id \t contig_num \t hog_pos \t obs_aa \t codon`
+TSV stdout: `acc_id \t unitig_id \t hog_pos \t obs_aa \t codon \t pident`
 
 `POS` is 0-based `sstart`. `AA` is a single-letter filter.
 
-`contig_num` is the numeric field immediately after the first `_` in `qseqid`
-(e.g. `DRR000001_42_ka:f:...` → `42`).
+`unitig_id` is `acc_id_N` where `N` is the numeric field immediately after the first
+`_` in `qseqid` (e.g. `DRR000001_42_ka:f:...` → `unitig_id = DRR000001_42`).
 
 ## `hoki freq`
 
@@ -185,7 +185,7 @@ Repeated until EOF:
 
 Codon encoding: A=0 C=1 G=2 T=3; `codon_idx = (nt0 << 4) | (nt1 << 2) | nt2`.
 
-### `tN.lhp` — per-thread partition file (no file header)
+### `tN.lhp` — per-thread partition file (LHP_VERSION 2, no file header)
 
 One file per worker thread. Records are appended in arrival order (no HOG sorting
 within the file; the index handles lookup).
@@ -194,13 +194,11 @@ within the file; the index handles lookup).
 Repeated until EOF:
   [2]  hog_id_len  uint16 LE
   [hog_id_len bytes]  hog_id string
-  PartitionEntry (24 bytes, packed):
+  PartitionEntry (16 bytes, packed):
     [4]  acc_idx        uint32 LE   // global accession index
     [4]  compressed_sz  uint32 LE
     [4]  raw_sz         uint32 LE
     [4]  n_records      uint32 LE
-    [4]  min_sstart     uint32 LE
-    [4]  max_send       uint32 LE
   [compressed_sz bytes]  zstd-compressed ShardBlock payload
 ```
 
