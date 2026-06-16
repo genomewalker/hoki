@@ -19,30 +19,37 @@ hoki convert -a ACC in.tsv out.lhb     # one per accession, fully parallel
 hoki merge out.lhg out.lhgi *.lhb      # single inversion pass
 ```
 
-### Large-scale (S3 / NFS — two-phase)
+### Large-scale (S3 / NFS — `ingest` path, no intermediate .lhb)
+
+One job per input file; each writes its own isolated partition dir.
+`merge-shard` then accepts all dirs at once and merges their acc registries automatically.
 
 ```bash
-# Phase 1: convert — one job per concatenated TSV batch (parallelise with GNU parallel or AWS Batch)
-# Each batch file contains many accessions; -a auto splits them into per-acc .lhb files
-for f in batches/*.tsv.gz; do
-    stem=$(basename $f .tsv.gz)
-    zcat $f | hoki convert -a auto - lhbs/$stem/
-done
+# Phase 1: one ingest job per TSV (parallelise with GNU parallel, Slurm, AWS Batch, …)
+parallel -j 32 'hoki ingest -a auto {} parts/{/.}/' ::: inputs/*.tsv
 
-# Phase 2: partition — scatter all .lhb → per-thread indexed files (single large instance)
-hoki partition -t 192 part/ lhbs/**/*.lhb
+# S3 example (stdin supported):
+aws s3 cp s3://serratus-rayan/beetles/logan_jun9_26_run/diamond/DRR000001/DRR000001.diamond.jun9_26.txt - \
+    | hoki ingest -a auto - parts/DRR000001/
 
-# Phase 3: merge-shard — parallel inversion (same instance)
-hoki merge-shard -t 192 part/ out.lhg out.lhgi
+# Phase 2: merge all partition dirs → final index
+hoki merge-shard -t 192 out.lhg out.lhgi parts/*/
 ```
 
-S3 example (stdin supported via `-`):
+`--hog-range START END` restricts HOGs processed (for cluster jobs splitting the HOG list across nodes).
+
+### Two-phase path (via .lhb — retained for compatibility)
+
 ```bash
-aws s3 cp s3://bucket/batch_001.tsv.gz - | zcat | hoki convert -a auto - lhbs/batch_001/
-```
+# Phase 1: convert
+for f in batches/*.tsv.gz; do zcat $f | hoki convert -a auto - lhbs/${f%.tsv.gz}/; done
 
-`--hog-range START END` lets cluster jobs process HOG ranges in parallel (split the
-sorted HOG list from `partition.idx` across array jobs).
+# Phase 2: partition (pass file list via stdin to avoid ARG_MAX)
+find lhbs/ -name '*.lhb' | hoki partition -t 192 part/ -
+
+# Phase 3: merge-shard
+hoki merge-shard -t 192 out.lhg out.lhgi part/
+```
 
 ---
 
@@ -83,22 +90,39 @@ On completion writes `out_dir/partition.idx` (LHPI binary index) and
 Replaces the old approach that wrote one `.lhp` file per HOG — eliminates the
 file-per-HOG metadata storm (catastrophic on NFS/EFS at scale).
 
+## `hoki ingest`
+
+```
+hoki ingest -a ACC|auto [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] in.tsv out_dir/
+```
+
+TSV → partition dir in a single pass — no intermediate `.lhb`. Equivalent to
+`convert | partition` but without the intermediate file and with no ARG\_MAX risk.
+
+`-a auto` extracts the accession from the `qseqid` prefix (before the first `_`), so one
+TSV containing many accessions produces a correctly partitioned output dir.
+
+Writes `out_dir/t0.lhp`, `out_dir/partition.idx`, and `out_dir/acc.registry`.
+Each parallel job writes to its own isolated output dir; `merge-shard` accepts
+multiple dirs and reconciles accession registries automatically.
+
 ## `hoki merge-shard`
 
 ```
-hoki merge-shard [-t N=nproc] [-z LVL=3] [--hog-range START END] \
-                 partition_dir/ out.lhg out.lhgi
+hoki merge-shard [-t N=nproc] [--hog-range START END] \
+                 out.lhg out.lhgi part_dir/ [part_dir2/ ...]
 ```
 
-Reads `partition_dir/partition.idx` to enumerate HOGs, opens all `tN.lhp` files,
-then inverts them in parallel using worker-stealing (`N` threads, default = hardware
-concurrency).
+Accepts one or more partition dirs (from `ingest` or `partition`).
+Loads all `acc.registry` files, builds a merged sorted global accession list,
+remaps per-dir local acc indices to global indices on the fly while reading extents.
 
-HOG payloads are written in completion order to `out.lhg`; a final sort pass orders
-the index entries by HOG ID before writing the LHGI section.
+Opens all `tN.lhp` files across all dirs (flat fd list), then inverts in parallel
+(`N` threads, default = hardware concurrency). HOG payloads written in completion order;
+final sort pass orders index entries by HOG ID before writing LHGI.
 
-`--hog-range START END` restricts processing to HOGs in `[START, END)` of the sorted
-index (for parallel cluster jobs splitting the HOG list).
+`--hog-range START END` restricts processing to HOGs in `[START, END]` (for parallel
+cluster jobs splitting the HOG list across nodes).
 
 ## `hoki merge`
 
