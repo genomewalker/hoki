@@ -14,6 +14,7 @@
 #include <charconv>
 #include <memory>
 #include <sys/stat.h>
+#include <zlib.h>
 
 namespace lhi {
 
@@ -66,6 +67,52 @@ inline void revcomp_codon(uint8_t c[3]) {
 
 using SvDict = std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>>;
 
+// Transparent line reader: plain file, .gz file, or stdin ("-").
+// Provides getline(std::string&) → bool.
+struct TsvReader {
+    enum class Kind { Plain, Gz, Stdin };
+    Kind kind;
+    std::ifstream fin;
+    gzFile gz = nullptr;
+    std::vector<char> gz_buf;
+
+    explicit TsvReader(const std::string& path) {
+        if (path == "-") {
+            kind = Kind::Stdin;
+        } else if (path.size() > 3 && path.compare(path.size()-3, 3, ".gz") == 0) {
+            kind = Kind::Gz;
+            gz = gzopen(path.c_str(), "r");
+            if (!gz) throw std::runtime_error("cannot open: " + path);
+            gzbuffer(gz, 1u << 20);
+            gz_buf.resize(1u << 16);
+        } else {
+            kind = Kind::Plain;
+            fin.open(path);
+            if (!fin) throw std::runtime_error("cannot open: " + path);
+        }
+    }
+    ~TsvReader() { if (gz) gzclose(gz); }
+    TsvReader(const TsvReader&) = delete;
+    TsvReader& operator=(const TsvReader&) = delete;
+
+    bool getline(std::string& line) {
+        if (kind == Kind::Gz) {
+            line.clear();
+            while (true) {
+                if (!gzgets(gz, gz_buf.data(), int(gz_buf.size()))) return !line.empty();
+                line += gz_buf.data();
+                if (!line.empty() && line.back() == '\n') {
+                    line.pop_back();
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    return true;
+                }
+            }
+        }
+        std::istream& s = (kind == Kind::Stdin) ? std::cin : static_cast<std::istream&>(fin);
+        return bool(std::getline(s, line));
+    }
+};
+
 // Convert a diamond blastx TSV (outfmt 6 + qseq_translated + full_qseq columns)
 // to a .lhb batch file.  All HOGs go into a single output file; no per-HOG shards.
 inline void convert(const std::string& tsv_path, const std::string& lhb_path,
@@ -97,18 +144,11 @@ inline void convert(const std::string& tsv_path, const std::string& lhb_path,
         it->second.clear();
     };
 
-    std::istream* in = &std::cin;
-    std::ifstream fin;
-    if (tsv_path != "-") {
-        fin.open(tsv_path);
-        if (!fin) throw std::runtime_error("cannot open: " + tsv_path);
-        in = &fin;
-    }
-
+    TsvReader reader(tsv_path);
     std::string line;
     uint64_t lineno = 0, n_written = 0, n_skipped = 0, n_obs_dropped = 0;
 
-    while (std::getline(*in, line)) {
+    while (reader.getline(line)) {
         ++lineno;
         if (line.empty() || line[0] == '#') continue;
 
@@ -242,14 +282,7 @@ inline void convert_multi(const std::string& tsv_path, const std::string& out_di
     SvDict hog_dict;
     std::vector<std::string> hog_strings;
 
-    std::istream* in = &std::cin;
-    std::ifstream fin;
-    if (tsv_path != "-") {
-        fin.open(tsv_path);
-        if (!fin) throw std::runtime_error("cannot open: " + tsv_path);
-        in = &fin;
-    }
-
+    TsvReader reader(tsv_path);
     std::string line;
     uint64_t lineno = 0, n_written = 0, n_skipped = 0, n_obs_dropped = 0;
 
@@ -262,7 +295,7 @@ inline void convert_multi(const std::string& tsv_path, const std::string& out_di
         return idx;
     };
 
-    while (std::getline(*in, line)) {
+    while (reader.getline(line)) {
         ++lineno;
         if (line.empty() || line[0] == '#') continue;
 

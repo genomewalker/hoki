@@ -9,6 +9,7 @@ list(PREPEND CMAKE_PREFIX_PATH
     "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo")
 
 find_package(zstd REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_executable(hoki src/main.cpp)
 target_include_directories(hoki PRIVATE src)
@@ -24,6 +25,7 @@ else()
     target_include_directories(hoki PRIVATE ${ZSTD_INC})
 endif()
 
+target_link_libraries(hoki PRIVATE ZLIB::ZLIB)
 target_compile_options(hoki PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
 
 install(TARGETS hoki DESTINATION bin)
