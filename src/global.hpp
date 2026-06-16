@@ -226,18 +226,17 @@ struct InvPosition {
     std::vector<InvObs> obs;
 };
 
-// Serialize an inverted HOG block (v8 format).
-// local_accs: sorted unique global acc_idx values for this HOG (obs remap global→local).
-// local_acc_pident: one byte per local acc = minimum pident across all HSPs for that acc.
-// positions: sorted ascending by hog_pos; each obs sorted ascending by (global) acc_idx.
-// hog_length: protein length in AA (0 = unknown).
-// covered_aa: AA positions covered per local acc (indexed by local_acc_idx; 0 = unknown).
+// Serialize an inverted HOG block (v8 format). scratch_* are reusable buffers (cleared on entry).
 inline void serialize_inverted_block(std::vector<uint8_t>& raw,
                                      const std::vector<uint32_t>& local_accs,
                                      const std::vector<uint8_t>& local_acc_pident,
                                      const std::vector<InvPosition>& positions,
-                                     uint32_t hog_length = 0,
-                                     const std::vector<uint32_t>& covered_aa = {}) {
+                                     uint32_t hog_length,
+                                     const std::vector<uint32_t>& covered_aa,
+                                     std::vector<uint8_t>& hdr_buf,
+                                     std::vector<uint8_t>& acc_buf,
+                                     std::vector<uint8_t>& cnum_buf,
+                                     std::vector<uint8_t>& codon_buf) {
     uint32_t n_local = uint32_t(local_accs.size());
 
     // Local acc dict + pident: varint(n_local), then per acc: varint(delta_gacc), uint8(pident)
@@ -259,12 +258,7 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
 
     uint32_t n_positions = uint32_t(positions.size());
 
-    // Build 4 columns into separate buffers, then concatenate:
-    //   hdr_buf: position headers
-    //   acc_buf: acc column (all positions)
-    //   cnum_buf: cnum column (all positions, one varint per obs)
-    //   codon_buf: codon column (per position, using obs ordinals for variants)
-    std::vector<uint8_t> hdr_buf, acc_buf, cnum_buf, codon_buf;
+    hdr_buf.clear(); acc_buf.clear(); cnum_buf.clear(); codon_buf.clear();
 
     // Position headers
     write_varint(hdr_buf, n_positions);
@@ -319,6 +313,18 @@ inline void serialize_inverted_block(std::vector<uint8_t>& raw,
     raw.insert(raw.end(), acc_buf.begin(),   acc_buf.end());
     raw.insert(raw.end(), cnum_buf.begin(),  cnum_buf.end());
     raw.insert(raw.end(), codon_buf.begin(), codon_buf.end());
+}
+
+// Convenience overload: allocates scratch buffers locally (use only on cold paths).
+inline void serialize_inverted_block(std::vector<uint8_t>& raw,
+                                     const std::vector<uint32_t>& local_accs,
+                                     const std::vector<uint8_t>& local_acc_pident,
+                                     const std::vector<InvPosition>& positions,
+                                     uint32_t hog_length = 0,
+                                     const std::vector<uint32_t>& covered_aa = {}) {
+    std::vector<uint8_t> hdr, acc, cnum, codon;
+    serialize_inverted_block(raw, local_accs, local_acc_pident, positions,
+                             hog_length, covered_aa, hdr, acc, cnum, codon);
 }
 
 // Read exactly n bytes from fd; returns false on short read.

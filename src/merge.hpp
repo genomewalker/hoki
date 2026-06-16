@@ -492,10 +492,15 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         std::vector<std::vector<InvPosition>> src_pos;
         std::vector<InvObs>     obs;
         std::vector<std::vector<InvObs>> per_block_obs;
-        // mixed/lhb path
-        std::unordered_map<uint32_t, std::vector<InvObs>> inverted;
+        // mixed/lhb path — flat (pos, obs) vector, sorted in one pass after all blocks
+        std::vector<std::pair<uint32_t, InvObs>> flat_inv;
         std::vector<VarNTRecord> recs;
         std::vector<uint32_t>   contig_cnum;
+        // serialize scratch: cleared per group, reused across groups to avoid allocs
+        std::vector<uint8_t> ser_hdr_buf, ser_acc_buf, ser_cnum_buf, ser_codon_buf;
+        // counting sort scratch for grouping flat_inv by hog_pos (O(N + max_pos) vs O(N log N))
+        std::vector<uint32_t> cs_count;   // cs_count[pos] = obs count at that position
+        std::vector<uint32_t> cs_pidx;    // cs_pidx[pos]  = positions[] index for that position
         // v8: per-HOG coverage/pident accumulators keyed by global acc_idx
         uint32_t hog_length = 0;
         // .lhb sources: store raw HSP intervals; merged at serialize time to avoid double-counting overlaps
@@ -538,8 +543,13 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         if (sc.seen_epoch.size() < accessions.size()) sc.seen_epoch.assign(accessions.size(), 0);
         ++sc.epoch;
         sc.n_accs = 0;
-        auto mark_acc = [&sc](uint32_t gacc) {
-            if (sc.seen_epoch[gacc] != sc.epoch) { sc.seen_epoch[gacc] = sc.epoch; ++sc.n_accs; }
+        std::vector<uint32_t> seen_accs;
+        auto mark_acc = [&sc, &seen_accs](uint32_t gacc) {
+            if (sc.seen_epoch[gacc] != sc.epoch) {
+                sc.seen_epoch[gacc] = sc.epoch;
+                ++sc.n_accs;
+                seen_accs.push_back(gacc);
+            }
         };
 
         bool all_lhg = true;
@@ -738,8 +748,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 }
             }
         } else {
-            // Mixed/LHB groups: accumulate into a map, then sort.
-            auto& inverted = sc.inverted; inverted.clear();
+            // Mixed/LHB groups: accumulate into a flat (pos, obs) vector, sort once.
+            auto& flat_inv = sc.flat_inv; flat_inv.clear();
             sc.hog_length = 0; sc.acc_intervals_map.clear(); sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
 
             for (size_t bi = 0; bi < n_blocks; ++bi) {
@@ -838,7 +848,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         for (const auto& o : r.vars) {
                             uint32_t hog_pos   = r.sstart + o.hog_offset;
                             uint8_t  codon_idx = uint8_t(o.packed_codon >> 2);
-                            inverted[hog_pos].push_back({acc_idx, codon_idx, cnum});
+                            flat_inv.emplace_back(hog_pos, InvObs{acc_idx, codon_idx, cnum});
                         }
                     }
                 } else {
@@ -867,14 +877,13 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
                     auto blk_positions = decode_block(blk);
                     for (const auto& ip : blk_positions) {
-                        auto& dst = inverted[ip.hog_pos];
                         for (const auto& o : ip.obs) {
                             uint32_t li = o.acc_idx;
                             if (li >= remap.size())
                                 throw std::runtime_error("acc_idx out of source registry for HOG " + hog_id);
                             uint32_t gacc = remap[li];
                             mark_acc(gacc);
-                            dst.push_back({gacc, o.codon_idx, o.cnum});
+                            flat_inv.emplace_back(ip.hog_pos, InvObs{gacc, o.codon_idx, o.cnum});
                         }
                     }
                 }
@@ -882,27 +891,32 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
             t_dec_end = clock_ns();
 
-            positions.reserve(inverted.size());
-            for (auto& kv : inverted) {
-                std::sort(kv.second.begin(), kv.second.end(),
-                    [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
-                positions.push_back({kv.first, std::move(kv.second)});
+            // Counting sort by hog_pos (O(N + hog_length)) — better than O(N log N) flat sort
+            // since hog_length ≤ 2000 typically and N = all obs across all blocks.
+            uint32_t max_pos = sc.hog_length > 0 ? sc.hog_length - 1 : 0;
+            for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
+            auto& cs_count = sc.cs_count; cs_count.assign(max_pos + 1, 0);
+            auto& cs_pidx  = sc.cs_pidx;  cs_pidx.assign(max_pos + 1, UINT32_MAX);
+            for (const auto& e : flat_inv) ++cs_count[e.first];
+            // Build InvPosition vector (sorted by pos; reserve obs counts)
+            for (uint32_t p = 0; p <= max_pos; ++p) {
+                if (!cs_count[p]) continue;
+                cs_pidx[p] = uint32_t(positions.size());
+                InvPosition ip; ip.hog_pos = p; ip.obs.reserve(cs_count[p]);
+                positions.push_back(std::move(ip));
             }
-            std::sort(positions.begin(), positions.end(),
-                [](const InvPosition& a, const InvPosition& b) { return a.hog_pos < b.hog_pos; });
+            // Fill obs into positions
+            for (auto& e : flat_inv)
+                positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
+            // Sort each position's obs by acc_idx
+            for (auto& pos : positions)
+                std::sort(pos.obs.begin(), pos.obs.end(),
+                          [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
         }
 
-        // Build per-HOG local acc dict: unique global acc_idx, sorted.
-        static thread_local std::unordered_set<uint32_t> tl_seen_set;
-        std::vector<uint32_t> local_accs;
-        {
-            tl_seen_set.clear();
-            for (const auto& pos : positions)
-                for (const auto& o : pos.obs)
-                    tl_seen_set.insert(o.acc_idx);
-            local_accs.assign(tl_seen_set.begin(), tl_seen_set.end());
-            std::sort(local_accs.begin(), local_accs.end());
-        }
+        // Build per-HOG local acc dict from seen_accs (populated by mark_acc above).
+        std::vector<uint32_t> local_accs = std::move(seen_accs);
+        std::sort(local_accs.begin(), local_accs.end());
 
         // Build per-local-acc pident and covered_aa vectors from maps.
         // covered_aa = merged .lhb intervals + direct .lhg sum (shards are HOG-disjoint).
@@ -930,7 +944,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
         // Serialize inverted block.
         inv_raw.clear();
-        serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v);
+        serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
+                                 sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf, sc.ser_codon_buf);
         t_build_end = clock_ns();
 
         tl_decode += t_dec_end - t0;
