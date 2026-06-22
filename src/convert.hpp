@@ -24,6 +24,7 @@ struct ConvertOptions {
     float  min_pident = 0.0f;
     double max_evalue = 1.0;
     bool   verbose    = false;
+    size_t flush_bytes = 0; // 0 = auto-detect from cgroup; else explicit threshold in bytes
 };
 
 // diamond blastx outfmt 6 columns (0-based):

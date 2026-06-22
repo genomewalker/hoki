@@ -33,6 +33,116 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
         return idx;
     };
 
+    // Create writer before the read loop so mid-stream flushes can write to it.
+    PartitionWriter pw(out_dir + "/t0.lhp");
+
+    const size_t flush_threshold = [&]() -> size_t {
+        if (opts.flush_bytes != 0) return opts.flush_bytes;
+        // cgroup v2: walk hierarchy from /proc/self/cgroup, find constrained memory.max
+        auto read_mem_limit = []() -> unsigned long long {
+            FILE* fg = fopen("/proc/self/cgroup", "r");
+            if (!fg) return 0;
+            char cgpath[512] = {};
+            char line[512];
+            while (fgets(line, sizeof(line), fg)) {
+                // format: 0::/user.slice/...
+                if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+                    size_t n = strlen(line);
+                    while (n > 0 && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]='\0';
+                    snprintf(cgpath, sizeof(cgpath), "%s", line+3);
+                    break;
+                }
+            }
+            fclose(fg);
+            if (!cgpath[0]) return 0;
+            // Walk up from /sys/fs/cgroup/<cgpath> to root
+            char base[640];
+            snprintf(base, sizeof(base), "/sys/fs/cgroup%s", cgpath);
+            while (strlen(base) > strlen("/sys/fs/cgroup")) {
+                char memmax[700];
+                snprintf(memmax, sizeof(memmax), "%s/memory.max", base);
+                FILE* fm = fopen(memmax, "r");
+                if (fm) {
+                    char val[64] = {};
+                    fgets(val, sizeof(val), fm);
+                    fclose(fm);
+                    if (val[0] != 'm') { // not "max"
+                        unsigned long long v = 0;
+                        sscanf(val, "%llu", &v);
+                        if (v > 0) return v;
+                    }
+                }
+                char* slash = strrchr(base, '/');
+                if (!slash || slash == base) break;
+                *slash = '\0';
+            }
+            return 0;
+        };
+        // cgroup v1: walk up from the task's memory cgroup until we find a real limit
+        auto read_v1 = []() -> unsigned long long {
+            FILE* fg = fopen("/proc/self/cgroup", "r");
+            if (!fg) return 0;
+            char cgrel[512] = {};
+            char line[512];
+            while (fgets(line, sizeof(line), fg)) {
+                char* p1 = strchr(line, ':');
+                if (!p1) continue;
+                char* p2 = strchr(p1+1, ':');
+                if (!p2) continue;
+                *p2 = '\0';
+                if (strstr(p1+1, "memory")) {
+                    size_t n = strlen(p2+1);
+                    while (n > 0 && ((p2+1)[n-1]=='\n'||(p2+1)[n-1]=='\r')) (p2+1)[--n]='\0';
+                    snprintf(cgrel, sizeof(cgrel), "%s", p2+1);
+                    break;
+                }
+            }
+            fclose(fg);
+            if (!cgrel[0]) return 0;
+            // Walk up: /slurm/uid_X/job_Y/step_Z/task_0 → job_Y → ... → root
+            char base[640];
+            snprintf(base, sizeof(base), "/sys/fs/cgroup/memory%s", cgrel);
+            while (strlen(base) > strlen("/sys/fs/cgroup/memory")) {
+                char fpath[700];
+                snprintf(fpath, sizeof(fpath), "%s/memory.limit_in_bytes", base);
+                FILE* f = fopen(fpath, "r");
+                if (f) {
+                    unsigned long long v = 0; fscanf(f, "%llu", &v); fclose(f);
+                    if (v > 0 && v < (1ull<<62)) return v;
+                }
+                char* slash = strrchr(base, '/');
+                if (!slash || slash == base) break;
+                *slash = '\0';
+            }
+            return 0;
+        };
+        unsigned long long limit = read_mem_limit();
+        if (!limit) limit = read_v1();
+        if (limit) {
+            size_t flush = size_t(limit * 7 / 10);
+            std::cerr << "ingest: cgroup mem " << (limit>>20) << " MiB → flush at "
+                      << (flush>>20) << " MiB\n";
+            return flush;
+        }
+        return 2048ull * 1024 * 1024; // 2 GiB fallback
+    }();
+    size_t mem_bytes = 0;
+    uint64_t n_flushes = 0;
+
+    auto flush_batches = [&]() {
+        for (auto& [acc, st] : acc_states) {
+            for (auto& [hog_idx, batch] : st.batches) {
+                if (batch.empty()) continue;
+                auto sp = compress_shard_payload(st.contig_strings, batch, opts.zstd_level);
+                PartitionEntry ent{st.acc_idx, uint32_t(sp.cbuf.size()), sp.raw_sz, sp.n_records};
+                pw.append(hog_strings[hog_idx], ent, sp.cbuf.data());
+            }
+            st.batches.clear();
+        }
+        mem_bytes = 0;
+        ++n_flushes;
+    };
+
     TsvReader reader(tsv_path);
     std::string line;
     uint64_t lineno = 0, n_written = 0, n_skipped = 0, n_obs_dropped = 0;
@@ -84,9 +194,9 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
             acc = opts.acc_id;
         }
 
+        bool inserted = (acc_states.count(acc) == 0);
         AccState& st = acc_states[acc];
-        if (st.contig_strings.empty() && st.contig_dict.empty())
-            st.acc_idx = uint32_t(acc_states.size() - 1); // assigned below in sorted pass
+        if (inserted) st.acc_idx = uint32_t(acc_states.size() - 1); // discovery order
 
         uint32_t hog_idx    = intern(hog_dict, hog_strings, extract_hog(f[col::sseqid]));
         uint32_t contig_idx = intern(st.contig_dict, st.contig_strings, qseqid);
@@ -131,48 +241,22 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
             }
             vr.vars.push_back({i, packed});
         }
-        if (!vr.vars.empty())
+        if (!vr.vars.empty()) {
+            mem_bytes += sizeof(VarNTRecord) + vr.vars.size() * sizeof(vr.vars[0]);
             st.batches[hog_idx].push_back(std::move(vr));
-        ++n_written;
-    }
-
-    // Assign sorted acc_idx (alphabetical, for deterministic merge across jobs).
-    std::vector<std::string> accessions;
-    accessions.reserve(acc_states.size());
-    for (auto& [acc, _] : acc_states) accessions.push_back(acc);
-    std::sort(accessions.begin(), accessions.end());
-    for (uint32_t i = 0; i < uint32_t(accessions.size()); ++i)
-        acc_states[accessions[i]].acc_idx = i;
-
-    write_acc_registry(accessions, out_dir + "/acc.registry");
-
-    // Write all HOG blocks for all accessions to t0.lhp in HOG-ID order.
-    PartitionWriter pw(out_dir + "/t0.lhp");
-
-    // Collect and sort HOG indices
-    std::vector<uint32_t> sorted_hogs;
-    for (auto& [acc, st] : acc_states)
-        for (auto& [hog_idx, _] : st.batches)
-            sorted_hogs.push_back(hog_idx);
-    std::sort(sorted_hogs.begin(), sorted_hogs.end(),
-        [&](uint32_t a, uint32_t b) { return hog_strings[a] < hog_strings[b]; });
-    sorted_hogs.erase(std::unique(sorted_hogs.begin(), sorted_hogs.end()), sorted_hogs.end());
-
-    for (uint32_t hog_idx : sorted_hogs) {
-        const std::string& hog_id = hog_strings[hog_idx];
-        for (auto& [acc, st] : acc_states) {
-            auto it = st.batches.find(hog_idx);
-            if (it == st.batches.end() || it->second.empty()) continue;
-            auto sp = compress_shard_payload(st.contig_strings, it->second, opts.zstd_level);
-            PartitionEntry ent;
-            ent.acc_idx       = st.acc_idx;
-            ent.compressed_sz = uint32_t(sp.cbuf.size());
-            ent.raw_sz        = sp.raw_sz;
-            ent.n_records     = sp.n_records;
-            pw.append(hog_id, ent, sp.cbuf.data());
         }
+        ++n_written;
+
+        if (mem_bytes > flush_threshold)
+            flush_batches();
     }
+
+    if (mem_bytes > 0) flush_batches();
     pw.flush_all();
+
+    std::vector<std::string> accessions(acc_states.size());
+    for (auto& [acc, st] : acc_states) accessions[st.acc_idx] = acc;
+    write_acc_registry(accessions, out_dir + "/acc.registry");
 
     // Build and write partition index (single thread → thread_idx always 0)
     std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
