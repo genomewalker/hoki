@@ -38,93 +38,107 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
 
     const size_t flush_threshold = [&]() -> size_t {
         if (opts.flush_bytes != 0) return opts.flush_bytes;
-        // cgroup v2: walk hierarchy from /proc/self/cgroup, find constrained memory.max
-        auto read_mem_limit = []() -> unsigned long long {
-            FILE* fg = fopen("/proc/self/cgroup", "r");
-            if (!fg) return 0;
-            char cgpath[512] = {};
-            char line[512];
-            while (fgets(line, sizeof(line), fg)) {
-                // format: 0::/user.slice/...
-                if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
-                    size_t n = strlen(line);
-                    while (n > 0 && (line[n-1]=='\n'||line[n-1]=='\r')) line[--n]='\0';
-                    snprintf(cgpath, sizeof(cgpath), "%s", line+3);
-                    break;
-                }
-            }
-            fclose(fg);
-            if (!cgpath[0]) return 0;
-            // Walk up from /sys/fs/cgroup/<cgpath> to root
-            char base[640];
-            snprintf(base, sizeof(base), "/sys/fs/cgroup%s", cgpath);
-            while (strlen(base) > strlen("/sys/fs/cgroup")) {
-                char memmax[700];
-                snprintf(memmax, sizeof(memmax), "%s/memory.max", base);
-                FILE* fm = fopen(memmax, "r");
-                if (fm) {
-                    char val[64] = {};
-                    fgets(val, sizeof(val), fm);
-                    fclose(fm);
-                    if (val[0] != 'm') { // not "max"
-                        unsigned long long v = 0;
-                        sscanf(val, "%llu", &v);
-                        if (v > 0) return v;
-                    }
-                }
-                char* slash = strrchr(base, '/');
-                if (!slash || slash == base) break;
-                *slash = '\0';
-            }
-            return 0;
-        };
-        // cgroup v1: walk up from the task's memory cgroup until we find a real limit
-        auto read_v1 = []() -> unsigned long long {
+
+        // Helper: strip trailing newline
+        auto chomp = [](char* s) { size_t n=strlen(s); while(n&&(s[n-1]=='\n'||s[n-1]=='\r'))s[--n]='\0'; };
+
+        // cgroup v1: read hierarchical_memory_limit from memory.stat — kernel pre-computes
+        // the tightest ancestor constraint, so no walk needed.
+        auto read_v1 = [&]() -> unsigned long long {
             FILE* fg = fopen("/proc/self/cgroup", "r");
             if (!fg) return 0;
             char cgrel[512] = {};
             char line[512];
             while (fgets(line, sizeof(line), fg)) {
-                char* p1 = strchr(line, ':');
-                if (!p1) continue;
-                char* p2 = strchr(p1+1, ':');
-                if (!p2) continue;
+                char* p1 = strchr(line, ':');  if (!p1) continue;
+                char* p2 = strchr(p1+1, ':'); if (!p2) continue;
                 *p2 = '\0';
                 if (strstr(p1+1, "memory")) {
-                    size_t n = strlen(p2+1);
-                    while (n > 0 && ((p2+1)[n-1]=='\n'||(p2+1)[n-1]=='\r')) (p2+1)[--n]='\0';
+                    chomp(p2+1);
                     snprintf(cgrel, sizeof(cgrel), "%s", p2+1);
                     break;
                 }
             }
             fclose(fg);
             if (!cgrel[0]) return 0;
-            // Walk up: /slurm/uid_X/job_Y/step_Z/task_0 → job_Y → ... → root
+            char stat[700];
+            snprintf(stat, sizeof(stat), "/sys/fs/cgroup/memory%s/memory.stat", cgrel);
+            FILE* fs = fopen(stat, "r");
+            if (!fs) return 0;
+            unsigned long long v = 0;
+            while (fgets(line, sizeof(line), fs)) {
+                if (strncmp(line, "hierarchical_memory_limit ", 26) == 0) {
+                    sscanf(line+26, "%llu", &v);
+                    break;
+                }
+            }
+            fclose(fs);
+            return (v > 0 && v < (1ull<<62)) ? v : 0;
+        };
+
+        // cgroup v2: walk leaf→root, return the minimum finite memory.max.
+        // (a parent slice may cap tighter than the leaf — must check all ancestors)
+        auto read_v2 = [&]() -> unsigned long long {
+            FILE* fg = fopen("/proc/self/cgroup", "r");
+            if (!fg) return 0;
+            char cgpath[512] = {};
+            char line[512];
+            while (fgets(line, sizeof(line), fg)) {
+                if (line[0]=='0' && line[1]==':' && line[2]==':') {
+                    chomp(line); snprintf(cgpath, sizeof(cgpath), "%s", line+3);
+                    break;
+                }
+            }
+            fclose(fg);
+            if (!cgpath[0]) return 0;
             char base[640];
-            snprintf(base, sizeof(base), "/sys/fs/cgroup/memory%s", cgrel);
-            while (strlen(base) > strlen("/sys/fs/cgroup/memory")) {
+            snprintf(base, sizeof(base), "/sys/fs/cgroup%s", cgpath);
+            unsigned long long best = 0;
+            while (strlen(base) > strlen("/sys/fs/cgroup")) {
                 char fpath[700];
-                snprintf(fpath, sizeof(fpath), "%s/memory.limit_in_bytes", base);
+                snprintf(fpath, sizeof(fpath), "%s/memory.max", base);
                 FILE* f = fopen(fpath, "r");
                 if (f) {
-                    unsigned long long v = 0; fscanf(f, "%llu", &v); fclose(f);
-                    if (v > 0 && v < (1ull<<62)) return v;
+                    char val[64] = {};
+                    fgets(val, sizeof(val), f); fclose(f);
+                    if (val[0] != 'm') { // not "max"
+                        unsigned long long v = 0; sscanf(val, "%llu", &v);
+                        if (v > 0 && (!best || v < best)) best = v;
+                    }
                 }
                 char* slash = strrchr(base, '/');
                 if (!slash || slash == base) break;
                 *slash = '\0';
             }
-            return 0;
+            return best;
         };
-        unsigned long long limit = read_mem_limit();
-        if (!limit) limit = read_v1();
-        if (limit) {
-            size_t flush = size_t(limit * 7 / 10);
-            std::cerr << "ingest: cgroup mem " << (limit>>20) << " MiB → flush at "
-                      << (flush>>20) << " MiB\n";
-            return flush;
+
+        // Fallback: MemTotal from /proc/meminfo (physical RAM, not job-constrained)
+        auto read_meminfo = []() -> unsigned long long {
+            FILE* f = fopen("/proc/meminfo", "r");
+            if (!f) return 0;
+            char line[128];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "MemTotal:", 9) == 0) {
+                    unsigned long long kb = 0; sscanf(line+9, "%llu", &kb);
+                    fclose(f); return kb * 1024;
+                }
+            }
+            fclose(f); return 0;
+        };
+
+        unsigned long long limit = read_v1();
+        if (!limit) limit = read_v2();
+        if (!limit) {
+            // SLURM_MEM_PER_NODE is in MB
+            const char* smem = getenv("SLURM_MEM_PER_NODE");
+            if (smem) { unsigned long long mb = 0; sscanf(smem, "%llu", &mb); limit = mb*1024*1024; }
         }
-        return 2048ull * 1024 * 1024; // 2 GiB fallback
+        if (!limit) limit = read_meminfo();
+        size_t flush = limit ? size_t(limit * 7 / 10) : 2048ull*1024*1024;
+        std::cerr << "ingest: mem limit " << (limit>>20) << " MiB → flush at "
+                  << (flush>>20) << " MiB\n";
+        return flush;
     }();
     size_t mem_bytes = 0;
     uint64_t n_flushes = 0;
@@ -137,7 +151,10 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
                 PartitionEntry ent{st.acc_idx, uint32_t(sp.cbuf.size()), sp.raw_sz, sp.n_records};
                 pw.append(hog_strings[hog_idx], ent, sp.cbuf.data());
             }
+            // compress_shard_payload embeds block-local contig tables — safe to release.
             st.batches.clear();
+            st.contig_dict.clear();
+            st.contig_strings.clear();
         }
         mem_bytes = 0;
         ++n_flushes;
@@ -199,7 +216,10 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
         if (inserted) st.acc_idx = uint32_t(acc_states.size() - 1); // discovery order
 
         uint32_t hog_idx    = intern(hog_dict, hog_strings, extract_hog(f[col::sseqid]));
+        size_t n_contigs_before = st.contig_strings.size();
         uint32_t contig_idx = intern(st.contig_dict, st.contig_strings, qseqid);
+        if (st.contig_strings.size() > n_contigs_before)
+            mem_bytes += qseqid.size() + 64; // new contig string + unordered_map entry overhead
         int8_t   qframe     = make_qframe(f[col::qstrand], qstart, qend, qlen);
         auto     ar         = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
 

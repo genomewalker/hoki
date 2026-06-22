@@ -35,7 +35,7 @@ constexpr uint8_t LHP_VERSION         = 2;
 constexpr size_t  LHP_HEADER_SZ       = 8;  // magic(4)+ver(1)+flags(1)+pad(2)
 
 constexpr uint8_t LHP_INDEX_MAGIC[4]  = {'L','H','P','I'};
-constexpr uint8_t LHP_INDEX_VERSION   = 1;
+constexpr uint8_t LHP_INDEX_VERSION   = 2; // v1 had uint16 n_extents; v2 uses uint32
 
 #pragma pack(push, 1)
 struct PartitionEntry {
@@ -135,9 +135,10 @@ public:
 };
 
 // Write the partition index: sorted hog_id → extents across N thread files.
-// Binary format: LHP_INDEX_MAGIC(4) + version(1) + n_threads(u32) + n_hogs(u32)
-//   per HOG: hog_id_len(u16) + hog_id + n_extents(u16)
+// Binary format v2: LHP_INDEX_MAGIC(4) + version(1) + n_threads(u32) + n_hogs(u32)
+//   per HOG: hog_id_len(u16) + hog_id + n_extents(u32)
 //     per extent: thread_idx(u32) + entry_offset(u64) + entry_len(u32)  [16 bytes]
+// v1 used n_extents(u16); v2 widens to u32 to support >65535 extents per HOG.
 inline void write_partition_index(
         const std::map<std::string, std::vector<PartitionIndexExtent>>& idx,
         uint32_t n_threads,
@@ -156,9 +157,8 @@ inline void write_partition_index(
         const uint8_t* hp = reinterpret_cast<const uint8_t*>(&hlen);
         buf.insert(buf.end(), hp, hp + 2);
         buf.insert(buf.end(), hog.begin(), hog.end());
-        uint16_t ne = uint16_t(exts.size());
-        const uint8_t* np = reinterpret_cast<const uint8_t*>(&ne);
-        buf.insert(buf.end(), np, np + 2);
+        uint32_t ne = uint32_t(exts.size());
+        for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(ne >> (8*i)));
         for (const auto& e : exts) {
             for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.thread_idx   >> (8 * i)));
             for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.entry_offset >> (8 * i)));
@@ -188,8 +188,10 @@ load_partition_index(const std::string& path, uint32_t& n_threads_out) {
         throw std::runtime_error("truncated partition index: " + path);
     if (buf.size() < 13 || memcmp(buf.data(), LHP_INDEX_MAGIC, 4) != 0)
         throw std::runtime_error("bad partition index magic: " + path);
+    if (buf[4] == 1)
+        throw std::runtime_error("partition index v1 (uint16 extents) not supported — re-run ingest: " + path);
     if (buf[4] != LHP_INDEX_VERSION)
-        throw std::runtime_error("unsupported partition index version: " + path);
+        throw std::runtime_error("unsupported partition index version " + std::to_string(buf[4]) + ": " + path);
 
     const uint8_t* cur = buf.data() + 5;
     const uint8_t* eof = buf.data() + buf.size();
@@ -202,11 +204,11 @@ load_partition_index(const std::string& path, uint32_t& n_threads_out) {
         uint16_t hlen = uint16_t(cur[0]) | (uint16_t(cur[1]) << 8); cur += 2;
         if (cur + hlen > eof) throw std::runtime_error("truncated partition index (hog_id)");
         std::string hog_id(reinterpret_cast<const char*>(cur), hlen); cur += hlen;
-        if (cur + 2 > eof) throw std::runtime_error("truncated partition index (n_extents)");
-        uint16_t ne = uint16_t(cur[0]) | (uint16_t(cur[1]) << 8); cur += 2;
+        if (cur + 4 > eof) throw std::runtime_error("truncated partition index (n_extents)");
+        uint32_t ne = read_u32_le(cur); cur += 4;
         auto& exts = idx[hog_id];
         exts.reserve(ne);
-        for (uint16_t ei = 0; ei < ne; ++ei) {
+        for (uint32_t ei = 0; ei < ne; ++ei) {
             if (cur + 16 > eof) throw std::runtime_error("truncated partition index (extent)");
             PartitionIndexExtent ext;
             ext.thread_idx   = read_u32_le(cur); cur += 4;
