@@ -151,11 +151,14 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
                 PartitionEntry ent{st.acc_idx, uint32_t(sp.cbuf.size()), sp.raw_sz, sp.n_records};
                 pw.append(hog_strings[hog_idx], ent, sp.cbuf.data());
             }
-            // compress_shard_payload embeds block-local contig tables — safe to release.
+            // Each compressed block embeds its own local contig table — safe to release all dicts.
             st.batches.clear();
             st.contig_dict.clear();
             st.contig_strings.clear();
         }
+        // HOG strings are block-local too; reset so subsequent records re-intern from 0.
+        hog_dict.clear();
+        hog_strings.clear();
         mem_bytes = 0;
         ++n_flushes;
     };
@@ -180,12 +183,14 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
 
         float  pident = 0.0f;
         double ev     = 0.0;
-        std::from_chars(f[col::pident].data(), f[col::pident].data() + f[col::pident].size(), pident);
-        std::from_chars(f[col::evalue].data(),  f[col::evalue].data()  + f[col::evalue].size(),  ev);
+        { auto [ptr,ec] = std::from_chars(f[col::pident].data(), f[col::pident].data()+f[col::pident].size(), pident);
+          if (ec != std::errc{}) { ++n_skipped; continue; } }
+        { auto [ptr,ec] = std::from_chars(f[col::evalue].data(),  f[col::evalue].data()+f[col::evalue].size(),  ev);
+          if (ec != std::errc{}) { ++n_skipped; continue; } }
 
         if (pident < opts.min_pident) { ++n_skipped; continue; }
         if (ev     > opts.max_evalue) { ++n_skipped; continue; }
-        if (pident == 100.0f)         { ++n_skipped; continue; }
+        if (pident == 100.0f)         { ++n_skipped; continue; } // perfect match = reference itself, no variation
 
         uint32_t sstart = 0, send = 0, qstart = 0, qend = 0, qlen = 0;
         {
@@ -215,11 +220,15 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
         AccState& st = acc_states[acc];
         if (inserted) st.acc_idx = uint32_t(acc_states.size() - 1); // discovery order
 
+        size_t n_hogs_before = hog_strings.size();
         uint32_t hog_idx    = intern(hog_dict, hog_strings, extract_hog(f[col::sseqid]));
+        if (hog_strings.size() > n_hogs_before)
+            mem_bytes += hog_strings.back().size() + 64;
+
         size_t n_contigs_before = st.contig_strings.size();
         uint32_t contig_idx = intern(st.contig_dict, st.contig_strings, qseqid);
         if (st.contig_strings.size() > n_contigs_before)
-            mem_bytes += qseqid.size() + 64; // new contig string + unordered_map entry overhead
+            mem_bytes += qseqid.size() + 64;
         int8_t   qframe     = make_qframe(f[col::qstrand], qstart, qend, qlen);
         auto     ar         = cigar_parse(f[col::cigar], f[col::qseq_aa], sstart, send);
 
@@ -264,8 +273,8 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
         if (!vr.vars.empty()) {
             mem_bytes += sizeof(VarNTRecord) + vr.vars.size() * sizeof(vr.vars[0]);
             st.batches[hog_idx].push_back(std::move(vr));
+            ++n_written;
         }
-        ++n_written;
 
         if (mem_bytes > flush_threshold)
             flush_batches();
