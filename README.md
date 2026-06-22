@@ -32,8 +32,11 @@ parallel -j 32 'hoki ingest -a auto {} parts/{/.}/' ::: inputs/*.tsv
 aws s3 cp s3://serratus-rayan/beetles/logan_jun9_26_run/diamond/DRR000001/DRR000001.diamond.jun9_26.txt - \
     | hoki ingest -a auto - parts/DRR000001/
 
-# Phase 2: merge — pass the parent dir; merge-shard scans it via opendir, no shell, no ARG_MAX
+# Phase 2: per-batch merge — pass the partition dir; opendir internally, no ARG_MAX
 hoki merge-shard -t 192 out.lhg out.lhgi parts/
+
+# Phase 3: global merge across all batch .lhg files — pass the dir, same convention
+hoki merge -t 192 global.lhg global.lhgi batch_outputs/
 ```
 
 `--hog-range START END` restricts HOGs processed (for cluster jobs splitting the HOG list across nodes).
@@ -146,7 +149,12 @@ hoki merge [-t N] [-z LVL=3] [-zo LVL=3] [--buckets N=1]
            out.lhg out.lhgi input1 [input2 ...]
 ```
 
-Inputs may be `.lhb` or `.lhg`, mixed.
+Inputs may be `.lhb` or `.lhg`, mixed. If a single directory is given, all `*.lhg`
+files in it are collected via `opendir` (no shell expansion, no ARG\_MAX):
+
+```bash
+hoki merge -t 192 global.lhg global.lhgi parts/
+```
 
 Scan: all inputs scanned in parallel across `-t` threads (worker-stealing). Each input
 produces a sorted list of `(hog_id, block_ref)` entries; `.lhb` files are buffered in

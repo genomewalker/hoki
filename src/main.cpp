@@ -26,7 +26,7 @@ static void usage(const char* prog) {
         << "  " << prog << " merge   [-zo LVL=3] [--buckets N=1] [--hog-range START END]\n"
         << "                  [--profile] [--hot-threshold N=100]\n"
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
-        << "                  inputs may be .lhb or .lhg, mixed\n"
+        << "                  inputs may be .lhb or .lhg, mixed; single dir arg scans for *.lhg\n"
         << "  " << prog << " ingest  -a ACC|auto [-z LVL] [-p MINPID] [-e MAXEV] [-v] <in.tsv> <out_part_dir/>\n"
         << "                  TSV → partition dir directly (no intermediate .lhb). One job per input file.\n"
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
@@ -100,6 +100,27 @@ int main(int argc, char* argv[]) {
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
         std::vector<std::string> inputs(pos.begin() + 2, pos.end());
+        // single dir arg → scan for *.lhg files internally (no ARG_MAX)
+        if (inputs.size() == 1) {
+            struct stat st{};
+            if (stat(inputs[0].c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                std::string dir = inputs[0];
+                if (!dir.empty() && dir.back() != '/') dir += '/';
+                inputs.clear();
+                DIR* d = opendir(dir.c_str());
+                if (!d) { std::cerr << "merge: cannot open dir " << dir << "\n"; return 1; }
+                struct dirent* ent;
+                while ((ent = readdir(d))) {
+                    std::string n = ent->d_name;
+                    if (n.size() > 4 && n.substr(n.size()-4) == ".lhg")
+                        inputs.push_back(dir + n);
+                }
+                closedir(d);
+                std::sort(inputs.begin(), inputs.end());
+                if (inputs.empty()) { std::cerr << "merge: no .lhg files in " << dir << "\n"; return 1; }
+                std::cerr << "merge: found " << inputs.size() << " .lhg files in " << dir << "\n";
+            }
+        }
         lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end,
                            n_buckets, n_threads, do_profile, hot_threshold, out_compress_level);
         return 0;
