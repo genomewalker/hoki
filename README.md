@@ -96,7 +96,8 @@ file-per-HOG metadata storm (catastrophic on NFS/EFS at scale).
 ## `hoki ingest`
 
 ```
-hoki ingest -a ACC|auto [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] in.tsv out_dir/
+hoki ingest -a ACC|auto [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] \
+            [--flush N[KMGT]] in.tsv out_dir/
 ```
 
 TSV → partition dir in a single pass — no intermediate `.lhb`. Equivalent to
@@ -105,9 +106,23 @@ TSV → partition dir in a single pass — no intermediate `.lhb`. Equivalent to
 `-a auto` extracts the accession from the `qseqid` prefix (before the first `_`), so one
 TSV containing many accessions produces a correctly partitioned output dir.
 
-Writes `out_dir/t0.lhp`, `out_dir/partition.idx`, and `out_dir/acc.registry`.
+Writes `out_dir/t0.lhp`, `out_dir/partition.idx` (v2 format), and `out_dir/acc.registry`.
 Each parallel job writes to its own isolated output dir; `merge-shard` accepts
 multiple dirs and reconciles accession registries automatically.
+
+**Memory management** — ingest flushes in-memory batches to disk when RAM usage
+exceeds a threshold, keeping peak RSS bounded regardless of input size.
+The threshold is auto-detected from the job's cgroup memory limit (SLURM `--mem`,
+AWS Batch `MEMORY`, etc.) and set to 70% of that limit. Override with `--flush`:
+
+```bash
+hoki ingest -a auto in.tsv out/          # auto: 70% of cgroup/SLURM limit
+hoki ingest -a auto --flush 8G in.tsv out/   # explicit 8 GiB
+hoki ingest -a auto --flush 500M in.tsv out/ # explicit 500 MiB
+```
+
+**Note:** `partition.idx` uses format v2 (n\_extents stored as uint32). Dirs produced
+by older hoki builds (v1, uint16) must be re-ingested before `merge-shard` will accept them.
 
 ## `hoki merge-shard`
 
