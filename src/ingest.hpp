@@ -2,8 +2,24 @@
 #include "convert.hpp"
 #include "container.hpp"
 #include "partition.hpp"
+#include <fstream>
 
 namespace lhi {
+
+// Actual RSS from /proc/self/status — accurate where mem_bytes accounting misses
+// vector over-allocation, map node overhead, and allocator fragmentation.
+inline size_t read_rss_bytes() {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            size_t kb = 0;
+            sscanf(line.c_str() + 6, "%zu", &kb);
+            return kb * 1024;
+        }
+    }
+    return 0;
+}
 
 // TSV → partition dir directly. No intermediate .lhb files.
 // Supports -a auto (acc from qseqid prefix) or -a ACC (single accession).
@@ -271,13 +287,24 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
             vr.vars.push_back({i, packed});
         }
         if (!vr.vars.empty()) {
-            mem_bytes += sizeof(VarNTRecord) + vr.vars.size() * sizeof(vr.vars[0]);
+            mem_bytes += sizeof(VarNTRecord) + vr.vars.capacity() * sizeof(vr.vars[0]);
             st.batches[hog_idx].push_back(std::move(vr));
             ++n_written;
         }
 
-        if (mem_bytes > flush_threshold)
-            flush_batches();
+        // Check actual RSS every 16K records — mem_bytes underestimates due to
+        // map node overhead and allocator fragmentation; RSS is the ground truth.
+        bool over = mem_bytes > flush_threshold;
+        if (!over && (lineno & 0x3FFFu) == 0) {
+            size_t rss = read_rss_bytes();
+            if (rss > flush_threshold) {
+                std::cerr << "ingest: RSS " << (rss>>20) << " MiB > threshold "
+                          << (flush_threshold>>20) << " MiB (estimated "
+                          << (mem_bytes>>20) << " MiB) — flushing\n";
+                over = true;
+            }
+        }
+        if (over) flush_batches();
     }
 
     if (mem_bytes > 0) flush_batches();
