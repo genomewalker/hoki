@@ -29,3 +29,17 @@ target_link_libraries(hoki PRIVATE ZLIB::ZLIB)
 target_compile_options(hoki PRIVATE -O3 -march=native -Wall -Wextra -Wpedantic)
 
 install(TARGETS hoki DESTINATION bin)
+
+# Tests
+add_executable(check_partition_overflow tests/check_partition_overflow.cpp)
+target_include_directories(check_partition_overflow PRIVATE src)
+if(TARGET zstd::libzstd_shared)
+    target_link_libraries(check_partition_overflow PRIVATE zstd::libzstd_shared)
+elseif(TARGET zstd::libzstd_static)
+    target_link_libraries(check_partition_overflow PRIVATE zstd::libzstd_static)
+else()
+    target_link_libraries(check_partition_overflow PRIVATE ${ZSTD_LIB})
+    target_include_directories(check_partition_overflow PRIVATE ${ZSTD_INC})
+endif()
+target_link_libraries(check_partition_overflow PRIVATE ZLIB::ZLIB)
+target_compile_options(check_partition_overflow PRIVATE -O3 -march=native)
