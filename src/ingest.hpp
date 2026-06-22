@@ -3,6 +3,7 @@
 #include "container.hpp"
 #include "partition.hpp"
 #include <fstream>
+#include <malloc.h>
 
 namespace lhi {
 
@@ -146,9 +147,20 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
         unsigned long long limit = read_v1();
         if (!limit) limit = read_v2();
         if (!limit) {
-            // SLURM_MEM_PER_NODE is in MB
+            // SLURM_MEM_PER_NODE covers --mem; for --mem-per-cpu multiply by cpu count.
             const char* smem = getenv("SLURM_MEM_PER_NODE");
-            if (smem) { unsigned long long mb = 0; sscanf(smem, "%llu", &mb); limit = mb*1024*1024; }
+            if (smem) {
+                unsigned long long mb = 0; sscanf(smem, "%llu", &mb); limit = mb*1024*1024;
+            } else {
+                const char* smpc = getenv("SLURM_MEM_PER_CPU");
+                const char* ncpu = getenv("SLURM_CPUS_PER_TASK");
+                if (!ncpu) ncpu = getenv("SLURM_JOB_CPUS_PER_NODE");
+                if (smpc && ncpu) {
+                    unsigned long long mb = 0, n = 1;
+                    sscanf(smpc, "%llu", &mb); sscanf(ncpu, "%llu", &n);
+                    limit = mb * n * 1024 * 1024;
+                }
+            }
         }
         if (!limit) limit = read_meminfo();
         size_t flush = limit ? size_t(limit * 7 / 10) : 2048ull*1024*1024;
@@ -177,6 +189,10 @@ inline void ingest(const std::string& tsv_path, const std::string& out_dir,
         hog_strings.clear();
         mem_bytes = 0;
         ++n_flushes;
+        // Release freed glibc arena pages back to OS so RSS actually drops.
+        // Without this, post-flush RSS stays high and the next RSS check re-fires
+        // immediately, producing tiny shards in a thrash loop.
+        malloc_trim(0);
     };
 
     TsvReader reader(tsv_path);
