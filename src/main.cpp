@@ -27,8 +27,8 @@ static void usage(const char* prog) {
         << "                  [--profile] [--hot-threshold N=100]\n"
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
         << "                  inputs may be .lhb or .lhg, mixed; single dir arg scans for *.lhg\n"
-        << "  " << prog << " ingest  -a ACC|auto [-z LVL] [-p MINPID] [-e MAXEV] [-v] [--flush N[KMGT]] <in.tsv> <out_part_dir/>\n"
-        << "                  TSV → partition dir directly (no intermediate .lhb). One job per input file.\n"
+        << "  " << prog << " ingest  -a ACC|auto [-t N] [-z LVL] [-p MINPID] [-e MAXEV] [-v] [--flush N[KMGT]] <in.tsv> <out_part_dir/>\n"
+        << "                  TSV → partition dir directly (no intermediate .lhb). -t N enables N parallel workers (default 1).\n"
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
         << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> <part_dir>...|<parent_dir>|-\n"
         << "                  parent_dir (no partition.idx at root): scanned via opendir — no shell, no ARG_MAX\n"
@@ -63,13 +63,15 @@ int main(int argc, char* argv[]) {
     if (mode == "ingest") {
         lhi::ConvertOptions opts;
         std::string in_path, out_dir;
+        int n_threads = 0;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-a" && i+1 < argc) opts.acc_id     = argv[++i];
             else if (a == "-z" && i+1 < argc) opts.zstd_level = std::stoi(argv[++i]);
             else if (a == "-p" && i+1 < argc) opts.min_pident = std::stof(argv[++i]);
             else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
-            else if (a == "-v")                      opts.verbose    = true;
+            else if (a == "-t" && i+1 < argc) n_threads       = std::stoi(argv[++i]);
+            else if (a == "-v")               opts.verbose     = true;
             else if (a == "--flush" && i+1 < argc) {
                 std::string sv = argv[++i];
                 size_t mul = 1;
@@ -80,11 +82,11 @@ int main(int argc, char* argv[]) {
                 else if (suf == 'T') { mul = 1024ull*1024*1024*1024; sv.pop_back(); }
                 opts.flush_bytes = std::stoull(sv) * mul;
             }
-            else if (in_path.empty())                in_path         = a;
-            else if (out_dir.empty())                out_dir         = a;
+            else if (in_path.empty()) in_path = a;
+            else if (out_dir.empty()) out_dir  = a;
         }
         if (in_path.empty() || out_dir.empty() || opts.acc_id.empty()) { usage(argv[0]); return 1; }
-        lhi::ingest(in_path, out_dir, opts);
+        lhi::ingest(in_path, out_dir, opts, n_threads);
         return 0;
     }
 

@@ -20,7 +20,7 @@ namespace lhi {
 
 struct ConvertOptions {
     std::string acc_id;          // SRA/ENA accession; "auto" = extract from qseqid prefix
-    int    zstd_level = 9;
+    int    zstd_level = 3;
     float  min_pident = 0.0f;
     double max_evalue = 1.0;
     bool   verbose    = false;
@@ -68,18 +68,38 @@ inline void revcomp_codon(uint8_t c[3]) {
 
 using SvDict = std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>>;
 
-// Transparent line reader: plain file, .gz file, or stdin ("-").
+// Transparent line reader: plain file, .gz file, .zst file, or stdin ("-").
 // Provides getline(std::string&) → bool.
 struct TsvReader {
-    enum class Kind { Plain, Gz, Stdin };
+    enum class Kind { Plain, Gz, Zst, Stdin };
     Kind kind;
     std::ifstream fin;
     gzFile gz = nullptr;
     std::vector<char> gz_buf;
 
+    // zstd streaming state
+    int          zst_fd  = -1;
+    ZSTD_DStream* zst_dctx = nullptr;
+    std::vector<char> zst_in;   // compressed input buffer
+    std::vector<char> zst_out;  // decompressed output buffer
+    size_t zst_in_pos  = 0;
+    size_t zst_in_end  = 0;
+    size_t zst_out_pos = 0;
+    size_t zst_out_end = 0;
+    bool   zst_eof     = false; // no more compressed bytes
+
     explicit TsvReader(const std::string& path) {
         if (path == "-") {
             kind = Kind::Stdin;
+        } else if (path.size() > 4 && path.compare(path.size()-4, 4, ".zst") == 0) {
+            kind = Kind::Zst;
+            zst_fd = ::open(path.c_str(), O_RDONLY);
+            if (zst_fd < 0) throw std::runtime_error("cannot open: " + path);
+            posix_fadvise(zst_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            zst_dctx = ZSTD_createDStream();
+            if (!zst_dctx) throw std::runtime_error("ZSTD_createDStream failed");
+            zst_in.resize(ZSTD_DStreamInSize());
+            zst_out.resize(ZSTD_DStreamOutSize() * 4); // 4× recommended for fewer refills
         } else if (path.size() > 3 && path.compare(path.size()-3, 3, ".gz") == 0) {
             kind = Kind::Gz;
             gz = gzopen(path.c_str(), "r");
@@ -92,11 +112,60 @@ struct TsvReader {
             if (!fin) throw std::runtime_error("cannot open: " + path);
         }
     }
-    ~TsvReader() { if (gz) gzclose(gz); }
+    ~TsvReader() {
+        if (gz) gzclose(gz);
+        if (zst_dctx) ZSTD_freeDStream(zst_dctx);
+        if (zst_fd >= 0) ::close(zst_fd);
+    }
     TsvReader(const TsvReader&) = delete;
     TsvReader& operator=(const TsvReader&) = delete;
 
+    // Decompress more bytes into zst_out[0..zst_out_end).
+    // Returns false when no more data.
+    bool zst_refill() {
+        if (zst_eof && zst_in_pos >= zst_in_end) return false;
+        // Fill input buffer if empty
+        if (zst_in_pos >= zst_in_end && !zst_eof) {
+            ssize_t r = ::read(zst_fd, zst_in.data(), zst_in.size());
+            if (r <= 0) { zst_eof = true; return false; }
+            zst_in_pos = 0;
+            zst_in_end = size_t(r);
+        }
+        ZSTD_inBuffer  in  = {zst_in.data() + zst_in_pos, zst_in_end - zst_in_pos, 0};
+        ZSTD_outBuffer out = {zst_out.data(), zst_out.size(), 0};
+        size_t ret = ZSTD_decompressStream(zst_dctx, &out, &in);
+        if (ZSTD_isError(ret))
+            throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(ret));
+        zst_in_pos  += in.pos;
+        zst_out_pos  = 0;
+        zst_out_end  = out.pos;
+        if (zst_in_pos >= zst_in_end && ret == 0) zst_eof = true;
+        return zst_out_end > 0;
+    }
+
     bool getline(std::string& line) {
+        if (kind == Kind::Zst) {
+            line.clear();
+            while (true) {
+                // Scan current output window for '\n'
+                if (zst_out_pos < zst_out_end) {
+                    const char* base = zst_out.data() + zst_out_pos;
+                    size_t avail = zst_out_end - zst_out_pos;
+                    const char* nl = static_cast<const char*>(memchr(base, '\n', avail));
+                    if (nl) {
+                        size_t len = size_t(nl - base);
+                        line.append(base, len);
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        zst_out_pos += len + 1;
+                        return true;
+                    }
+                    line.append(base, avail);
+                    zst_out_pos = zst_out_end = 0;
+                }
+                // Need more decompressed data
+                if (!zst_refill()) return !line.empty();
+            }
+        }
         if (kind == Kind::Gz) {
             line.clear();
             while (true) {

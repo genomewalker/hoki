@@ -56,7 +56,8 @@ struct ShardPayload {
 inline ShardPayload compress_shard_payload(
         const std::vector<std::string>& global_contigs,
         std::vector<VarNTRecord>& recs,
-        int zstd_level) {
+        int zstd_level,
+        ZSTD_CCtx* cctx = nullptr) {
     std::unordered_map<uint32_t, uint32_t> g2l;
     std::vector<std::string> local_contigs;
     for (auto& r : recs) {
@@ -90,11 +91,12 @@ inline ShardPayload compress_shard_payload(
     sp.raw_sz = uint32_t(raw.size());
     size_t bound = ZSTD_compressBound(raw.size());
     sp.cbuf.resize(bound);
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    bool own_cctx = (cctx == nullptr);
+    if (own_cctx) cctx = ZSTD_createCCtx();
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, zstd_level);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, 1);
     size_t csz = ZSTD_compress2(cctx, sp.cbuf.data(), bound, raw.data(), raw.size());
-    ZSTD_freeCCtx(cctx);
+    if (own_cctx) ZSTD_freeCCtx(cctx);
     if (ZSTD_isError(csz))
         throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
     sp.cbuf.resize(csz);
