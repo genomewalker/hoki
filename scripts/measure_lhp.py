@@ -118,5 +118,3 @@ if __name__ == '__main__':
     print(f"Compressed:       {fmt_mb(total_compressed)}")
     if total_compressed:
         print(f"Ratio (raw→zstd): {col_total/total_compressed:.2f}×")
-    if totals['span']:
-        print(f"Avg fill:         {totals['codons']/totals['span']:.3f} codons/pos")

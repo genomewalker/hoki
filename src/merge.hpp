@@ -210,9 +210,17 @@ inline ShardResult merge_shard_compute_extents(
             if (acc_idx < rm.size()) acc_idx = rm[acc_idx];
         }
 
-        // Extract this HOG's raw slice from the decompressed frame
-        const uint8_t* p   = raw_block.data() + ext.hog_raw_off;
-        const uint8_t* end = p + ext.hog_raw_len;
+        // v4 column-major frame: [other_sec_len(u32) | bmp_sec_len(u32) | other | bmp | cdn]
+        if (raw_block.size() < 8)
+            throw std::runtime_error("frame too small for HOG " + hog_id);
+        uint32_t other_sec_len = read_u32_le(raw_block.data());
+        uint32_t bmp_sec_len   = read_u32_le(raw_block.data() + 4);
+        const uint8_t* other_sec = raw_block.data() + 8;
+        const uint8_t* bmp_sec   = other_sec + other_sec_len;
+        const uint8_t* cdn_sec   = bmp_sec   + bmp_sec_len;
+
+        const uint8_t* p   = other_sec + ext.other_off;
+        const uint8_t* end = p + ext.other_len;
         uint32_t n_contigs = 0;
         int n = read_varint(p, end, &n_contigs);
         if (!n) throw std::runtime_error("corrupt contig dict for HOG " + hog_id);
@@ -225,7 +233,6 @@ inline ShardResult merge_shard_compute_extents(
             p += n;
             std::string_view uid(reinterpret_cast<const char*>(p), len);
             p += len;
-            // cnum: numeric field immediately after first '_' (ACC_N or Logan ACC_N_metadata...)
             uint32_t cnum = j;
             {
                 auto fs = uid.find('_');
@@ -240,7 +247,7 @@ inline ShardResult merge_shard_compute_extents(
             contig_cnum[j] = cnum;
         }
         recs.clear();
-        if (!deserialize_varnt_block(p, end, recs))
+        if (!deserialize_varnt_block_split(p, end, bmp_sec + ext.bmp_off, cdn_sec + ext.cdn_off, recs))
             throw std::runtime_error("corrupt varnt block for HOG " + hog_id);
 
         mark_acc(acc_idx);

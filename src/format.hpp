@@ -284,4 +284,83 @@ inline bool deserialize_varnt_block(const uint8_t* p, const uint8_t* end,
     return true;
 }
 
+// Column-major variant: bitmap and codon bytes come from separate frame sections (v4).
+// p/other_end cover [varnt_header | contig | sstart | span | qframe | pident | evalue].
+// bmp_ptr / cdn_ptr point into the frame's bitmap / codon sections for this block.
+inline bool deserialize_varnt_block_split(
+        const uint8_t* p, const uint8_t* other_end,
+        const uint8_t* bmp_ptr, const uint8_t* cdn_ptr,
+        std::vector<VarNTRecord>& out) {
+    int n;
+    uint32_t n_recs = 0, contig_bytes = 0, sstart_bytes = 0, span_bytes = 0,
+             bmp_bytes = 0, n_codons = 0;
+    n = read_varint(p, other_end, &n_recs);       if (!n) return false; p += n;
+    n = read_varint(p, other_end, &contig_bytes); if (!n) return false; p += n;
+    n = read_varint(p, other_end, &sstart_bytes); if (!n) return false; p += n;
+    n = read_varint(p, other_end, &span_bytes);   if (!n) return false; p += n;
+    n = read_varint(p, other_end, &bmp_bytes);    if (!n) return false; p += n;
+    n = read_varint(p, other_end, &n_codons);     if (!n) return false; p += n;
+
+    size_t fixed_sz = size_t(n_recs) * (1 + 2 + 2);
+    if (p + contig_bytes + sstart_bytes + span_bytes + fixed_sz > other_end)
+        return false;
+
+    const uint8_t* contig_ptr = p;                   p += contig_bytes;
+    const uint8_t* contig_end = p;
+    const uint8_t* sstart_ptr = p;                   p += sstart_bytes;
+    const uint8_t* sstart_end = p;
+    const uint8_t* span_ptr   = p;                   p += span_bytes;
+    const uint8_t* span_end   = p;
+    const uint8_t* qframe_ptr = p;                   p += 1 * n_recs;
+    const uint8_t* pident_ptr = p;                   p += 2 * n_recs;
+    const uint8_t* evalue_ptr = p;                   p += 2 * n_recs;
+    const uint8_t* bmp_end_p  = bmp_ptr + bmp_bytes;
+    size_t cdn_off = 0;
+
+    out.resize(n_recs);
+    uint32_t prev_sstart = 0, prev_contig = 0;
+    for (uint32_t i = 0; i < n_recs; ++i) {
+        auto& r = out[i];
+        uint32_t dc = 0;
+        n = read_varint(contig_ptr, contig_end, &dc); if (!n) return false;
+        contig_ptr += n;
+        prev_contig += dc;
+        r.contig_idx = prev_contig;
+        if (dc) prev_sstart = 0;
+
+        uint32_t dss = 0;
+        n = read_varint(sstart_ptr, sstart_end, &dss); if (!n) return false;
+        sstart_ptr += n;
+        r.sstart = prev_sstart + dss;
+        prev_sstart = r.sstart;
+
+        uint32_t span = 0;
+        n = read_varint(span_ptr, span_end, &span); if (!n) return false; span_ptr += n;
+        if (span == 0) return false;
+        r.send = r.sstart + span - 1;
+
+        r.qframe = int8_t(*qframe_ptr++);
+        r.pident = decode_pident(read_u16(pident_ptr)); pident_ptr += 2;
+        r.evalue = decode_evalue(read_i16(evalue_ptr)); evalue_ptr += 2;
+
+        uint32_t bmp_sz = (span + 7) / 8;
+        if (bmp_ptr + bmp_sz > bmp_end_p) return false;
+        uint32_t n_M = 0;
+        for (uint32_t b = 0; b < bmp_sz; ++b) n_M += uint32_t(__builtin_popcount(bmp_ptr[b]));
+        r.vars.clear(); r.vars.reserve(n_M);
+        for (uint32_t b = 0; b < span; ++b) {
+            if (bmp_ptr[b / 8] & (1u << (b & 7))) {
+                if (cdn_off >= n_codons) return false;
+                uint8_t ci6 = cdn_ptr[cdn_off++];
+                VarNTObs obs;
+                obs.hog_offset   = b;
+                obs.packed_codon = uint8_t(ci6 << 2);
+                r.vars.push_back(obs);
+            }
+        }
+        bmp_ptr += bmp_sz;
+    }
+    return (cdn_off == n_codons);
+}
+
 } // namespace lhi

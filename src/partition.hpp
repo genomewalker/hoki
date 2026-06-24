@@ -31,36 +31,59 @@
 namespace lhi {
 
 constexpr uint8_t LHP_FILE_MAGIC[4]   = {'L','H','G','P'};
-constexpr uint8_t LHP_VERSION         = 3;  // v3: VarNT contig_col delta-encoded, (contig,sstart) sort
+constexpr uint8_t LHP_VERSION         = 4;  // v4: column-major frames [other|bitmap|codon]
 constexpr size_t  LHP_HEADER_SZ       = 8;  // magic(4)+ver(1)+flags(1)+pad(2)
 
 constexpr uint8_t LHP_INDEX_MAGIC[4]  = {'L','H','P','I'};
-constexpr uint8_t LHP_INDEX_VERSION   = 3; // v1 had uint16 n_extents; v2 uses uint32; v3 frame-grouped
+constexpr uint8_t LHP_INDEX_VERSION   = 4;  // v4 matches LHP_VERSION 4
 
-#pragma pack(push, 1)
-struct PartitionEntry {
-    uint32_t acc_idx;
-    uint32_t compressed_sz;
-    uint32_t raw_sz;
-    uint32_t n_records;
-};
-static_assert(sizeof(PartitionEntry) == 16);
-#pragma pack(pop)
-
-// v3: frame-level pointers; acc_idx+n_records moved from PartitionEntry stream into index.
+// v4: column-major frame layout. Each decompressed frame is:
+//   [other_sec_len(u32) | bmp_sec_len(u32) | other_section | bitmap_section | codon_section]
+// Extent fields point into these sections (offsets relative to section start).
 struct PartitionIndexExtent {
     uint32_t thread_idx;
-    uint64_t frame_off;    // byte offset of compressed frame data in tN.lhp (after 4-byte csz prefix)
+    uint64_t frame_off;    // byte offset of compressed frame in tN.lhp (after 4-byte csz prefix)
     uint32_t frame_csz;    // compressed frame size
-    uint32_t hog_raw_off;  // byte offset of HOG raw data within decompressed frame
-    uint32_t hog_raw_len;  // byte length of HOG raw data within decompressed frame
+    uint32_t other_off;    // offset in decompressed frame's other-section
+    uint32_t other_len;    // length in other-section (contig_dict + varnt_hdr + cols except bmp/cdn)
+    uint32_t bmp_off;      // offset in frame's bitmap-section
+    uint32_t cdn_off;      // offset in frame's codon-section
     uint32_t acc_idx;
     uint32_t n_records;
-};  // 4+8+4+4+4+4+4 = 32 bytes
+};  // 4+8+4+4+4+4+4+4+4 = 40 bytes
 
-// Per-thread sequential writer. Batches raw VarNT payloads into groups, then
-// compresses each group as a single zstd frame. Bigger compression unit = better ratio.
-// .lhp format: [frame_csz(u32) | zstd_frame(frame_csz bytes)] repeated.
+// Parse a raw VarNT block and return byte offsets splitting it into
+// [other (contig_dict+hdr+cols)] | [bitmaps] | [codons].
+inline bool split_raw_block(const uint8_t* raw, uint32_t raw_len,
+                            uint32_t& other_len, uint32_t& bmp_len, uint32_t& cdn_len) {
+    const uint8_t* p   = raw;
+    const uint8_t* end = raw + raw_len;
+    uint32_t v = 0; int n;
+    // skip contig dict
+    n = read_varint(p, end, &v); if (!n) return false; p += n;
+    for (uint32_t i = 0; i < v; ++i) {
+        uint32_t nlen = 0;
+        n = read_varint(p, end, &nlen); if (!n) return false; p += n + nlen;
+    }
+    // read varnt header: n_recs, contig_b, sstart_b, span_b, bmp_b, cdn_b
+    uint32_t n_recs = 0, contig_b = 0, sstart_b = 0, span_b = 0, bmp_b = 0, cdn_b = 0;
+    n = read_varint(p, end, &n_recs);   if (!n) return false; p += n;
+    n = read_varint(p, end, &contig_b); if (!n) return false; p += n;
+    n = read_varint(p, end, &sstart_b); if (!n) return false; p += n;
+    n = read_varint(p, end, &span_b);   if (!n) return false; p += n;
+    n = read_varint(p, end, &bmp_b);    if (!n) return false; p += n;
+    n = read_varint(p, end, &cdn_b);    if (!n) return false; p += n;
+    // p now points at start of contig column; other = everything before bitmap
+    uint32_t fixed_sz = n_recs * 5;  // qframe(1) + pident(2) + evalue(2)
+    other_len = uint32_t(p - raw) + contig_b + sstart_b + span_b + fixed_sz;
+    bmp_len   = bmp_b;
+    cdn_len   = cdn_b;
+    return (other_len + bmp_len + cdn_len == raw_len);
+}
+
+// Per-thread sequential writer. Batches raw VarNT payloads into column-major groups,
+// then compresses each group as a single zstd frame.
+// Frame layout: [other_sec_len(u32) | bmp_sec_len(u32) | other_sec | bmp_sec | cdn_sec]
 class PartitionWriter {
     static constexpr size_t BUF_CAP          = 8u * 1024 * 1024;
     static constexpr size_t FRAME_RAW_TARGET = 2u * 1024 * 1024;
@@ -70,10 +93,14 @@ class PartitionWriter {
     uint64_t    fpos_  = 0;
     std::vector<uint8_t> buf_;
 
-    std::vector<uint8_t> frame_raw_;
-    struct PendingHog { std::string hog_id; uint32_t acc_idx, n_records, raw_off, raw_len; };
+    std::vector<uint8_t> other_raw_, bmp_raw_, cdn_raw_;
+    struct PendingHog {
+        std::string hog_id;
+        uint32_t acc_idx, n_records;
+        uint32_t other_off, other_len, bmp_off, cdn_off;
+    };
     std::vector<PendingHog> pending_;
-    std::vector<uint8_t>    cbuf_;
+    std::vector<uint8_t>    cbuf_, frame_assemble_;
 
     ZSTD_CCtx* cctx_  = nullptr;
     int        level_  = 3;
@@ -97,25 +124,40 @@ class PartitionWriter {
     }
     void flush_frame() {
         if (pending_.empty()) return;
-        size_t bound = ZSTD_compressBound(frame_raw_.size());
+        uint32_t other_sec_len = uint32_t(other_raw_.size());
+        uint32_t bmp_sec_len   = uint32_t(bmp_raw_.size());
+        // assemble column-major frame: [other_sec_len | bmp_sec_len | other | bmp | cdn]
+        frame_assemble_.clear();
+        frame_assemble_.reserve(8 + other_raw_.size() + bmp_raw_.size() + cdn_raw_.size());
+        for (int i = 0; i < 4; ++i) frame_assemble_.push_back(uint8_t(other_sec_len >> (8*i)));
+        for (int i = 0; i < 4; ++i) frame_assemble_.push_back(uint8_t(bmp_sec_len   >> (8*i)));
+        frame_assemble_.insert(frame_assemble_.end(), other_raw_.begin(), other_raw_.end());
+        frame_assemble_.insert(frame_assemble_.end(), bmp_raw_.begin(),   bmp_raw_.end());
+        frame_assemble_.insert(frame_assemble_.end(), cdn_raw_.begin(),   cdn_raw_.end());
+
+        size_t bound = ZSTD_compressBound(frame_assemble_.size());
         cbuf_.resize(bound);
         ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, level_);
         ZSTD_CCtx_setParameter(cctx_, ZSTD_c_checksumFlag, 1);
         size_t csz = ZSTD_compress2(cctx_, cbuf_.data(), bound,
-                                     frame_raw_.data(), frame_raw_.size());
+                                     frame_assemble_.data(), frame_assemble_.size());
         if (ZSTD_isError(csz))
             throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
         cbuf_.resize(csz);
+
         uint64_t frame_off = fpos_ + uint64_t(buf_.size()) + 4;
         uint32_t u32csz = uint32_t(csz);
         const uint8_t* lp = reinterpret_cast<const uint8_t*>(&u32csz);
         buf_.insert(buf_.end(), lp, lp + 4);
         buf_.insert(buf_.end(), cbuf_.data(), cbuf_.data() + csz);
         maybe_flush();
+
         for (auto& ph : pending_)
             idx_[ph.hog_id].push_back({0u, frame_off, u32csz,
-                                        ph.raw_off, ph.raw_len, ph.acc_idx, ph.n_records});
-        frame_raw_.clear();
+                                        ph.other_off, ph.other_len,
+                                        ph.bmp_off, ph.cdn_off,
+                                        ph.acc_idx, ph.n_records});
+        other_raw_.clear(); bmp_raw_.clear(); cdn_raw_.clear();
         pending_.clear();
     }
 
@@ -128,7 +170,9 @@ public:
             throw std::runtime_error("cannot create: " + path + ": " + strerror(errno));
         cctx_ = ZSTD_createCCtx();
         buf_.reserve(BUF_CAP + 256 * 1024);
-        frame_raw_.reserve(FRAME_RAW_TARGET + 512 * 1024);
+        other_raw_.reserve(FRAME_RAW_TARGET);
+        bmp_raw_.reserve(FRAME_RAW_TARGET / 8);
+        cdn_raw_.reserve(FRAME_RAW_TARGET);
     }
     ~PartitionWriter() {
         if (fd_ >= 0) {
@@ -143,10 +187,18 @@ public:
 
     void append_raw(const std::string& hog_id, uint32_t acc_idx, uint32_t n_records,
                     const uint8_t* raw, uint32_t raw_len) {
+        uint32_t other_len = 0, bmp_len = 0, cdn_len = 0;
+        if (!split_raw_block(raw, raw_len, other_len, bmp_len, cdn_len))
+            throw std::runtime_error("split_raw_block failed for HOG " + hog_id);
         pending_.push_back({hog_id, acc_idx, n_records,
-                            uint32_t(frame_raw_.size()), raw_len});
-        frame_raw_.insert(frame_raw_.end(), raw, raw + raw_len);
-        if (frame_raw_.size() >= FRAME_RAW_TARGET) flush_frame();
+                            uint32_t(other_raw_.size()), other_len,
+                            uint32_t(bmp_raw_.size()),
+                            uint32_t(cdn_raw_.size())});
+        other_raw_.insert(other_raw_.end(), raw,                          raw + other_len);
+        bmp_raw_.insert  (bmp_raw_.end(),   raw + other_len,              raw + other_len + bmp_len);
+        cdn_raw_.insert  (cdn_raw_.end(),   raw + other_len + bmp_len,    raw + raw_len);
+        size_t total = other_raw_.size() + bmp_raw_.size() + cdn_raw_.size();
+        if (total >= FRAME_RAW_TARGET) flush_frame();
     }
 
     void flush_all() {
@@ -163,9 +215,10 @@ public:
 };
 
 // Write the partition index: sorted hog_id → extents across N thread files.
-// Binary format v3: LHP_INDEX_MAGIC(4) + version(1) + n_threads(u32) + n_hogs(u32)
+// Binary format v4: LHP_INDEX_MAGIC(4) + version(1) + n_threads(u32) + n_hogs(u32)
 //   per HOG: hog_id_len(u16) + hog_id + n_extents(u32)
-//     per extent: thread_idx(u32)+frame_off(u64)+frame_csz(u32)+hog_raw_off(u32)+hog_raw_len(u32)+acc_idx(u32)+n_records(u32) [32 bytes]
+//     per extent: thread_idx(u32)+frame_off(u64)+frame_csz(u32)+other_off(u32)+other_len(u32)
+//                 +bmp_off(u32)+cdn_off(u32)+acc_idx(u32)+n_records(u32) [40 bytes]
 inline void write_partition_index(
         const std::map<std::string, std::vector<PartitionIndexExtent>>& idx,
         uint32_t n_threads,
@@ -187,13 +240,15 @@ inline void write_partition_index(
         uint32_t ne = uint32_t(exts.size());
         for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(ne >> (8*i)));
         for (const auto& e : exts) {
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.thread_idx  >> (8*i)));
-            for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.frame_off   >> (8*i)));
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.frame_csz   >> (8*i)));
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.hog_raw_off >> (8*i)));
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.hog_raw_len >> (8*i)));
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.acc_idx     >> (8*i)));
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.n_records   >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.thread_idx >> (8*i)));
+            for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.frame_off  >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.frame_csz  >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.other_off  >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.other_len  >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.bmp_off    >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.cdn_off    >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.acc_idx    >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.n_records  >> (8*i)));
         }
     }
 
@@ -219,8 +274,8 @@ load_partition_index(const std::string& path, uint32_t& n_threads_out) {
         throw std::runtime_error("truncated partition index: " + path);
     if (buf.size() < 13 || memcmp(buf.data(), LHP_INDEX_MAGIC, 4) != 0)
         throw std::runtime_error("bad partition index magic: " + path);
-    if (buf[4] == 1 || buf[4] == 2)
-        throw std::runtime_error("partition index v1/v2 not supported — re-run ingest: " + path);
+    if (buf[4] == 1 || buf[4] == 2 || buf[4] == 3)
+        throw std::runtime_error("partition index v1/v2/v3 not supported — re-run ingest: " + path);
     if (buf[4] != LHP_INDEX_VERSION)
         throw std::runtime_error("unsupported partition index version " + std::to_string(buf[4]) + ": " + path);
 
@@ -240,17 +295,19 @@ load_partition_index(const std::string& path, uint32_t& n_threads_out) {
         auto& exts = idx[hog_id];
         exts.reserve(ne);
         for (uint32_t ei = 0; ei < ne; ++ei) {
-            if (cur + 32 > eof) throw std::runtime_error("truncated partition index (extent)");
+            if (cur + 40 > eof) throw std::runtime_error("truncated partition index (extent)");
             PartitionIndexExtent ext;
-            ext.thread_idx   = read_u32_le(cur); cur += 4;
-            ext.frame_off    = 0;
+            ext.thread_idx = read_u32_le(cur); cur += 4;
+            ext.frame_off  = 0;
             for (int i = 0; i < 8; ++i) ext.frame_off |= (uint64_t(cur[i]) << (8*i));
             cur += 8;
-            ext.frame_csz    = read_u32_le(cur); cur += 4;
-            ext.hog_raw_off  = read_u32_le(cur); cur += 4;
-            ext.hog_raw_len  = read_u32_le(cur); cur += 4;
-            ext.acc_idx      = read_u32_le(cur); cur += 4;
-            ext.n_records    = read_u32_le(cur); cur += 4;
+            ext.frame_csz  = read_u32_le(cur); cur += 4;
+            ext.other_off  = read_u32_le(cur); cur += 4;
+            ext.other_len  = read_u32_le(cur); cur += 4;
+            ext.bmp_off    = read_u32_le(cur); cur += 4;
+            ext.cdn_off    = read_u32_le(cur); cur += 4;
+            ext.acc_idx    = read_u32_le(cur); cur += 4;
+            ext.n_records  = read_u32_le(cur); cur += 4;
             exts.push_back(ext);
         }
     }
