@@ -135,6 +135,11 @@ struct ShardScratch {
     std::vector<uint32_t> contig_cnum;
     std::vector<VarNTRecord> recs;
     std::vector<uint8_t> inv_raw, hdr_buf, acc_b, cnum_b, codon_b, hog_cbuf;
+    // Frame-decode reuse: extents sorted by (thread_idx, frame_off); raw_block holds the
+    // last decoded frame so adjacent same-frame extents skip the pread+zstd. Persists
+    // across HOG calls on the same worker (only ever a hit, never wrong).
+    std::vector<uint32_t> ext_order;
+    uint64_t cached_frame_key = ~uint64_t(0);
 
     explicit ShardScratch(size_t n_acc) : seen_epoch(n_acc, 0) {
         dctx = ZSTD_createDCtx();
@@ -185,26 +190,43 @@ inline ShardResult merge_shard_compute_extents(
     auto& acc_intervals_map = sc.acc_intervals_map;
     auto& acc_pident_map   = sc.acc_pident_map;
 
+    // Group extents by (thread_idx, frame_off) so each shared zstd frame is decoded ONCE
+    // per HOG rather than once per extent. A HOG's hundreds of extents typically touch
+    // only a handful of distinct 4 MB frames.
+    auto& ext_order = sc.ext_order;
+    ext_order.resize(extents.size());
+    std::iota(ext_order.begin(), ext_order.end(), 0u);
+    std::sort(ext_order.begin(), ext_order.end(), [&](uint32_t a, uint32_t b) {
+        if (extents[a].thread_idx != extents[b].thread_idx)
+            return extents[a].thread_idx < extents[b].thread_idx;
+        return extents[a].frame_off < extents[b].frame_off;
+    });
+
     uint64_t _t0 = clock_ns();
-    for (const auto& ext : extents) {
+    for (uint32_t _oi : ext_order) {
+        const auto& ext = extents[_oi];
         if (ext.thread_idx >= thread_fds.size())
             throw std::runtime_error("extent thread_idx OOB for HOG " + hog_id);
         int tfd = thread_fds[ext.thread_idx];
 
-        // Read and decompress the grouped frame
-        extent_buf.resize(ext.frame_csz);
-        if (::pread(tfd, extent_buf.data(), ext.frame_csz, off_t(ext.frame_off))
-                != ssize_t(ext.frame_csz))
-            throw std::runtime_error("pread frame failed for HOG " + hog_id);
-
-        uint64_t frame_rsz = ZSTD_getFrameContentSize(extent_buf.data(), ext.frame_csz);
-        if (frame_rsz == ZSTD_CONTENTSIZE_UNKNOWN || frame_rsz == ZSTD_CONTENTSIZE_ERROR)
-            throw std::runtime_error("bad frame content size for HOG " + hog_id);
-        raw_block.resize(size_t(frame_rsz));
-        size_t rz = ZSTD_decompressDCtx(sc.dctx, raw_block.data(), size_t(frame_rsz),
-                                          extent_buf.data(), ext.frame_csz);
-        if (ZSTD_isError(rz))
-            throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
+        // Decode the frame only when it differs from the one already in raw_block.
+        uint64_t fkey = (uint64_t(ext.thread_idx) << 48)
+                      | (uint64_t(ext.frame_off) & 0xFFFFFFFFFFFFull);
+        if (fkey != sc.cached_frame_key) {
+            extent_buf.resize(ext.frame_csz);
+            if (::pread(tfd, extent_buf.data(), ext.frame_csz, off_t(ext.frame_off))
+                    != ssize_t(ext.frame_csz))
+                throw std::runtime_error("pread frame failed for HOG " + hog_id);
+            uint64_t frame_rsz = ZSTD_getFrameContentSize(extent_buf.data(), ext.frame_csz);
+            if (frame_rsz == ZSTD_CONTENTSIZE_UNKNOWN || frame_rsz == ZSTD_CONTENTSIZE_ERROR)
+                throw std::runtime_error("bad frame content size for HOG " + hog_id);
+            raw_block.resize(size_t(frame_rsz));
+            size_t rz = ZSTD_decompressDCtx(sc.dctx, raw_block.data(), size_t(frame_rsz),
+                                              extent_buf.data(), ext.frame_csz);
+            if (ZSTD_isError(rz))
+                throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
+            sc.cached_frame_key = fkey;
+        }
 
         uint32_t acc_idx = ext.acc_idx;
         if (!fd_acc_remap.empty() && ext.thread_idx < fd_acc_remap.size()

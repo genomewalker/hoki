@@ -273,6 +273,16 @@ int main(int argc, char* argv[]) {
             hog_list.push_back(&kv);
         }
 
+        // Largest-first dispatch: process the heaviest HOGs (most records) first so the
+        // tail of the run isn't a single giant HOG finishing alone while cores idle.
+        // The .lhgi index is sorted by hog_id at the end, so dispatch order is free to set.
+        std::sort(hog_list.begin(), hog_list.end(), [](const HogEntry* a, const HogEntry* b) {
+            uint64_t wa = 0, wb = 0;
+            for (const auto& e : a->second) wa += e.n_records;
+            for (const auto& e : b->second) wb += e.n_records;
+            return wa > wb;
+        });
+
         size_t nt = size_t(n_threads > 0 ? n_threads : int(std::thread::hardware_concurrency()));
         nt = std::max<size_t>(1, std::min(nt, hog_list.size()));
 
