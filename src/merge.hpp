@@ -433,10 +433,10 @@ inline void run_merge_shard_spill(
               got += size_t(r);
           } }
         // group record spans by hog_idx
-        std::unordered_map<uint32_t, std::vector<uint32_t>> groups;  // hog_idx -> record start offsets
+        std::unordered_map<uint32_t, std::vector<uint64_t>> groups;  // hog_idx -> record start offsets (64-bit: buckets exceed 4GB at scale)
         size_t off = 0;
         while (off + 25 <= data.size()) {
-            uint32_t rstart = uint32_t(off);
+            uint64_t rstart = off;
             uint32_t hog_idx = read_u32_le(&data[off]);
             off += 4 + 4 + 4 + 4 + 4 + 1;  // hog,acc,cnum,sstart,send,pu8
             uint32_t nobs = read_u32_le(&data[off]); off += 4;
@@ -458,7 +458,7 @@ inline void run_merge_shard_spill(
                     uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
                     sc.seen_accs.clear(); sc.flat_inv.clear();
                     sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
-                    for (uint32_t ro : groups[hidx]) {
+                    for (uint64_t ro : groups[hidx]) {
                         const uint8_t* q = &data[ro];
                         q += 4;                              // skip hog_idx
                         uint32_t acc  = read_u32_le(q); q += 4;
