@@ -547,14 +547,9 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                             uint32_t lo = sc[h], hi = sc[h + 1];
                             uint32_t N  = hi - lo;
 
-                            // Win 2: packed-key sort — one O(N) gather, then contiguous sort
-                            // Low 32 bits = rank within so[lo..hi): makes std::sort stable w.r.t. original order
-                            sk.resize(N); sort_scratch.resize(N);
-                            for (uint32_t i = 0; i < N; i++) sk[i] = (uint64_t(s.rec_hdr[so[lo+i]].sstart) << 32) | i;
-                            std::sort(sk.begin(), sk.end());
-                            for (uint32_t i = 0; i < N; i++) sort_scratch[i] = so[lo + uint32_t(sk[i])];
-
-                            // Win 1: generation-stamped flat g2l — no hash map, no string copies
+                            // Generation-stamped flat g2l — assign local contig slots in
+                            // first-seen order. Must precede the sort below (the sort key and
+                            // the contig delta-encoding both read g2l_slot).
                             if (++g2l_cur == 0) { std::fill(g2l_gen.begin(), g2l_gen.end(), 0); g2l_cur = 1; }
                             local_gids.clear();
                             for (uint32_t i = lo; i < hi; i++) {
@@ -562,13 +557,31 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                                 if (g2l_gen[ci] != g2l_cur) { g2l_gen[ci]=g2l_cur; g2l_slot[ci]=uint32_t(local_gids.size()); local_gids.push_back(ci); }
                             }
 
-                            // Columnar serialisation directly from SoA
+                            // Sort records by (contig slot, sstart) — the column format's
+                            // contract: contig grouped, sstart monotone within each contig run,
+                            // so contig deltas are non-negative and sstart resets per contig.
+                            sort_scratch.resize(N);
+                            for (uint32_t i = 0; i < N; i++) sort_scratch[i] = so[lo + i];
+                            std::stable_sort(sort_scratch.begin(), sort_scratch.end(),
+                                [&](uint32_t a, uint32_t b) {
+                                    uint32_t sa = g2l_slot[s.rec_hdr[a].contig_idx];
+                                    uint32_t sb = g2l_slot[s.rec_hdr[b].contig_idx];
+                                    if (sa != sb) return sa < sb;
+                                    return s.rec_hdr[a].sstart < s.rec_hdr[b].sstart;
+                                });
+
+                            // Columnar serialisation directly from SoA. contig is delta-encoded
+                            // against the previous slot; sstart resets to 0 at each contig boundary
+                            // (mirrors deserialize_varnt_block's accumulation).
                             cc_col.clear(); ss_col.clear(); span_col.clear(); qf_col.clear();
                             pi_col.clear(); ev_col.clear(); bmp_col.clear(); cdn_col.clear();
-                            uint32_t prev_ss = 0;
+                            uint32_t prev_ss = 0, prev_slot = 0;
                             for (uint32_t idx : sort_scratch) {
                                 const auto& hdr = s.rec_hdr[idx];
-                                write_varint(cc_col,   g2l_slot[hdr.contig_idx]);
+                                uint32_t slot = g2l_slot[hdr.contig_idx];
+                                uint32_t dc = slot - prev_slot;
+                                write_varint(cc_col,   dc);
+                                if (dc) { prev_ss = 0; prev_slot = slot; }
                                 write_varint(ss_col,   hdr.sstart - prev_ss); prev_ss = hdr.sstart;
                                 write_varint(span_col, hdr.send - hdr.sstart + 1);
                                 qf_col.push_back(uint8_t(hdr.qframe));
