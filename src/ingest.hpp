@@ -446,8 +446,12 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         // RSS ~= 2x the per-worker batch. Trigger at HALF the per-worker share so the
         // in-flight snapshot + new accumulation together stay within budget; a frequent
         // hard RSS guard (below) catches estimate undercount (dicts, arenas, fragmentation).
-        const size_t flush_total = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold);
-        const size_t thr         = std::max<size_t>(1, flush_total / (N * 2));
+        // --flush is the hard RSS CAP. The steady accumulation is then compressed at the
+        // final flush, a transient that roughly doubles it — so target accumulation at a
+        // QUARTER of the cap per worker (cap/2 total, halved again for the async snapshot).
+        // The peak (steady + final-flush spike) then lands at/under --flush.
+        const size_t rss_cap = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold);
+        const size_t thr     = std::max<size_t>(1, rss_cap / (N * 4));
 
         // cctx is now owned by PartitionWriter; no per-worker CCtx needed here.
 
@@ -765,7 +769,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
             if (mem_bytes > thr) {
                 flush();                                  // normal path: async double-buffer
-            } else if ((++rss_tick & 0xFF) == 0 && read_rss_bytes() > (flush_total * 4) / 5) {
+            } else if ((++rss_tick & 0xFF) == 0 && read_rss_bytes() > rss_cap) {
                 // Hard RSS ceiling. The estimate undercounts (contig_strings, dicts, arenas),
                 // so this real-RSS check is the true bound. Flush SYNCHRONOUSLY — wait for the
                 // write to free the snapshot before accumulating again — otherwise the async
