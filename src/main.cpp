@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <condition_variable>
+#include <deque>
 #include <optional>
 #include <thread>
 #include <atomic>
@@ -164,12 +166,14 @@ int main(int argc, char* argv[]) {
     if (mode == "merge-shard") {
         int n_threads = 0;
         int out_zstd_level = 6;
+        bool do_profile = false;
         std::string hog_range_start, hog_range_end;
         std::vector<std::string> pos;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "-t" && i+1 < argc)          n_threads       = std::stoi(argv[++i]);
             else if (a == "-zo" && i+1 < argc)         out_zstd_level  = std::stoi(argv[++i]);
+            else if (a == "--profile")                 do_profile      = true;
             else if (a == "--hog-range" && i+2 < argc) { hog_range_start = argv[++i]; hog_range_end = argv[++i]; }
             else pos.emplace_back(a);
         }
@@ -279,35 +283,63 @@ int main(int argc, char* argv[]) {
         // before computing index hi once they run WINDOW ahead of the writer), so peak
         // memory is O(WINDOW × payload) instead of O(full .lhg output).
         std::vector<lhi::ShardResult> results(hog_list.size());
-        std::unique_ptr<std::atomic<bool>[]> ready(new std::atomic<bool>[hog_list.size()]);
-        for (size_t i = 0; i < hog_list.size(); ++i)
-            ready[i].store(false, std::memory_order_relaxed);
         std::atomic<size_t> next_h{0};
-        std::atomic<size_t> write_cursor{0};
         std::atomic<bool>   sfailed{false};
         std::string         serr;
         std::mutex          serr_mtx;
-        const size_t WINDOW = std::max<size_t>(1024, nt * 32);
+
+        // Completion-order pipeline: workers compute HOG payloads into results[hi] and
+        // push hi onto a queue; a single writer drains the queue in COMPLETION order
+        // (not hog-index order) and frees each payload immediately. The .lhgi index is
+        // sorted by hog_id at the end, so physical order in the .lhg is irrelevant —
+        // writing in completion order removes the head-of-line stall where one slow HOG
+        // blocked the writer while finished payloads piled up in RAM.
+        std::deque<size_t>      done_q;
+        std::mutex              done_mtx;
+        std::condition_variable done_cv;
+        std::atomic<uint64_t> prof_decode{0}, prof_build{0}, prof_compress{0};
+        std::atomic<uint64_t> slowest_ns{0};
+        std::string slowest_hog; std::mutex slowest_mtx;
 
         auto sworker = [&]() {
             lhi::ShardScratch sc(accessions.size());
+            uint64_t td = 0, tb = 0, tc = 0;
             for (;;) {
                 size_t hi = next_h.fetch_add(1, std::memory_order_relaxed);
                 if (hi >= hog_list.size() || sfailed.load(std::memory_order_relaxed)) break;
-                // backpressure: don't run more than WINDOW ahead of the writer
-                while (hi >= write_cursor.load(std::memory_order_acquire) + WINDOW
-                       && !sfailed.load(std::memory_order_relaxed))
-                    std::this_thread::yield();
+                uint64_t c0 = do_profile ? clock_ns() : 0;
                 try {
                     results[hi] = lhi::merge_shard_compute_extents(
                         hog_list[hi]->first, hog_list[hi]->second, tfd_ints, sc,
-                        fd_acc_remap, out_zstd_level);
+                        fd_acc_remap, out_zstd_level,
+                        do_profile ? &td : nullptr, do_profile ? &tb : nullptr,
+                        do_profile ? &tc : nullptr);
                 } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lk(serr_mtx);
-                    if (!sfailed.exchange(true)) serr = e.what();
+                    { std::lock_guard<std::mutex> lk(serr_mtx);
+                      if (!sfailed.exchange(true)) serr = e.what(); }
+                    done_cv.notify_all();
                     break;
                 }
-                ready[hi].store(true, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lk(done_mtx);
+                    done_q.push_back(hi);
+                }
+                done_cv.notify_one();
+                if (do_profile) {
+                    uint64_t dt = clock_ns() - c0;
+                    if (dt > slowest_ns.load(std::memory_order_relaxed)) {
+                        std::lock_guard<std::mutex> lk(slowest_mtx);
+                        if (dt > slowest_ns.load(std::memory_order_relaxed)) {
+                            slowest_ns.store(dt, std::memory_order_relaxed);
+                            slowest_hog = hog_list[hi]->first;
+                        }
+                    }
+                }
+            }
+            if (do_profile) {
+                prof_decode.fetch_add(td, std::memory_order_relaxed);
+                prof_build.fetch_add(tb, std::memory_order_relaxed);
+                prof_compress.fetch_add(tc, std::memory_order_relaxed);
             }
         };
 
@@ -327,11 +359,17 @@ int main(int argc, char* argv[]) {
         auto writer_fn = [&]() {
             lhi::WriteBuffer wb;
             try {
-                for (size_t hi = 0; hi < hog_list.size(); ++hi) {
-                    while (!ready[hi].load(std::memory_order_acquire)) {
-                        if (sfailed.load(std::memory_order_relaxed)) return;
-                        std::this_thread::yield();
+                size_t written = 0;
+                while (written < hog_list.size()) {
+                    size_t hi;
+                    {
+                        std::unique_lock<std::mutex> lk(done_mtx);
+                        done_cv.wait(lk, [&]{ return !done_q.empty() ||
+                                                     sfailed.load(std::memory_order_relaxed); });
+                        if (done_q.empty()) return;   // sfailed with nothing left → abort
+                        hi = done_q.front(); done_q.pop_front();
                     }
+                    ++written;
                     auto& r = results[hi];
                     uint8_t hdr8[8];
                     memcpy(hdr8, lhi::LHG_HOG_ENTRY_MAGIC, 4);
@@ -348,7 +386,6 @@ int main(int argc, char* argv[]) {
                     wb.append(fd_out, out_lhg, r.payload.data(), r.payload.size());
                     data_pos += uint64_t(8) + r.payload.size();
                     std::vector<uint8_t>().swap(r.payload);
-                    write_cursor.store(hi + 1, std::memory_order_release);
                 }
                 wb.flush_to(fd_out, out_lhg);
             } catch (const std::exception& ex) {
@@ -369,6 +406,15 @@ int main(int argc, char* argv[]) {
         if (sfailed.load()) {
             std::cerr << "error: " << (writer_err.empty() ? serr : writer_err) << "\n";
             return 1;
+        }
+        if (do_profile) {
+            uint64_t d = prof_decode.load(), b = prof_build.load(), c = prof_compress.load();
+            uint64_t tot = d + b + c; if (!tot) tot = 1;
+            std::fprintf(stderr, "profile[hogs]     n=%zu threads=%zu\n", hog_list.size(), nt);
+            std::fprintf(stderr, "profile[decode]   %.1fs (%d%%)  pread+zstd+deserialize\n", d/1e9, int(d*100/tot));
+            std::fprintf(stderr, "profile[build]    %.1fs (%d%%)  invert+coverage+serialize\n", b/1e9, int(b*100/tot));
+            std::fprintf(stderr, "profile[compress] %.1fs (%d%%)  zstd out\n", c/1e9, int(c*100/tot));
+            std::fprintf(stderr, "profile[slowest]  %s  %.2fs (single HOG)\n", slowest_hog.c_str(), slowest_ns.load()/1e9);
         }
 
         // Sort index entries by hog_id (physical order = completion order, may differ)

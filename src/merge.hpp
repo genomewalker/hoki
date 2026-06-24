@@ -154,7 +154,9 @@ inline ShardResult merge_shard_compute_extents(
         const std::vector<int>& thread_fds,
         ShardScratch& sc,
         const std::vector<const std::vector<uint32_t>*>& fd_acc_remap = {},
-        int out_zstd_level = 6) {
+        int out_zstd_level = 6,
+        uint64_t* tl_decode = nullptr, uint64_t* tl_build = nullptr,
+        uint64_t* tl_compress = nullptr) {
 
     ShardResult res;
     res.hog_id = hog_id;
@@ -183,6 +185,7 @@ inline ShardResult merge_shard_compute_extents(
     auto& acc_intervals_map = sc.acc_intervals_map;
     auto& acc_pident_map   = sc.acc_pident_map;
 
+    uint64_t _t0 = clock_ns();
     for (const auto& ext : extents) {
         if (ext.thread_idx >= thread_fds.size())
             throw std::runtime_error("extent thread_idx OOB for HOG " + hog_id);
@@ -270,6 +273,7 @@ inline ShardResult merge_shard_compute_extents(
         }
     }
 
+    uint64_t _t1 = clock_ns();   // decode end
     uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
     for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
     std::vector<uint32_t> cs_count(max_pos + 1, 0), cs_pidx(max_pos + 1, UINT32_MAX);
@@ -316,6 +320,7 @@ inline ShardResult merge_shard_compute_extents(
 
     size_t raw_sz = inv_raw.size();
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
+    uint64_t _t2 = clock_ns();   // build end
     {
         size_t bound = ZSTD_compressBound(raw_sz);
         hog_cbuf.resize(bound);
@@ -324,6 +329,11 @@ inline ShardResult merge_shard_compute_extents(
         if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
         else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
     }
+
+    uint64_t _t3 = clock_ns();   // compress end
+    if (tl_decode)   *tl_decode   += _t1 - _t0;
+    if (tl_build)    *tl_build    += _t2 - _t1;
+    if (tl_compress) *tl_compress += _t3 - _t2;
 
     res.stored_sz = stored_sz;
     res.n_accs    = n_accs;
