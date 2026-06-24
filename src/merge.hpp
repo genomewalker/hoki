@@ -117,11 +117,11 @@ struct ShardResult {
     std::vector<uint8_t> payload;
 };
 
-// merge_shard_compute + merge_shard_file deleted: read old per-HOG .lhp format
-// (LHGP magic) which partition no longer writes. Active path: merge_shard_compute_extents.
+// merge_shard_compute* deleted: read the old per-HOG .lhp format which partition no
+// longer writes. Active merge-shard path: run_merge_shard_spill (below).
 
 
-// Per-thread scratch for merge_shard_compute_extents. Allocate once per worker;
+// Per-thread scratch for the spill build (build_inverted_from_scratch). Allocate once;
 // pass by reference so the 152 MB seen_epoch vector and dctx are reused across HOGs.
 struct ShardScratch {
     ZSTD_DCtx* dctx = nullptr;
@@ -151,219 +151,6 @@ struct ShardScratch {
     ShardScratch& operator=(const ShardScratch&) = delete;
 };
 
-// Invert one HOG from indexed partition files (tN.lhp + partition.idx).
-// Preads extents from already-open thread fds; never opens a per-HOG file.
-// fd_acc_remap[flat_fd_idx] → vector mapping local acc_idx → global acc_idx.
-// Empty means identity (single partition dir, no remapping needed).
-inline ShardResult merge_shard_compute_extents(
-        const std::string& hog_id,
-        const std::vector<PartitionIndexExtent>& extents,
-        const std::vector<int>& thread_fds,
-        ShardScratch& sc,
-        const std::vector<const std::vector<uint32_t>*>& fd_acc_remap = {},
-        int out_zstd_level = 6,
-        uint64_t* tl_decode = nullptr, uint64_t* tl_build = nullptr,
-        uint64_t* tl_compress = nullptr) {
-
-    ShardResult res;
-    res.hog_id = hog_id;
-
-    // Bump epoch; on 32-bit wrap, full reset so epoch=1 is unambiguous.
-    if (++sc.epoch == 0) {
-        std::fill(sc.seen_epoch.begin(), sc.seen_epoch.end(), 0);
-        sc.epoch = 1;
-    }
-    uint32_t epoch = sc.epoch;
-    uint32_t n_accs = 0;
-    sc.seen_accs.clear();
-    auto mark_acc = [&](uint32_t gacc) {
-        if (sc.seen_epoch[gacc] != epoch) { sc.seen_epoch[gacc] = epoch; ++n_accs; sc.seen_accs.push_back(gacc); }
-    };
-
-    sc.flat_inv.clear();
-    sc.acc_intervals_map.clear();
-    sc.acc_pident_map.clear();
-    uint32_t hog_length = 0;
-    auto& raw_block        = sc.raw_block;
-    auto& extent_buf       = sc.extent_buf;
-    auto& contig_cnum      = sc.contig_cnum;
-    auto& recs             = sc.recs;
-    auto& flat_inv         = sc.flat_inv;
-    auto& acc_intervals_map = sc.acc_intervals_map;
-    auto& acc_pident_map   = sc.acc_pident_map;
-
-    // Group extents by (thread_idx, frame_off) so each shared zstd frame is decoded ONCE
-    // per HOG rather than once per extent. A HOG's hundreds of extents typically touch
-    // only a handful of distinct 4 MB frames.
-    auto& ext_order = sc.ext_order;
-    ext_order.resize(extents.size());
-    std::iota(ext_order.begin(), ext_order.end(), 0u);
-    std::sort(ext_order.begin(), ext_order.end(), [&](uint32_t a, uint32_t b) {
-        if (extents[a].thread_idx != extents[b].thread_idx)
-            return extents[a].thread_idx < extents[b].thread_idx;
-        return extents[a].frame_off < extents[b].frame_off;
-    });
-
-    uint64_t _t0 = clock_ns();
-    for (uint32_t _oi : ext_order) {
-        const auto& ext = extents[_oi];
-        if (ext.thread_idx >= thread_fds.size())
-            throw std::runtime_error("extent thread_idx OOB for HOG " + hog_id);
-        int tfd = thread_fds[ext.thread_idx];
-
-        // Decode the frame only when it differs from the one already in raw_block.
-        uint64_t fkey = (uint64_t(ext.thread_idx) << 48)
-                      | (uint64_t(ext.frame_off) & 0xFFFFFFFFFFFFull);
-        if (fkey != sc.cached_frame_key) {
-            extent_buf.resize(ext.frame_csz);
-            if (::pread(tfd, extent_buf.data(), ext.frame_csz, off_t(ext.frame_off))
-                    != ssize_t(ext.frame_csz))
-                throw std::runtime_error("pread frame failed for HOG " + hog_id);
-            uint64_t frame_rsz = ZSTD_getFrameContentSize(extent_buf.data(), ext.frame_csz);
-            if (frame_rsz == ZSTD_CONTENTSIZE_UNKNOWN || frame_rsz == ZSTD_CONTENTSIZE_ERROR)
-                throw std::runtime_error("bad frame content size for HOG " + hog_id);
-            raw_block.resize(size_t(frame_rsz));
-            size_t rz = ZSTD_decompressDCtx(sc.dctx, raw_block.data(), size_t(frame_rsz),
-                                              extent_buf.data(), ext.frame_csz);
-            if (ZSTD_isError(rz))
-                throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
-            sc.cached_frame_key = fkey;
-        }
-
-        uint32_t acc_idx = ext.acc_idx;
-        if (!fd_acc_remap.empty() && ext.thread_idx < fd_acc_remap.size()
-                && fd_acc_remap[ext.thread_idx]) {
-            const auto& rm = *fd_acc_remap[ext.thread_idx];
-            if (acc_idx < rm.size()) acc_idx = rm[acc_idx];
-        }
-
-        // v4 column-major frame: [other_sec_len(u32) | bmp_sec_len(u32) | other | bmp | cdn]
-        if (raw_block.size() < 8)
-            throw std::runtime_error("frame too small for HOG " + hog_id);
-        uint32_t other_sec_len = read_u32_le(raw_block.data());
-        uint32_t bmp_sec_len   = read_u32_le(raw_block.data() + 4);
-        const uint8_t* other_sec = raw_block.data() + 8;
-        const uint8_t* bmp_sec   = other_sec + other_sec_len;
-        const uint8_t* cdn_sec   = bmp_sec   + bmp_sec_len;
-
-        const uint8_t* p   = other_sec + ext.other_off;
-        const uint8_t* end = p + ext.other_len;
-        uint32_t n_contigs = 0;
-        int n = read_varint(p, end, &n_contigs);
-        if (!n) throw std::runtime_error("corrupt contig dict for HOG " + hog_id);
-        p += n;
-        contig_cnum.clear(); contig_cnum.resize(n_contigs);
-        for (uint32_t j = 0; j < n_contigs; ++j) {
-            uint32_t len = 0;
-            n = read_varint(p, end, &len);
-            if (!n || p + n + len > end) throw std::runtime_error("truncated contig dict for HOG " + hog_id);
-            p += n;
-            std::string_view uid(reinterpret_cast<const char*>(p), len);
-            p += len;
-            uint32_t cnum = j;
-            {
-                auto fs = uid.find('_');
-                if (fs != std::string_view::npos && fs + 1 < uid.size()) {
-                    auto fe = uid.find('_', fs + 1);
-                    auto part = (fe != std::string_view::npos) ? uid.substr(fs+1, fe-fs-1) : uid.substr(fs+1);
-                    uint32_t v = 0;
-                    auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
-                    if (cr.ec == std::errc{}) cnum = v;
-                }
-            }
-            contig_cnum[j] = cnum;
-        }
-        recs.clear();
-        if (!deserialize_varnt_block_split(p, end, bmp_sec + ext.bmp_off, cdn_sec + ext.cdn_off, recs))
-            throw std::runtime_error("corrupt varnt block for HOG " + hog_id);
-
-        mark_acc(acc_idx);
-        for (const auto& r : recs) {
-            if (r.contig_idx >= contig_cnum.size())
-                throw std::runtime_error("contig_idx OOB in HOG " + hog_id);
-            uint32_t cnum = contig_cnum[r.contig_idx];
-            uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
-            hog_length = std::max(hog_length, r.send + 1);
-            acc_intervals_map[acc_idx].emplace_back(r.sstart, r.send);
-            {
-                auto [it2, ins] = acc_pident_map.emplace(acc_idx, pu8);
-                if (!ins && pu8 < it2->second) it2->second = pu8;
-            }
-            for (const auto& o : r.vars) {
-                uint32_t hog_pos   = r.sstart + o.hog_offset;
-                uint8_t  codon_idx = uint8_t(o.packed_codon >> 2);
-                flat_inv.emplace_back(hog_pos, InvObs{acc_idx, codon_idx, cnum});
-            }
-        }
-    }
-
-    uint64_t _t1 = clock_ns();   // decode end
-    uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
-    for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
-    std::vector<uint32_t> cs_count(max_pos + 1, 0), cs_pidx(max_pos + 1, UINT32_MAX);
-    for (const auto& e : flat_inv) ++cs_count[e.first];
-    std::vector<InvPosition> positions;
-    for (uint32_t pp = 0; pp <= max_pos; ++pp) {
-        if (!cs_count[pp]) continue;
-        cs_pidx[pp] = uint32_t(positions.size());
-        InvPosition ip; ip.hog_pos = pp; ip.obs.reserve(cs_count[pp]);
-        positions.push_back(std::move(ip));
-    }
-    for (auto& e : flat_inv) positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
-    for (auto& pos : positions)
-        std::sort(pos.obs.begin(), pos.obs.end(),
-                  [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
-
-    std::vector<uint32_t> local_accs(sc.seen_accs);
-    std::sort(local_accs.begin(), local_accs.end());
-
-    auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
-        if (ivals.empty()) return 0;
-        std::sort(ivals.begin(), ivals.end());
-        uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
-        for (size_t k = 1; k < ivals.size(); ++k) {
-            if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
-            else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
-        }
-        return cov + ce - cs + 1;
-    };
-    std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
-    std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
-    for (size_t li = 0; li < local_accs.size(); ++li) {
-        uint32_t gacc = local_accs[li];
-        auto it = acc_pident_map.find(gacc);
-        if (it != acc_pident_map.end()) local_acc_pident[li] = it->second;
-        auto it3 = acc_intervals_map.find(gacc);
-        if (it3 != acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
-    }
-
-    auto& inv_raw  = sc.inv_raw;  inv_raw.clear();
-    auto& hog_cbuf = sc.hog_cbuf;
-    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
-                             covered_aa_v, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b);
-
-    size_t raw_sz = inv_raw.size();
-    uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
-    uint64_t _t2 = clock_ns();   // build end
-    {
-        size_t bound = ZSTD_compressBound(raw_sz);
-        hog_cbuf.resize(bound);
-        size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
-        bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
-        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
-        else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
-    }
-
-    uint64_t _t3 = clock_ns();   // compress end
-    if (tl_decode)   *tl_decode   += _t1 - _t0;
-    if (tl_build)    *tl_build    += _t2 - _t1;
-    if (tl_compress) *tl_compress += _t3 - _t2;
-
-    res.stored_sz = stored_sz;
-    res.n_accs    = n_accs;
-    res.payload.assign(payload, payload + payload_sz);
-    return res;
-}
 
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -447,6 +234,47 @@ inline void spill_extent_into(const uint8_t* frame_ptr, size_t frame_len,
 
 // Build inverted+compressed payload from state already accumulated in sc
 // (flat_inv / acc_intervals_map / acc_pident_map / seen_accs).
+// Amino-acid coverage of a set of [start,end] intervals after merging overlaps. Shared by
+// the merge-shard spill build and the merge_batches reduce build.
+inline uint32_t merged_interval_cov(std::vector<std::pair<uint32_t,uint32_t>>& ivals) {
+    if (ivals.empty()) return 0;
+    std::sort(ivals.begin(), ivals.end());
+    uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
+    for (size_t k = 1; k < ivals.size(); ++k) {
+        if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
+        else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
+    }
+    return cov + ce - cs + 1;
+}
+
+// Serialize a HOG's inverted block and zstd-compress it; sets stored_sz (with the raw/zstd
+// flag bits) and a view of the payload (inv_raw if stored raw, else hog_cbuf). cctx!=null
+// uses ZSTD_compress2 (persistent ctx); else one-shot ZSTD_compress at `level`. If
+// ser_done_ns!=null it is set right after serialize (before compress) so callers can split
+// build vs compress timing. Shared by the spill build and the merge_batches reduce build.
+inline void finalize_inverted_payload(
+        const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
+        const std::vector<InvPosition>& positions, uint32_t hog_length,
+        const std::vector<uint32_t>& covered_aa_v,
+        std::vector<uint8_t>& inv_raw, std::vector<uint8_t>& hog_cbuf,
+        std::vector<uint8_t>& sb_hdr, std::vector<uint8_t>& sb_acc,
+        std::vector<uint8_t>& sb_cnum, std::vector<uint8_t>& sb_codon,
+        ZSTD_CCtx* cctx, int level, uint64_t* ser_done_ns,
+        uint32_t& stored_sz, const uint8_t*& payload, size_t& payload_sz) {
+    inv_raw.clear();
+    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
+                             covered_aa_v, sb_hdr, sb_acc, sb_cnum, sb_codon);
+    if (ser_done_ns) *ser_done_ns = clock_ns();
+    size_t raw_sz = inv_raw.size();
+    size_t bound = ZSTD_compressBound(raw_sz);
+    hog_cbuf.resize(bound);
+    size_t csz = cctx ? ZSTD_compress2(cctx, hog_cbuf.data(), bound, inv_raw.data(), raw_sz)
+                      : ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, level);
+    bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
+    if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data();  payload_sz = raw_sz; }
+    else         { stored_sz = uint32_t(csz)   | 0x40000000u; payload = hog_cbuf.data(); payload_sz = csz; }
+}
+
 inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardScratch& sc,
                                                uint32_t n_accs, uint32_t hog_length,
                                                int out_zstd_level) {
@@ -469,16 +297,6 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
                   [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
     std::vector<uint32_t> local_accs(sc.seen_accs);
     std::sort(local_accs.begin(), local_accs.end());
-    auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
-        if (ivals.empty()) return 0;
-        std::sort(ivals.begin(), ivals.end());
-        uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
-        for (size_t k = 1; k < ivals.size(); ++k) {
-            if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
-            else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
-        }
-        return cov + ce - cs + 1;
-    };
     std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
     std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
     for (size_t li = 0; li < local_accs.size(); ++li) {
@@ -488,20 +306,10 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
         auto it3 = sc.acc_intervals_map.find(gacc);
         if (it3 != sc.acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
     }
-    auto& inv_raw  = sc.inv_raw;  inv_raw.clear();
-    auto& hog_cbuf = sc.hog_cbuf;
-    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
-                             covered_aa_v, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b);
-    size_t raw_sz = inv_raw.size();
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
-    {
-        size_t bound = ZSTD_compressBound(raw_sz);
-        hog_cbuf.resize(bound);
-        size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
-        bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
-        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
-        else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
-    }
+    finalize_inverted_payload(local_accs, local_acc_pident, positions, hog_length, covered_aa_v,
+                              sc.inv_raw, sc.hog_cbuf, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b,
+                              nullptr, out_zstd_level, nullptr, stored_sz, payload, payload_sz);
     res.stored_sz = stored_sz; res.n_accs = n_accs;
     res.payload.assign(payload, payload + payload_sz);
     return res;
@@ -1334,16 +1142,6 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
         // Build per-local-acc pident and covered_aa vectors from maps.
         // covered_aa = merged .lhb intervals + direct .lhg sum (shards are HOG-disjoint).
-        auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
-            if (ivals.empty()) return 0;
-            std::sort(ivals.begin(), ivals.end());
-            uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
-            for (size_t k = 1; k < ivals.size(); ++k) {
-                if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
-                else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
-            }
-            return cov + ce - cs + 1;
-        };
         std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
         std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
         for (size_t li = 0; li < local_accs.size(); ++li) {
@@ -1356,40 +1154,20 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             if (it3 != sc.acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
         }
 
-        // Serialize inverted block.
-        inv_raw.clear();
-        serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
-                                 sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf, sc.ser_codon_buf);
-        t_build_end = clock_ns();
-
-        tl_decode += t_dec_end - t0;
-        tl_build  += t_build_end - t_dec_end;
-
-        size_t raw_sz = inv_raw.size();
-        size_t payload_sz = 0;
-        uint32_t stored_sz = 0;
-        bool use_raw = false;
-
-        {
-            size_t bound = ZSTD_compressBound(raw_sz);
-            hog_cbuf.resize(bound);
-            size_t csz = ZSTD_compress2(cctx, hog_cbuf.data(), bound,
-                                        inv_raw.data(), raw_sz);
-            if (ZSTD_isError(csz))
-                throw std::runtime_error(std::string("zstd HOG compress: ") + ZSTD_getErrorName(csz));
-            use_raw = (csz >= raw_sz);
-            if (!use_raw) { payload_sz = csz; stored_sz = uint32_t(csz) | 0x40000000u; }
-        }
-        if (use_raw) { payload_sz = raw_sz; stored_sz = uint32_t(raw_sz) | 0x80000000u; }
-
+        // Serialize + compress the inverted block (shared with the spill build).
+        uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
+        finalize_inverted_payload(local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
+                                  inv_raw, hog_cbuf, sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf,
+                                  sc.ser_codon_buf, cctx, 0, &t_build_end, stored_sz, payload, payload_sz);
+        tl_decode   += t_dec_end - t0;
+        tl_build    += t_build_end - t_dec_end;
         tl_compress += clock_ns() - t_build_end;
 
         GroupResult& gr = results[g];
         gr.hog_id = hog_id;
         gr.n_accs = sc.n_accs;
         gr.stored_sz = stored_sz;
-        if (use_raw) gr.payload.assign(inv_raw.begin(), inv_raw.end());
-        else         gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + payload_sz);
+        gr.payload.assign(payload, payload + payload_sz);
         size_t psz = gr.payload.size();
         {
             std::unique_lock<std::mutex> lk(done_mtx);
