@@ -212,6 +212,9 @@ public:
 
     const std::unordered_map<std::string, std::vector<PartitionIndexExtent>>&
     index() const { return idx_; }
+    void clear_index() {
+        std::unordered_map<std::string, std::vector<PartitionIndexExtent>>().swap(idx_);
+    }
 };
 
 // Write the partition index: sorted hog_id → extents across N thread files.
@@ -260,6 +263,56 @@ inline void write_partition_index(
         if (r <= 0) throw std::runtime_error("write failed: " + out_path);
         done += size_t(r);
     }
+}
+
+// Write partition.idx by streaming each worker's index directly, freeing each as written.
+// A HOG appears once per thread that holds it; load_partition_index accumulates extents
+// per HOG across entries, so the header n_hogs is the TOTAL (thread,hog) entry count.
+// This avoids the merged-copy (global_idx) that doubled the index RAM at finalization.
+inline void write_partition_index_streamed(
+        std::vector<std::unique_ptr<PartitionWriter>>& writers,
+        uint32_t n_threads, const std::string& out_path) {
+    UniqueFd fd(::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    if (fd < 0) throw std::runtime_error("cannot create partition index: " + out_path);
+    auto write_all = [&](const uint8_t* p, size_t n) {
+        size_t done = 0;
+        while (done < n) { ssize_t r = ::write(fd, p + done, n - done);
+            if (r <= 0) throw std::runtime_error("write failed: " + out_path); done += size_t(r); }
+    };
+    uint64_t total_entries = 0;
+    for (uint32_t t = 0; t < n_threads; ++t) total_entries += writers[t]->index().size();
+
+    std::vector<uint8_t> buf; buf.reserve(34u * 1024 * 1024);
+    buf.insert(buf.end(), LHP_INDEX_MAGIC, LHP_INDEX_MAGIC + 4);
+    buf.push_back(LHP_INDEX_VERSION);
+    for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(n_threads >> (8 * i)));
+    uint32_t n_hogs = uint32_t(total_entries);
+    for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(n_hogs >> (8 * i)));
+
+    for (uint32_t t = 0; t < n_threads; ++t) {
+        for (const auto& [hog, exts] : writers[t]->index()) {
+            uint16_t hlen = uint16_t(hog.size());
+            const uint8_t* hp = reinterpret_cast<const uint8_t*>(&hlen);
+            buf.insert(buf.end(), hp, hp + 2);
+            buf.insert(buf.end(), hog.begin(), hog.end());
+            uint32_t ne = uint32_t(exts.size());
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(ne >> (8*i)));
+            for (const auto& e : exts) {
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(t           >> (8*i)));
+                for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.frame_off  >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.frame_csz  >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.other_off  >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.other_len  >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.bmp_off    >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.cdn_off    >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.acc_idx    >> (8*i)));
+                for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.n_records  >> (8*i)));
+            }
+            if (buf.size() >= 32u * 1024 * 1024) { write_all(buf.data(), buf.size()); buf.clear(); }
+        }
+        writers[t]->clear_index();   // release this worker's index now
+    }
+    if (!buf.empty()) write_all(buf.data(), buf.size());
 }
 
 // Load partition index. n_threads_out receives the number of tN.lhp files.
@@ -470,15 +523,13 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
     if (failed.load()) throw std::runtime_error("partition failed: " + err);
     if (input_paths.size() > 100) std::cerr << "\n";
 
-    // Merge per-thread sidecars into one sorted global index
-    std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
-    for (size_t t = 0; t < n_threads; ++t) {
-        for (const auto& [hog, extents] : writers[t]->index())
-            for (auto e : extents) { e.thread_idx = uint32_t(t); global_idx[hog].push_back(e); }
-    }
-    write_partition_index(global_idx, uint32_t(n_threads), out_dir + "/partition.idx");
+    // Stream each worker's index straight to partition.idx, freeing as written — avoids the
+    // merged-copy (global_idx) that doubled index RAM at finalization (the OOM driver).
+    size_t n_idx_entries = 0;
+    for (size_t t = 0; t < n_threads; ++t) n_idx_entries += writers[t]->index().size();
+    write_partition_index_streamed(writers, uint32_t(n_threads), out_dir + "/partition.idx");
 
-    std::cerr << "partition done: " << global_idx.size() << " HOGs, "
+    std::cerr << "partition done: " << n_idx_entries << " HOG index entries, "
               << accessions.size() << " accessions from " << input_paths.size()
               << " inputs → " << out_dir << "\n";
 }

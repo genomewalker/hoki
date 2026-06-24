@@ -441,7 +441,13 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         PartitionWriter& pw = *writers[tid];
         size_t mem_bytes    = 0;
         uint32_t rss_tick   = 0;
-        const size_t thr    = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold) / N;
+        // --flush is the total RSS budget. The flush is async double-buffered (one batch
+        // is compressed+written in the background while the next accumulates), so peak
+        // RSS ~= 2x the per-worker batch. Trigger at HALF the per-worker share so the
+        // in-flight snapshot + new accumulation together stay within budget; a frequent
+        // hard RSS guard (below) catches estimate undercount (dicts, arenas, fragmentation).
+        const size_t flush_total = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold);
+        const size_t thr         = std::max<size_t>(1, flush_total / (N * 2));
 
         // cctx is now owned by PartitionWriter; no per-worker CCtx needed here.
 
@@ -481,19 +487,20 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                 s.acc_idx     = uint32_t(ai * N + tid);
                 s.max_hog_idx = la.max_hog_idx;
 
-                // Save capacities before move so worker retains pre-allocated slabs.
-                size_t oc = la.obs_pool.capacity(),
-                       hc = la.rec_hdr.capacity(),
-                       gc = la.rec_hog.capacity();
-
+                // Move the slabs out (leaves la's vectors empty, capacity ~0) and RELEASE
+                // that capacity instead of re-reserving it. The old reserve() retained each
+                // accession's peak slab capacity for the whole run; with many accessions
+                // (contiguous in the input) that accumulated unbounded RSS across all
+                // ~50k LocalAccs — the real OOM driver, not --flush. Re-growth on reuse is
+                // cheap and only matters for interleaved accessions (rare here).
                 s.rec_hog        = std::move(la.rec_hog);
                 s.rec_hdr        = std::move(la.rec_hdr);
                 s.obs_pool       = std::move(la.obs_pool);
                 s.contig_strings = std::move(la.contig_strings);
 
-                la.obs_pool.reserve(oc);  la.tracked_obs_cap = oc;
-                la.rec_hdr.reserve(hc);   la.tracked_hdr_cap = hc;
-                la.rec_hog.reserve(gc);   la.tracked_hog_cap = gc;
+                la.obs_pool.shrink_to_fit();  la.tracked_obs_cap = 0;
+                la.rec_hdr.shrink_to_fit();   la.tracked_hdr_cap = 0;
+                la.rec_hog.shrink_to_fit();   la.tracked_hog_cap = 0;
                 la.contig_dict.clear();
                 la.max_hog_idx = 0;
                 snaps.push_back(std::move(s));
@@ -756,8 +763,16 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                 }
             }
 
-            if (mem_bytes > thr) flush();
-            else if (mem_bytes > thr / 4 && (++rss_tick & 0xFFF) == 0 && read_rss_bytes() / N > thr) flush();
+            if (mem_bytes > thr) {
+                flush();                                  // normal path: async double-buffer
+            } else if ((++rss_tick & 0xFF) == 0 && read_rss_bytes() > (flush_total * 4) / 5) {
+                // Hard RSS ceiling. The estimate undercounts (contig_strings, dicts, arenas),
+                // so this real-RSS check is the true bound. Flush SYNCHRONOUSLY — wait for the
+                // write to free the snapshot before accumulating again — otherwise the async
+                // snapshot stays resident while new data piles on and RSS blows past budget.
+                flush();
+                if (flush_future.valid()) flush_future.get();
+            }
         }; // end process lambda
 
         Batch batch;
