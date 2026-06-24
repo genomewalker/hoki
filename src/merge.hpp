@@ -154,7 +154,7 @@ inline ShardResult merge_shard_compute_extents(
         const std::vector<int>& thread_fds,
         ShardScratch& sc,
         const std::vector<const std::vector<uint32_t>*>& fd_acc_remap = {},
-        int out_zstd_level = 3) {
+        int out_zstd_level = 6) {
 
     ShardResult res;
     res.hog_id = hog_id;
@@ -341,7 +341,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int n_threads_override = 0,
                           bool do_profile = false,
                           int hot_threshold = 100,
-                          int out_zstd_level = 3) {
+                          int out_zstd_level = 6) {
     // out_zstd_level: ZSTD compression level (default 3)
 
     // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.
