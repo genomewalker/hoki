@@ -31,11 +31,11 @@
 namespace lhi {
 
 constexpr uint8_t LHP_FILE_MAGIC[4]   = {'L','H','G','P'};
-constexpr uint8_t LHP_VERSION         = 2;
+constexpr uint8_t LHP_VERSION         = 3;  // v3: VarNT contig_col delta-encoded, (contig,sstart) sort
 constexpr size_t  LHP_HEADER_SZ       = 8;  // magic(4)+ver(1)+flags(1)+pad(2)
 
 constexpr uint8_t LHP_INDEX_MAGIC[4]  = {'L','H','P','I'};
-constexpr uint8_t LHP_INDEX_VERSION   = 2; // v1 had uint16 n_extents; v2 uses uint32
+constexpr uint8_t LHP_INDEX_VERSION   = 3; // v1 had uint16 n_extents; v2 uses uint32; v3 frame-grouped
 
 #pragma pack(push, 1)
 struct PartitionEntry {
@@ -47,28 +47,38 @@ struct PartitionEntry {
 static_assert(sizeof(PartitionEntry) == 16);
 #pragma pack(pop)
 
-// Location of a single HOG's PartitionEntry+payload within a thread file.
-// entry_offset: byte offset inside tT.lhp of the PartitionEntry struct.
-// entry_len:    sizeof(PartitionEntry) + compressed_sz (pread length).
+// v3: frame-level pointers; acc_idx+n_records moved from PartitionEntry stream into index.
 struct PartitionIndexExtent {
     uint32_t thread_idx;
-    uint64_t entry_offset;
-    uint32_t entry_len;
-};
+    uint64_t frame_off;    // byte offset of compressed frame data in tN.lhp (after 4-byte csz prefix)
+    uint32_t frame_csz;    // compressed frame size
+    uint32_t hog_raw_off;  // byte offset of HOG raw data within decompressed frame
+    uint32_t hog_raw_len;  // byte length of HOG raw data within decompressed frame
+    uint32_t acc_idx;
+    uint32_t n_records;
+};  // 4+8+4+4+4+4+4 = 32 bytes
 
-// Per-thread sequential writer. Keeps one fd open for the whole scatter pass;
-// HOGs interleave into one sequential 8 MB-buffered stream.  A sidecar index
-// records extents so merge-shard can pread individual HOGs without opening 30K files.
+// Per-thread sequential writer. Batches raw VarNT payloads into groups, then
+// compresses each group as a single zstd frame. Bigger compression unit = better ratio.
+// .lhp format: [frame_csz(u32) | zstd_frame(frame_csz bytes)] repeated.
 class PartitionWriter {
-    static constexpr size_t BUF_CAP = 8u * 1024u * 1024u;
+    static constexpr size_t BUF_CAP          = 8u * 1024 * 1024;
+    static constexpr size_t FRAME_RAW_TARGET = 2u * 1024 * 1024;
 
     std::string path_;
-    int         fd_      = -1;
-    uint64_t    fpos_    = 0;   // bytes committed to disk
+    int         fd_    = -1;
+    uint64_t    fpos_  = 0;
     std::vector<uint8_t> buf_;
 
-    // hog_id → [(entry_offset, entry_len)]
-    std::unordered_map<std::string, std::vector<std::pair<uint64_t, uint32_t>>> idx_;
+    std::vector<uint8_t> frame_raw_;
+    struct PendingHog { std::string hog_id; uint32_t acc_idx, n_records, raw_off, raw_len; };
+    std::vector<PendingHog> pending_;
+    std::vector<uint8_t>    cbuf_;
+
+    ZSTD_CCtx* cctx_  = nullptr;
+    int        level_  = 3;
+
+    std::unordered_map<std::string, std::vector<PartitionIndexExtent>> idx_;
 
     void do_write(const uint8_t* p, size_t n) {
         size_t done = 0;
@@ -85,13 +95,40 @@ class PartitionWriter {
             buf_.clear();
         }
     }
+    void flush_frame() {
+        if (pending_.empty()) return;
+        size_t bound = ZSTD_compressBound(frame_raw_.size());
+        cbuf_.resize(bound);
+        ZSTD_CCtx_setParameter(cctx_, ZSTD_c_compressionLevel, level_);
+        ZSTD_CCtx_setParameter(cctx_, ZSTD_c_checksumFlag, 1);
+        size_t csz = ZSTD_compress2(cctx_, cbuf_.data(), bound,
+                                     frame_raw_.data(), frame_raw_.size());
+        if (ZSTD_isError(csz))
+            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
+        cbuf_.resize(csz);
+        uint64_t frame_off = fpos_ + uint64_t(buf_.size()) + 4;
+        uint32_t u32csz = uint32_t(csz);
+        const uint8_t* lp = reinterpret_cast<const uint8_t*>(&u32csz);
+        buf_.insert(buf_.end(), lp, lp + 4);
+        buf_.insert(buf_.end(), cbuf_.data(), cbuf_.data() + csz);
+        maybe_flush();
+        for (auto& ph : pending_)
+            idx_[ph.hog_id].push_back({0u, frame_off, u32csz,
+                                        ph.raw_off, ph.raw_len, ph.acc_idx, ph.n_records});
+        frame_raw_.clear();
+        pending_.clear();
+    }
 
 public:
-    explicit PartitionWriter(const std::string& path) : path_(path) {
+    explicit PartitionWriter(const std::string& path, int level = 3)
+        : path_(path), level_(level)
+    {
         fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd_ < 0)
             throw std::runtime_error("cannot create: " + path + ": " + strerror(errno));
+        cctx_ = ZSTD_createCCtx();
         buf_.reserve(BUF_CAP + 256 * 1024);
+        frame_raw_.reserve(FRAME_RAW_TARGET + 512 * 1024);
     }
     ~PartitionWriter() {
         if (fd_ >= 0) {
@@ -99,30 +136,21 @@ public:
             ::close(fd_);
             fd_ = -1;
         }
+        if (cctx_) { ZSTD_freeCCtx(cctx_); cctx_ = nullptr; }
     }
     PartitionWriter(const PartitionWriter&) = delete;
     PartitionWriter& operator=(const PartitionWriter&) = delete;
 
-    void append(const std::string& hog_id, const PartitionEntry& ent,
-                const uint8_t* payload) {
-        uint16_t hlen = uint16_t(hog_id.size());
-        // entry_offset: where PartitionEntry lands in the file (after hog_id prefix)
-        uint64_t entry_offset = fpos_ + uint64_t(buf_.size()) + 2 + hlen;
-        uint32_t entry_len    = uint32_t(sizeof(PartitionEntry)) + ent.compressed_sz;
-        idx_[hog_id].emplace_back(entry_offset, entry_len);
-
-        const uint8_t* hp = reinterpret_cast<const uint8_t*>(&hlen);
-        buf_.insert(buf_.end(), hp, hp + 2);
-        buf_.insert(buf_.end(),
-                    reinterpret_cast<const uint8_t*>(hog_id.data()),
-                    reinterpret_cast<const uint8_t*>(hog_id.data()) + hlen);
-        const uint8_t* ep = reinterpret_cast<const uint8_t*>(&ent);
-        buf_.insert(buf_.end(), ep, ep + sizeof(PartitionEntry));
-        buf_.insert(buf_.end(), payload, payload + ent.compressed_sz);
-        maybe_flush();
+    void append_raw(const std::string& hog_id, uint32_t acc_idx, uint32_t n_records,
+                    const uint8_t* raw, uint32_t raw_len) {
+        pending_.push_back({hog_id, acc_idx, n_records,
+                            uint32_t(frame_raw_.size()), raw_len});
+        frame_raw_.insert(frame_raw_.end(), raw, raw + raw_len);
+        if (frame_raw_.size() >= FRAME_RAW_TARGET) flush_frame();
     }
 
     void flush_all() {
+        flush_frame();
         if (!buf_.empty()) {
             do_write(buf_.data(), buf_.size());
             fpos_ += buf_.size();
@@ -130,21 +158,20 @@ public:
         }
     }
 
-    const std::unordered_map<std::string, std::vector<std::pair<uint64_t, uint32_t>>>&
+    const std::unordered_map<std::string, std::vector<PartitionIndexExtent>>&
     index() const { return idx_; }
 };
 
 // Write the partition index: sorted hog_id → extents across N thread files.
-// Binary format v2: LHP_INDEX_MAGIC(4) + version(1) + n_threads(u32) + n_hogs(u32)
+// Binary format v3: LHP_INDEX_MAGIC(4) + version(1) + n_threads(u32) + n_hogs(u32)
 //   per HOG: hog_id_len(u16) + hog_id + n_extents(u32)
-//     per extent: thread_idx(u32) + entry_offset(u64) + entry_len(u32)  [16 bytes]
-// v1 used n_extents(u16); v2 widens to u32 to support >65535 extents per HOG.
+//     per extent: thread_idx(u32)+frame_off(u64)+frame_csz(u32)+hog_raw_off(u32)+hog_raw_len(u32)+acc_idx(u32)+n_records(u32) [32 bytes]
 inline void write_partition_index(
         const std::map<std::string, std::vector<PartitionIndexExtent>>& idx,
         uint32_t n_threads,
         const std::string& out_path) {
     std::vector<uint8_t> buf;
-    buf.reserve(idx.size() * 36 + 16);
+    buf.reserve(idx.size() * 52 + 16);
 
     buf.insert(buf.end(), LHP_INDEX_MAGIC, LHP_INDEX_MAGIC + 4);
     buf.push_back(LHP_INDEX_VERSION);
@@ -160,9 +187,13 @@ inline void write_partition_index(
         uint32_t ne = uint32_t(exts.size());
         for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(ne >> (8*i)));
         for (const auto& e : exts) {
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.thread_idx   >> (8 * i)));
-            for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.entry_offset >> (8 * i)));
-            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.entry_len    >> (8 * i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.thread_idx  >> (8*i)));
+            for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.frame_off   >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.frame_csz   >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.hog_raw_off >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.hog_raw_len >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.acc_idx     >> (8*i)));
+            for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(e.n_records   >> (8*i)));
         }
     }
 
@@ -188,8 +219,8 @@ load_partition_index(const std::string& path, uint32_t& n_threads_out) {
         throw std::runtime_error("truncated partition index: " + path);
     if (buf.size() < 13 || memcmp(buf.data(), LHP_INDEX_MAGIC, 4) != 0)
         throw std::runtime_error("bad partition index magic: " + path);
-    if (buf[4] == 1)
-        throw std::runtime_error("partition index v1 (uint16 extents) not supported — re-run ingest: " + path);
+    if (buf[4] == 1 || buf[4] == 2)
+        throw std::runtime_error("partition index v1/v2 not supported — re-run ingest: " + path);
     if (buf[4] != LHP_INDEX_VERSION)
         throw std::runtime_error("unsupported partition index version " + std::to_string(buf[4]) + ": " + path);
 
@@ -209,13 +240,17 @@ load_partition_index(const std::string& path, uint32_t& n_threads_out) {
         auto& exts = idx[hog_id];
         exts.reserve(ne);
         for (uint32_t ei = 0; ei < ne; ++ei) {
-            if (cur + 16 > eof) throw std::runtime_error("truncated partition index (extent)");
+            if (cur + 32 > eof) throw std::runtime_error("truncated partition index (extent)");
             PartitionIndexExtent ext;
             ext.thread_idx   = read_u32_le(cur); cur += 4;
-            ext.entry_offset = 0;
-            for (int i = 0; i < 8; ++i) ext.entry_offset |= (uint64_t(cur[i]) << (8 * i));
+            ext.frame_off    = 0;
+            for (int i = 0; i < 8; ++i) ext.frame_off |= (uint64_t(cur[i]) << (8*i));
             cur += 8;
-            ext.entry_len    = read_u32_le(cur); cur += 4;
+            ext.frame_csz    = read_u32_le(cur); cur += 4;
+            ext.hog_raw_off  = read_u32_le(cur); cur += 4;
+            ext.hog_raw_len  = read_u32_le(cur); cur += 4;
+            ext.acc_idx      = read_u32_le(cur); cur += 4;
+            ext.n_records    = read_u32_le(cur); cur += 4;
             exts.push_back(ext);
         }
     }
@@ -325,7 +360,8 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
         writers[tid] = std::make_unique<PartitionWriter>(
             out_dir + "/t" + std::to_string(tid) + ".lhp");
         auto& w = *writers[tid];
-        std::vector<uint8_t> payload;
+        std::vector<uint8_t> cbuf, raw;
+        ZSTD_DCtx* dctx = ZSTD_createDCtx();
         for (;;) {
             size_t fi = next.fetch_add(1, std::memory_order_relaxed);
             if (fi >= input_paths.size() || failed.load(std::memory_order_relaxed)) break;
@@ -342,17 +378,17 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
                         cur_idx = it->second;
                     },
                     [&](BatchBlockRef br) {
-                        PartitionEntry ent;
-                        ent.acc_idx       = cur_idx;
-                        ent.compressed_sz = br.compressed_sz;
-                        ent.raw_sz        = br.raw_sz;
-                        ent.n_records     = 0;
-                        payload.resize(br.compressed_sz);
+                        cbuf.resize(br.compressed_sz);
                         off_t pay_off = br.shard_hdr_offset + 28;
-                        if (::pread(sfd, payload.data(), br.compressed_sz, pay_off)
+                        if (::pread(sfd, cbuf.data(), br.compressed_sz, pay_off)
                                 != ssize_t(br.compressed_sz))
                             throw std::runtime_error("pread payload failed: " + input_paths[fi]);
-                        w.append(br.hog_id, ent, payload.data());
+                        raw.resize(br.raw_sz);
+                        size_t rz = ZSTD_decompressDCtx(dctx, raw.data(), br.raw_sz,
+                                                         cbuf.data(), br.compressed_sz);
+                        if (ZSTD_isError(rz))
+                            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(rz));
+                        w.append_raw(br.hog_id, cur_idx, 0, raw.data(), uint32_t(rz));
                     });
                 if (!ok) throw std::runtime_error("cannot open batch: " + input_paths[fi]);
             } catch (const std::exception& e) {
@@ -364,6 +400,7 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
                 std::fprintf(stderr, "  partitioned %zu/%zu inputs\r", fi + 1, input_paths.size());
         }
         w.flush_all();
+        ZSTD_freeDCtx(dctx);
     };
 
     {
@@ -379,11 +416,8 @@ inline void partition_lhbs(const std::vector<std::string>& input_paths,
     // Merge per-thread sidecars into one sorted global index
     std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
     for (size_t t = 0; t < n_threads; ++t) {
-        for (const auto& [hog, extents] : writers[t]->index()) {
-            auto& ge = global_idx[hog];
-            for (const auto& [off, len] : extents)
-                ge.push_back({uint32_t(t), off, len});
-        }
+        for (const auto& [hog, extents] : writers[t]->index())
+            for (auto e : extents) { e.thread_idx = uint32_t(t); global_idx[hog].push_back(e); }
     }
     write_partition_index(global_idx, uint32_t(n_threads), out_dir + "/partition.idx");
 

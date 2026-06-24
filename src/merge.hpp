@@ -187,32 +187,32 @@ inline ShardResult merge_shard_compute_extents(
         if (ext.thread_idx >= thread_fds.size())
             throw std::runtime_error("extent thread_idx OOB for HOG " + hog_id);
         int tfd = thread_fds[ext.thread_idx];
-        extent_buf.resize(ext.entry_len);
-        if (::pread(tfd, extent_buf.data(), ext.entry_len, off_t(ext.entry_offset))
-                != ssize_t(ext.entry_len))
-            throw std::runtime_error("pread extent failed for HOG " + hog_id);
 
-        if (ext.entry_len < sizeof(PartitionEntry))
-            throw std::runtime_error("extent too small for HOG " + hog_id);
-        PartitionEntry ent;
-        memcpy(&ent, extent_buf.data(), sizeof(PartitionEntry));
-        if (!fd_acc_remap.empty() && ext.thread_idx < fd_acc_remap.size()
-                && fd_acc_remap[ext.thread_idx]) {
-            const auto& rm = *fd_acc_remap[ext.thread_idx];
-            if (ent.acc_idx < rm.size()) ent.acc_idx = rm[ent.acc_idx];
-        }
-        if (ent.raw_sz > 512u * 1024 * 1024)
-            throw std::runtime_error("raw_sz OOB for HOG " + hog_id);
-        const uint8_t* cdata = extent_buf.data() + sizeof(PartitionEntry);
-        uint32_t acc_idx = ent.acc_idx;
+        // Read and decompress the grouped frame
+        extent_buf.resize(ext.frame_csz);
+        if (::pread(tfd, extent_buf.data(), ext.frame_csz, off_t(ext.frame_off))
+                != ssize_t(ext.frame_csz))
+            throw std::runtime_error("pread frame failed for HOG " + hog_id);
 
-        raw_block.resize(ent.raw_sz);
-        size_t rz = ZSTD_decompressDCtx(sc.dctx, raw_block.data(), ent.raw_sz, cdata, ent.compressed_sz);
+        uint64_t frame_rsz = ZSTD_getFrameContentSize(extent_buf.data(), ext.frame_csz);
+        if (frame_rsz == ZSTD_CONTENTSIZE_UNKNOWN || frame_rsz == ZSTD_CONTENTSIZE_ERROR)
+            throw std::runtime_error("bad frame content size for HOG " + hog_id);
+        raw_block.resize(size_t(frame_rsz));
+        size_t rz = ZSTD_decompressDCtx(sc.dctx, raw_block.data(), size_t(frame_rsz),
+                                          extent_buf.data(), ext.frame_csz);
         if (ZSTD_isError(rz))
             throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(rz));
 
-        const uint8_t* p   = raw_block.data();
-        const uint8_t* end = p + rz;
+        uint32_t acc_idx = ext.acc_idx;
+        if (!fd_acc_remap.empty() && ext.thread_idx < fd_acc_remap.size()
+                && fd_acc_remap[ext.thread_idx]) {
+            const auto& rm = *fd_acc_remap[ext.thread_idx];
+            if (acc_idx < rm.size()) acc_idx = rm[acc_idx];
+        }
+
+        // Extract this HOG's raw slice from the decompressed frame
+        const uint8_t* p   = raw_block.data() + ext.hog_raw_off;
+        const uint8_t* end = p + ext.hog_raw_len;
         uint32_t n_contigs = 0;
         int n = read_varint(p, end, &n_contigs);
         if (!n) throw std::runtime_error("corrupt contig dict for HOG " + hog_id);

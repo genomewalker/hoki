@@ -103,6 +103,35 @@ inline ShardPayload compress_shard_payload(
     return sp;
 }
 
+// Remap contig indices global→local, serialize contig dict + VarNT block into raw bytes.
+// Same as the first 3 steps of compress_shard_payload but without the zstd compression step.
+inline std::vector<uint8_t> serialize_shard_raw(
+        const std::vector<std::string>& global_contigs,
+        std::vector<VarNTRecord>& recs) {
+    std::unordered_map<uint32_t, uint32_t> g2l;
+    std::vector<std::string> local_contigs;
+    for (auto& r : recs) {
+        if (!g2l.count(r.contig_idx)) {
+            g2l[r.contig_idx] = uint32_t(local_contigs.size());
+            local_contigs.push_back(global_contigs[r.contig_idx]);
+        }
+    }
+    for (auto& r : recs) r.contig_idx = g2l.at(r.contig_idx);
+
+    size_t raw_est = 5;
+    for (auto& s : local_contigs) raw_est += 5 + s.size();
+    raw_est += recs.size() * 64;
+    std::vector<uint8_t> raw;
+    raw.reserve(raw_est);
+    write_varint(raw, uint32_t(local_contigs.size()));
+    for (auto& s : local_contigs) {
+        write_varint(raw, uint32_t(s.size()));
+        raw.insert(raw.end(), s.begin(), s.end());
+    }
+    serialize_varnt_block(raw, std::move(recs));
+    return raw;
+}
+
 // Serialize local contig dict + VarNT block, compress, write to open fd (for .lhb).
 inline void write_shard_block(int fd,
                                const std::vector<std::string>& global_contigs,

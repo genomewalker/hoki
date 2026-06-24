@@ -144,7 +144,7 @@ inline void ingest_st(const std::string& tsv_path, const std::string& out_dir,
         return idx;
     };
 
-    PartitionWriter pw(out_dir + "/t0.lhp");
+    PartitionWriter pw(out_dir + "/t0.lhp", opts.zstd_level);
     size_t mem_bytes = 0;
     uint64_t n_flushes = 0;
 
@@ -152,9 +152,8 @@ inline void ingest_st(const std::string& tsv_path, const std::string& out_dir,
         for (auto& [acc, st] : acc_states) {
             for (auto& [hog_idx, batch] : st.batches) {
                 if (batch.empty()) continue;
-                auto sp = compress_shard_payload(st.contig_strings, batch, opts.zstd_level);
-                PartitionEntry ent{st.acc_idx, uint32_t(sp.cbuf.size()), sp.raw_sz, sp.n_records};
-                pw.append(hog_strings[hog_idx], ent, sp.cbuf.data());
+                auto raw = serialize_shard_raw(st.contig_strings, batch);
+                pw.append_raw(hog_strings[hog_idx], st.acc_idx, uint32_t(batch.size()), raw.data(), uint32_t(raw.size()));
             }
             st.batches.clear();
             st.contig_dict.clear();
@@ -324,8 +323,7 @@ inline void ingest_st(const std::string& tsv_path, const std::string& out_dir,
 
     std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
     for (const auto& [hog, extents] : pw.index())
-        for (const auto& [off, len] : extents)
-            global_idx[hog].push_back({0u, off, len});
+        for (auto e : extents) { e.thread_idx = 0u; global_idx[hog].push_back(e); }
     write_partition_index(global_idx, 1u, out_dir + "/partition.idx");
 
     std::cerr << "ingest: " << n_written << " records, " << n_skipped << " skipped, "
@@ -408,11 +406,11 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     std::vector<std::unique_ptr<PartitionWriter>> writers(N);
     for (size_t t = 0; t < N; ++t)
         writers[t] = std::make_unique<PartitionWriter>(
-            out_dir + "/t" + std::to_string(t) + ".lhp");
+            out_dir + "/t" + std::to_string(t) + ".lhp", opts.zstd_level);
 
     // ── Per-worker aggregate counters ────────────────────────────────────────
     std::vector<uint64_t> w_written(N,0), w_skipped(N,0), w_obs_dropped(N,0);
-    std::vector<uint64_t> w_stall_ns(N,0), w_zstd_ns(N,0), w_queue_ns(N,0);
+    std::vector<uint64_t> w_stall_ns(N,0), w_queue_ns(N,0);
 
     // ── Worker lambda ─────────────────────────────────────────────────────────
     auto do_worker = [&](size_t tid) {
@@ -445,8 +443,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         uint32_t rss_tick   = 0;
         const size_t thr    = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold) / N;
 
-        // Persistent CCtx: reused across all flush cycles, freed at end of worker.
-        ZSTD_CCtx* cctx = ZSTD_createCCtx();
+        // cctx is now owned by PartitionWriter; no per-worker CCtx needed here.
 
         auto intern = [](SvDict& d, std::vector<std::string>& v, std::string_view s) -> uint32_t {
             auto it = d.find(s);
@@ -460,7 +457,6 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         std::vector<uint32_t>    sort_counts, sort_order, scatter_pos;  // reused across flushes
         std::future<void>        flush_future;
         uint64_t& n_stall_ns = w_stall_ns[tid];
-        uint64_t* p_zstd_ns  = &w_zstd_ns[tid];
         uint64_t& n_queue_ns = w_queue_ns[tid];
         AlignedResult ar_buf;
 
@@ -515,25 +511,17 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             auto so  = std::move(sort_order);
             auto sp  = std::move(scatter_pos);
 
-            // Hand old CCtx to async thread; worker creates a fresh one immediately.
-            ZSTD_CCtx* actx = cctx;
-            cctx = ZSTD_createCCtx();
-            int zlvl = opts.zstd_level;
-
             flush_future = std::async(std::launch::async,
                 [snaps = std::move(snaps), hog = std::move(hog_snap),
                  sc = std::move(sc), so = std::move(so), sp = std::move(sp),
-                 actx, &pw, zlvl, p_zstd_ns_out=p_zstd_ns]() mutable {
+                 &pw]() mutable {
                     // Reusable buffers — grown to HWM across the entire async batch
                     std::vector<uint32_t> present, sort_scratch;
                     std::vector<uint64_t> sk;                       // Win 2: packed sort keys
                     std::vector<uint32_t> g2l_slot, g2l_gen, local_gids;  // Win 1: flat g2l
                     uint32_t              g2l_cur = 0;
                     std::vector<uint8_t>  raw_buf, cc_col, ss_col, span_col,
-                                          qf_col,  pi_col, ev_col, bmp_col, cdn_col, cbuf;
-                    uint64_t              zstd_ns = 0;
-                    ZSTD_CCtx_setParameter(actx, ZSTD_c_compressionLevel, zlvl);
-                    ZSTD_CCtx_setParameter(actx, ZSTD_c_checksumFlag, 1);
+                                          qf_col,  pi_col, ev_col, bmp_col, cdn_col;
                     for (auto& s : snaps) {
                         // Grow flat g2l arrays to cover all contig indices this snap
                         if (g2l_slot.size() < s.contig_strings.size()) {
@@ -618,21 +606,9 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                             raw_buf.insert(raw_buf.end(), bmp_col.begin(),  bmp_col.end());
                             raw_buf.insert(raw_buf.end(), cdn_col.begin(),  cdn_col.end());
 
-                            size_t bound = ZSTD_compressBound(raw_buf.size());
-                            cbuf.resize(bound);
-                            auto _zt0 = std::chrono::steady_clock::now();
-                            size_t csz = ZSTD_compress2(actx, cbuf.data(), bound, raw_buf.data(), raw_buf.size());
-                            zstd_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_zt0).count());
-                            if (ZSTD_isError(csz))
-                                throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(csz));
-                            cbuf.resize(csz);
-
-                            PartitionEntry ent{s.acc_idx, uint32_t(csz), uint32_t(raw_buf.size()), N};
-                            pw.append(hog[h], ent, cbuf.data());
+                            pw.append_raw(hog[h], s.acc_idx, N, raw_buf.data(), uint32_t(raw_buf.size()));
                         }
                     }
-                    *p_zstd_ns_out = zstd_ns;
-                    ZSTD_freeCCtx(actx);
                 });
         };
 
@@ -783,7 +759,6 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         if (mem_bytes > 0) flush();
         if (flush_future.valid()) { auto _t0=std::chrono::steady_clock::now(); flush_future.get(); n_stall_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t0).count()); }
         pw.flush_all();
-        ZSTD_freeCCtx(cctx);
     };
 
     // ── Launch workers ────────────────────────────────────────────────────────
@@ -847,11 +822,9 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
     // ── Merge per-worker sidecars → partition.idx ─────────────────────────────
     std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
-    for (size_t t = 0; t < N; ++t) {
+    for (size_t t = 0; t < N; ++t)
         for (const auto& [hog, extents] : writers[t]->index())
-            for (const auto& [off, len] : extents)
-                global_idx[hog].push_back({uint32_t(t), off, len});
-    }
+            for (auto e : extents) { e.thread_idx = uint32_t(t); global_idx[hog].push_back(e); }
     write_partition_index(global_idx, uint32_t(N), out_dir + "/partition.idx");
     write_acc_registry(acc_vec, out_dir + "/acc.registry");
 
@@ -871,12 +844,10 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     double skew = wmax ? double(wmax)/double(tot_written/N) : 1.0;
     std::cerr << "] skew=" << std::fixed << std::setprecision(2) << skew
               << "× (max/avg, ideal=1.00)\n";
-    uint64_t tot_stall=0, tot_zstd=0, tot_queue=0;
-    for (size_t t=0;t<N;++t){ tot_stall+=w_stall_ns[t]; tot_zstd+=w_zstd_ns[t]; tot_queue+=w_queue_ns[t]; }
+    uint64_t tot_stall=0, tot_queue=0;
+    for (size_t t=0;t<N;++t){ tot_stall+=w_stall_ns[t]; tot_queue+=w_queue_ns[t]; }
     std::cerr << "ingest: flush stall " << tot_stall/1000000 << " ms total ("
               << tot_stall/1000000/N << " ms/worker avg)";
-    if (tot_zstd) std::cerr << " | zstd " << tot_zstd/1000000 << " ms ("
-                            << int(100.0*tot_zstd/std::max(uint64_t(1),tot_stall+tot_zstd)) << "% of flush)";
     if (tot_queue) std::cerr << "\ningest: input-stall " << tot_queue/1000000
                              << " ms total (" << tot_queue/1000000/N << " ms/worker avg)";
     std::cerr << "\n";

@@ -152,9 +152,12 @@ inline void serialize_varnt_block(std::vector<uint8_t>& raw,
                                    std::vector<VarNTRecord>&& recs) {
     const size_t N = recs.size();
 
-    // sstart-sorted → monotone column enables delta encoding; recs is moved-in.
-    std::stable_sort(recs.begin(), recs.end(),
-        [](const VarNTRecord& a, const VarNTRecord& b) { return a.sstart < b.sstart; });
+    // (contig_idx,sstart)-sorted → contig_col collapses to near-zero deltas; sstart_col
+    // stays monotone within each contig run (cross-boundary reset handled in loop below).
+    std::stable_sort(recs.begin(), recs.end(), [](const VarNTRecord& a, const VarNTRecord& b) {
+        return a.contig_idx < b.contig_idx ||
+               (a.contig_idx == b.contig_idx && a.sstart < b.sstart);
+    });
 
     std::vector<uint8_t> contig_col, sstart_col, span_col, qframe_col,
                          pident_col, evalue_col, bmp_buf;
@@ -166,10 +169,12 @@ inline void serialize_varnt_block(std::vector<uint8_t>& raw,
     bmp_buf.reserve(N * 16);
     cdn_idx.reserve(N * 8);
 
-    uint32_t prev_sstart = 0;
+    uint32_t prev_sstart = 0, prev_contig = 0;
     for (const auto& r : recs) {
-        write_varint(contig_col, r.contig_idx);
-        write_varint(sstart_col, r.sstart - prev_sstart);  // delta; first = absolute
+        uint32_t dc = r.contig_idx - prev_contig;
+        write_varint(contig_col, dc);
+        if (dc) { prev_sstart = 0; prev_contig = r.contig_idx; }
+        write_varint(sstart_col, r.sstart - prev_sstart);
         prev_sstart = r.sstart;
         uint32_t span = r.send - r.sstart + 1;
         write_varint(span_col, span);
@@ -234,13 +239,15 @@ inline bool deserialize_varnt_block(const uint8_t* p, const uint8_t* end,
     size_t cdn_off = 0;
 
     out.resize(n_recs);
-    uint32_t prev_sstart = 0;
+    uint32_t prev_sstart = 0, prev_contig = 0;
     for (uint32_t i = 0; i < n_recs; ++i) {
         auto& r = out[i];
-        uint32_t ci = 0;
-        n = read_varint(contig_ptr, contig_end, &ci); if (!n) return false;
+        uint32_t dc = 0;
+        n = read_varint(contig_ptr, contig_end, &dc); if (!n) return false;
         contig_ptr += n;
-        r.contig_idx = ci;
+        prev_contig += dc;
+        r.contig_idx = prev_contig;
+        if (dc) prev_sstart = 0;
 
         uint32_t dss = 0;
         n = read_varint(sstart_ptr, sstart_end, &dss); if (!n) return false;
