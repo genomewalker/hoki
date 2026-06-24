@@ -99,11 +99,20 @@ int main(int argc, char* argv[]) {
         bool do_profile = false;
         int hot_threshold = 100;
         int out_compress_level = 6;
+        size_t mem_budget = 16ull << 30;
         std::vector<std::string> pos;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "--hog-range" && i+2 < argc) { hog_start = argv[++i]; hog_end = argv[++i]; }
             else if (a == "-zo" && i+1 < argc)              out_compress_level= std::stoi(argv[++i]);
+            else if (a == "--flush" && i+1 < argc) {
+                std::string sv = argv[++i]; size_t mul = 1;
+                if (!sv.empty()) { char c = sv.back();
+                    if (c=='K'||c=='k') mul=1ull<<10; else if (c=='M'||c=='m') mul=1ull<<20;
+                    else if (c=='G'||c=='g') mul=1ull<<30; else if (c=='T'||c=='t') mul=1ull<<40;
+                    if (mul>1) sv.pop_back(); }
+                mem_budget = std::stoull(sv) * mul;
+            }
             else if (a == "--buckets" && i+1 < argc)        n_buckets         = std::stoi(argv[++i]);
             else if (a == "-t"        && i+1 < argc)        n_threads         = std::stoi(argv[++i]);
             else if (a == "--profile")                      do_profile        = true;
@@ -136,7 +145,8 @@ int main(int argc, char* argv[]) {
             }
         }
         lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end,
-                           n_buckets, n_threads, do_profile, hot_threshold, out_compress_level);
+                           n_buckets, n_threads, do_profile, hot_threshold, out_compress_level,
+                           mem_budget);
         return 0;
     }
 

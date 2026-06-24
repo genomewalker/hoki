@@ -23,6 +23,7 @@
 #include <deque>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <cstdint>
@@ -698,7 +699,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int n_threads_override = 0,
                           bool do_profile = false,
                           int hot_threshold = 100,
-                          int out_zstd_level = 6) {
+                          int out_zstd_level = 6,
+                          size_t mem_budget = 16ull << 30) {
     // out_zstd_level: ZSTD compression level (default 3)
 
     // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.
@@ -948,9 +950,19 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             throw std::runtime_error("write header failed: " + bk.lhg_path);
     }
 
-    std::unique_ptr<std::atomic<bool>[]> result_ready(new std::atomic<bool>[n_groups]);
-    for (size_t i = 0; i < n_groups; ++i)
-        result_ready[i].store(false, std::memory_order_relaxed);
+    std::atomic<bool> failed{false};
+    std::string first_error;
+    std::mutex err_mtx;
+
+    // Completion-order, memory-bounded output: workers push finished group ids; the writer
+    // drains them in COMPLETION order (not index order) and frees each payload immediately.
+    // A byte budget throttles workers when too much output is pending unwritten, so peak RAM
+    // is bounded regardless of the final .lhg size (vs the old all-results-resident model).
+    std::deque<size_t>      done_q;
+    std::mutex              done_mtx;
+    std::condition_variable done_cv;     // writer wakeup
+    std::condition_variable space_cv;    // worker backpressure release
+    size_t                  unwritten_bytes = 0;
 
     // Per-worker reusable containers — cleared (not reallocated) per group.
     struct WorkerScratch {
@@ -1378,13 +1390,19 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         gr.stored_sz = stored_sz;
         if (use_raw) gr.payload.assign(inv_raw.begin(), inv_raw.end());
         else         gr.payload.assign(hog_cbuf.begin(), hog_cbuf.begin() + payload_sz);
-        result_ready[g].store(true, std::memory_order_release);
+        size_t psz = gr.payload.size();
+        {
+            std::unique_lock<std::mutex> lk(done_mtx);
+            space_cv.wait(lk, [&]{ return unwritten_bytes <= mem_budget ||
+                                          failed.load(std::memory_order_relaxed); });
+            done_q.push_back(g);
+            unwritten_bytes += psz;
+        }
+        done_cv.notify_one();
     };
 
     std::atomic<size_t> next_group{0};
-    std::atomic<bool> failed{false};
-    std::string first_error;
-    std::mutex err_mtx;
+    // (failed/first_error/err_mtx hoisted above process_group)
     size_t hw = std::thread::hardware_concurrency();
     size_t default_threads = std::min<size_t>(32u, hw);
     size_t n_threads = (n_threads_override > 0)
@@ -1407,8 +1425,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
                                   scratch, tl_decode, tl_build, tl_compress);
                 } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lk(err_mtx);
-                    if (!failed.exchange(true)) first_error = e.what();
+                    { std::lock_guard<std::mutex> lk(err_mtx);
+                      if (!failed.exchange(true)) first_error = e.what(); }
+                    done_cv.notify_all(); space_cv.notify_all();
                     break;
                 }
                 continue;
@@ -1422,8 +1441,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             if (got) {
                 try { decode_one_block(dt.g, dt.bi); }
                 catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lk(err_mtx);
-                    if (!failed.exchange(true)) first_error = e.what();
+                    { std::lock_guard<std::mutex> lk(err_mtx);
+                      if (!failed.exchange(true)) first_error = e.what(); }
+                    done_cv.notify_all(); space_cv.notify_all();
                     break;
                 }
                 continue;
@@ -1445,11 +1465,17 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     std::string writer_error;
     auto writer_fn = [&]() {
         try {
-            for (size_t g = 0; g < n_groups; ++g) {
-                while (!result_ready[g].load(std::memory_order_acquire)) {
-                    if (failed.load(std::memory_order_relaxed)) return;
-                    std::this_thread::yield();
+            size_t written = 0;
+            while (written < n_groups) {
+                size_t g;
+                {
+                    std::unique_lock<std::mutex> lk(done_mtx);
+                    done_cv.wait(lk, [&]{ return !done_q.empty() ||
+                                                 failed.load(std::memory_order_relaxed); });
+                    if (done_q.empty()) return;   // failed with nothing left to drain
+                    g = done_q.front(); done_q.pop_front();
                 }
+                ++written;
                 GroupResult& gr = results[g];
                 BucketOut&   bk = buckets[group_bucket[g]];
                 uint64_t off = bk.write_pos;
@@ -1462,12 +1488,16 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 bk.write_pos += gr.payload.size();
                 bk.index_entries.push_back(
                     {std::move(gr.hog_id), off, bk.write_pos - off, gr.n_accs});
-                { std::vector<uint8_t>().swap(gr.payload); }
+                size_t psz = gr.payload.size();
+                std::vector<uint8_t>().swap(gr.payload);
+                { std::lock_guard<std::mutex> lk(done_mtx); unwritten_bytes -= psz; }
+                space_cv.notify_all();
             }
             for (auto& bk : buckets) bk.wbuf.flush_to(bk.lhg_fd, bk.lhg_path);
         } catch (const std::exception& e) {
             writer_error = e.what();
             failed.store(true, std::memory_order_relaxed);
+            space_cv.notify_all();
         }
     };
 
