@@ -86,7 +86,7 @@ inline bool split_raw_block(const uint8_t* raw, uint32_t raw_len,
 // Frame layout: [other_sec_len(u32) | bmp_sec_len(u32) | other_sec | bmp_sec | cdn_sec]
 class PartitionWriter {
     static constexpr size_t BUF_CAP          = 8u * 1024 * 1024;
-    static constexpr size_t FRAME_RAW_TARGET = 2u * 1024 * 1024;
+    static constexpr size_t FRAME_RAW_TARGET = 4u * 1024 * 1024;
 
     std::string path_;
     int         fd_    = -1;
@@ -162,7 +162,7 @@ class PartitionWriter {
     }
 
 public:
-    explicit PartitionWriter(const std::string& path, int level = 3)
+    explicit PartitionWriter(const std::string& path, int level = 6)
         : path_(path), level_(level)
     {
         fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
