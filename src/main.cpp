@@ -273,11 +273,19 @@ int main(int argc, char* argv[]) {
                 tfd_ints.push_back(raw);
                 fd_acc_remap.push_back(&dir_remap[d]);
             }
-            for (auto& [hog, exts] : dir_idx) {
-                auto& dst = merged_idx[hog];
-                for (auto ext : exts) {
-                    ext.thread_idx += fd_base;
-                    dst.push_back(ext);
+            if (merged_idx.empty()) {
+                // First (usually only) partition dir: ADOPT its index instead of copying —
+                // avoids holding both dir_idx and merged_idx, a full doubling of the
+                // partition index in RAM (the dominant merge-shard memory term). thread_idx
+                // is local to a dir, so only needs offsetting when fd_base != 0.
+                merged_idx = std::move(dir_idx);
+                if (fd_base)
+                    for (auto& [hog, exts] : merged_idx)
+                        for (auto& e : exts) e.thread_idx += fd_base;
+            } else {
+                for (auto& [hog, exts] : dir_idx) {
+                    auto& dst = merged_idx[hog];
+                    for (auto& ext : exts) { ext.thread_idx += fd_base; dst.push_back(ext); }
                 }
             }
         }
