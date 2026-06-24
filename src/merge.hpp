@@ -23,6 +23,7 @@
 #include <deque>
 #include <thread>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <cstdint>
 #include <cstdio>
@@ -363,6 +364,330 @@ inline ShardResult merge_shard_compute_extents(
     return res;
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// Memory-bounded merge-shard: decode-once + hash-partition spill.
+//
+// HOGs and frames are densely many-to-many (a HOG spans hundreds of the shard's
+// distinct frames), so per-HOG decoding re-decompresses each shared frame thousands
+// of times, while decoding every frame into RAM holds the whole working set. Instead:
+//   Pass 1: decode each distinct frame ONCE (parallel), deserialize its extents'
+//           records, append them to one of B on-disk bucket files keyed by hog_idx%B.
+//           Peak RAM = per-thread write buffers.
+//   Pass 2: process one bucket at a time — read it (<= budget), group by hog, run the
+//           invert+coverage+compress build, emit each HOG. Peak RAM = one bucket.
+// Each frame is decoded exactly once; the working set spills to scratch once.
+// Spill record (little-endian), appended to bucket[hog_idx % B]:
+//   hog_idx u32 | acc_idx u32 | cnum u32 | sstart u32 | send u32 | pu8 u8 | n_obs u32
+//   then n_obs * (hog_offset u32, codon u8)
+// ════════════════════════════════════════════════════════════════════════════
+
+// Parse one extent from an already-decoded frame; append its spill records to `out`.
+inline void spill_extent_into(const uint8_t* frame_ptr, size_t frame_len,
+                              const PartitionIndexExtent& ext, uint32_t hog_idx,
+                              const std::vector<const std::vector<uint32_t>*>& fd_acc_remap,
+                              std::vector<uint32_t>& contig_cnum,
+                              std::vector<VarNTRecord>& recs,
+                              std::vector<uint8_t>& out) {
+    uint32_t acc_idx = ext.acc_idx;
+    if (!fd_acc_remap.empty() && ext.thread_idx < fd_acc_remap.size()
+            && fd_acc_remap[ext.thread_idx]) {
+        const auto& rm = *fd_acc_remap[ext.thread_idx];
+        if (acc_idx < rm.size()) acc_idx = rm[acc_idx];
+    }
+    if (frame_len < 8) throw std::runtime_error("frame too small in spill");
+    uint32_t other_sec_len = read_u32_le(frame_ptr);
+    uint32_t bmp_sec_len   = read_u32_le(frame_ptr + 4);
+    const uint8_t* other_sec = frame_ptr + 8;
+    const uint8_t* bmp_sec   = other_sec + other_sec_len;
+    const uint8_t* cdn_sec   = bmp_sec   + bmp_sec_len;
+    const uint8_t* p   = other_sec + ext.other_off;
+    const uint8_t* end = p + ext.other_len;
+    uint32_t n_contigs = 0;
+    int n = read_varint(p, end, &n_contigs);
+    if (!n) throw std::runtime_error("corrupt contig dict in spill");
+    p += n;
+    contig_cnum.clear(); contig_cnum.resize(n_contigs);
+    for (uint32_t j = 0; j < n_contigs; ++j) {
+        uint32_t len = 0;
+        n = read_varint(p, end, &len);
+        if (!n || p + n + len > end) throw std::runtime_error("truncated contig dict in spill");
+        p += n;
+        std::string_view uid(reinterpret_cast<const char*>(p), len);
+        p += len;
+        uint32_t cnum = j;
+        auto fs = uid.find('_');
+        if (fs != std::string_view::npos && fs + 1 < uid.size()) {
+            auto fe = uid.find('_', fs + 1);
+            auto part = (fe != std::string_view::npos) ? uid.substr(fs+1, fe-fs-1) : uid.substr(fs+1);
+            uint32_t v = 0;
+            auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
+            if (cr.ec == std::errc{}) cnum = v;
+        }
+        contig_cnum[j] = cnum;
+    }
+    recs.clear();
+    if (!deserialize_varnt_block_split(p, end, bmp_sec + ext.bmp_off, cdn_sec + ext.cdn_off, recs))
+        throw std::runtime_error("corrupt varnt block in spill");
+    for (const auto& r : recs) {
+        if (r.contig_idx >= contig_cnum.size())
+            throw std::runtime_error("contig_idx OOB in spill");
+        uint32_t cnum = contig_cnum[r.contig_idx];
+        uint8_t pu8 = uint8_t(std::min(100.0f, r.pident + 0.5f));
+        write_u32(out, hog_idx); write_u32(out, acc_idx); write_u32(out, cnum);
+        write_u32(out, r.sstart); write_u32(out, r.send); out.push_back(pu8);
+        write_u32(out, uint32_t(r.vars.size()));
+        for (const auto& o : r.vars) {
+            write_u32(out, o.hog_offset);
+            out.push_back(uint8_t(o.packed_codon >> 2));
+        }
+    }
+}
+
+// Build inverted+compressed payload from state already accumulated in sc
+// (flat_inv / acc_intervals_map / acc_pident_map / seen_accs).
+inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardScratch& sc,
+                                               uint32_t n_accs, uint32_t hog_length,
+                                               int out_zstd_level) {
+    ShardResult res; res.hog_id = hog_id;
+    auto& flat_inv = sc.flat_inv;
+    uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
+    for (const auto& e : flat_inv) if (e.first > max_pos) max_pos = e.first;
+    std::vector<uint32_t> cs_count(max_pos + 1, 0), cs_pidx(max_pos + 1, UINT32_MAX);
+    for (const auto& e : flat_inv) ++cs_count[e.first];
+    std::vector<InvPosition> positions;
+    for (uint32_t pp = 0; pp <= max_pos; ++pp) {
+        if (!cs_count[pp]) continue;
+        cs_pidx[pp] = uint32_t(positions.size());
+        InvPosition ip; ip.hog_pos = pp; ip.obs.reserve(cs_count[pp]);
+        positions.push_back(std::move(ip));
+    }
+    for (auto& e : flat_inv) positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
+    for (auto& pos : positions)
+        std::sort(pos.obs.begin(), pos.obs.end(),
+                  [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+    std::vector<uint32_t> local_accs(sc.seen_accs);
+    std::sort(local_accs.begin(), local_accs.end());
+    auto merged_interval_cov = [](std::vector<std::pair<uint32_t,uint32_t>>& ivals) -> uint32_t {
+        if (ivals.empty()) return 0;
+        std::sort(ivals.begin(), ivals.end());
+        uint32_t cov = 0, cs = ivals[0].first, ce = ivals[0].second;
+        for (size_t k = 1; k < ivals.size(); ++k) {
+            if (ivals[k].first <= ce) { ce = std::max(ce, ivals[k].second); }
+            else { cov += ce - cs + 1; cs = ivals[k].first; ce = ivals[k].second; }
+        }
+        return cov + ce - cs + 1;
+    };
+    std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
+    std::vector<uint32_t> covered_aa_v(local_accs.size(), 0);
+    for (size_t li = 0; li < local_accs.size(); ++li) {
+        uint32_t gacc = local_accs[li];
+        auto it = sc.acc_pident_map.find(gacc);
+        if (it != sc.acc_pident_map.end()) local_acc_pident[li] = it->second;
+        auto it3 = sc.acc_intervals_map.find(gacc);
+        if (it3 != sc.acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
+    }
+    auto& inv_raw  = sc.inv_raw;  inv_raw.clear();
+    auto& hog_cbuf = sc.hog_cbuf;
+    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
+                             covered_aa_v, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b);
+    size_t raw_sz = inv_raw.size();
+    uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
+    {
+        size_t bound = ZSTD_compressBound(raw_sz);
+        hog_cbuf.resize(bound);
+        size_t csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, out_zstd_level);
+        bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
+        if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data(); payload_sz = raw_sz; }
+        else         { stored_sz = uint32_t(csz) | 0x40000000u;    payload = hog_cbuf.data(); payload_sz = csz; }
+    }
+    res.stored_sz = stored_sz; res.n_accs = n_accs;
+    res.payload.assign(payload, payload + payload_sz);
+    return res;
+}
+
+using ShardHogList =
+    std::vector<const std::pair<const std::string, std::vector<PartitionIndexExtent>>*>;
+
+// Memory-bounded merge of one shard set. emit() is called once per built HOG and
+// must be thread-safe. Peak RAM is bounded by `budget` regardless of shard size.
+inline void run_merge_shard_spill(
+        const ShardHogList& hog_list,
+        const std::vector<int>& tfd_ints,
+        const std::vector<const std::vector<uint32_t>*>& fd_acc_remap,
+        size_t n_accessions, size_t budget, size_t nt, int out_zstd_level,
+        const std::string& spill_dir, bool do_profile,
+        const std::function<void(ShardResult&&)>& emit) {
+
+    // ── group extents by frame ───────────────────────────────────────────────
+    struct FExt { uint32_t hog_idx; const PartitionIndexExtent* ext; };
+    struct FrameJob { int tfd; uint64_t off; uint32_t csz; std::vector<FExt> exts; };
+    std::vector<FrameJob> frames;
+    std::unordered_map<uint64_t, uint32_t> fmap;
+    uint64_t sum_csz = 0;
+    for (uint32_t hi = 0; hi < uint32_t(hog_list.size()); ++hi)
+        for (const auto& e : hog_list[hi]->second) {
+            uint64_t key = (uint64_t(e.thread_idx) << 48)
+                         | (uint64_t(e.frame_off) & 0xFFFFFFFFFFFFull);
+            auto it = fmap.find(key);
+            uint32_t fi;
+            if (it == fmap.end()) {
+                fi = uint32_t(frames.size()); fmap.emplace(key, fi);
+                frames.push_back({tfd_ints[e.thread_idx], e.frame_off, e.frame_csz, {}});
+                sum_csz += e.frame_csz;
+            } else fi = it->second;
+            frames[fi].exts.push_back({hi, &e});
+        }
+
+    // Spill format expands the compressed bytes several-fold; size B so each bucket
+    // (~est_spill / B) fits the budget.
+    size_t est_spill = sum_csz * 10;   // spill record format expands ~8x; margin keeps buckets <= budget
+    size_t B = std::max<size_t>(1, (est_spill + budget - 1) / budget);
+    std::vector<UniqueFd> bfd; bfd.reserve(B);
+    std::vector<std::unique_ptr<std::mutex>> bmtx;
+    for (size_t b = 0; b < B; ++b) {
+        std::string bp = spill_dir + "/bucket." + std::to_string(b);
+        int fd = open(bp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) throw std::runtime_error("cannot create spill bucket: " + bp);
+        bfd.emplace_back(fd);
+        bmtx.push_back(std::make_unique<std::mutex>());
+    }
+    std::cerr << "merge-shard: spill " << frames.size() << " frames -> " << B
+              << " buckets (budget " << (budget >> 20) << " MiB, -t " << nt << ")\n";
+
+    std::atomic<bool> failed{false}; std::string err; std::mutex err_mtx;
+
+    // ── pass 1: decode each frame once, scatter records to bucket files ───────
+    {
+        std::atomic<size_t> fnext{0};
+        auto p1 = [&]() {
+            ZSTD_DCtx* dctx = ZSTD_createDCtx();
+            std::vector<uint8_t> cbuf, frame;
+            std::vector<uint32_t> ccnum; std::vector<VarNTRecord> recs;
+            std::vector<std::vector<uint8_t>> lbuf(B);
+            const size_t CHUNK = 8u * 1024 * 1024;
+            auto flush_b = [&](size_t b) {
+                if (lbuf[b].empty()) return;
+                std::lock_guard<std::mutex> lk(*bmtx[b]);
+                const uint8_t* d = lbuf[b].data(); size_t rem = lbuf[b].size(), done = 0;
+                while (done < rem) {
+                    ssize_t w = ::write(bfd[b], d + done, rem - done);
+                    if (w <= 0) throw std::runtime_error("bucket write failed");
+                    done += size_t(w);
+                }
+                lbuf[b].clear();
+            };
+            try {
+                for (;;) {
+                    size_t i = fnext.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= frames.size() || failed.load(std::memory_order_relaxed)) break;
+                    auto& fj = frames[i];
+                    cbuf.resize(fj.csz);
+                    if (::pread(fj.tfd, cbuf.data(), fj.csz, off_t(fj.off)) != ssize_t(fj.csz))
+                        throw std::runtime_error("pread frame failed");
+                    uint64_t rsz = ZSTD_getFrameContentSize(cbuf.data(), fj.csz);
+                    if (rsz == ZSTD_CONTENTSIZE_UNKNOWN || rsz == ZSTD_CONTENTSIZE_ERROR)
+                        throw std::runtime_error("bad frame content size");
+                    frame.resize(size_t(rsz));
+                    size_t rz = ZSTD_decompressDCtx(dctx, frame.data(), size_t(rsz), cbuf.data(), fj.csz);
+                    if (ZSTD_isError(rz)) throw std::runtime_error(ZSTD_getErrorName(rz));
+                    for (auto& fe : fj.exts) {
+                        size_t b = fe.hog_idx % B;
+                        spill_extent_into(frame.data(), frame.size(), *fe.ext, fe.hog_idx,
+                                          fd_acc_remap, ccnum, recs, lbuf[b]);
+                        if (lbuf[b].size() >= CHUNK) flush_b(b);
+                    }
+                }
+                for (size_t b = 0; b < B; ++b) flush_b(b);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(err_mtx);
+                if (!failed.exchange(true)) err = e.what();
+            }
+            ZSTD_freeDCtx(dctx);
+        };
+        std::vector<std::thread> pool;
+        for (size_t t = 1; t < nt; ++t) pool.emplace_back(p1);
+        p1();
+        for (auto& t : pool) t.join();
+        if (failed.load()) throw std::runtime_error("spill pass 1: " + err);
+    }
+
+    // ── pass 2: build one bucket at a time (parallel HOGs within a bucket) ────
+    for (size_t b = 0; b < B; ++b) {
+        off_t sz = lseek(bfd[b], 0, SEEK_END);
+        if (sz <= 0) continue;
+        std::vector<uint8_t> data; data.resize(size_t(sz));
+        { size_t got = 0;
+          while (got < size_t(sz)) {
+              ssize_t r = ::pread(bfd[b], data.data() + got, size_t(sz) - got, off_t(got));
+              if (r <= 0) throw std::runtime_error("bucket read failed");
+              got += size_t(r);
+          } }
+        // group record spans by hog_idx
+        std::unordered_map<uint32_t, std::vector<uint32_t>> groups;  // hog_idx -> record start offsets
+        size_t off = 0;
+        while (off + 25 <= data.size()) {
+            uint32_t rstart = uint32_t(off);
+            uint32_t hog_idx = read_u32_le(&data[off]);
+            off += 4 + 4 + 4 + 4 + 4 + 1;  // hog,acc,cnum,sstart,send,pu8
+            uint32_t nobs = read_u32_le(&data[off]); off += 4;
+            off += size_t(nobs) * 5;
+            groups[hog_idx].push_back(rstart);
+        }
+        std::vector<uint32_t> hkeys; hkeys.reserve(groups.size());
+        for (auto& kv : groups) hkeys.push_back(kv.first);
+
+        std::atomic<size_t> gnext{0};
+        auto p2 = [&]() {
+            ShardScratch sc(n_accessions);
+            try {
+                for (;;) {
+                    size_t gi = gnext.fetch_add(1, std::memory_order_relaxed);
+                    if (gi >= hkeys.size() || failed.load(std::memory_order_relaxed)) break;
+                    uint32_t hidx = hkeys[gi];
+                    if (++sc.epoch == 0) { std::fill(sc.seen_epoch.begin(), sc.seen_epoch.end(), 0); sc.epoch = 1; }
+                    uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
+                    sc.seen_accs.clear(); sc.flat_inv.clear();
+                    sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
+                    for (uint32_t ro : groups[hidx]) {
+                        const uint8_t* q = &data[ro];
+                        q += 4;                              // skip hog_idx
+                        uint32_t acc  = read_u32_le(q); q += 4;
+                        uint32_t cnum = read_u32_le(q); q += 4;
+                        uint32_t ss   = read_u32_le(q); q += 4;
+                        uint32_t se   = read_u32_le(q); q += 4;
+                        uint8_t  pu8  = *q++;
+                        uint32_t nobs = read_u32_le(q); q += 4;
+                        if (sc.seen_epoch[acc] != epoch) { sc.seen_epoch[acc] = epoch; ++n_accs; sc.seen_accs.push_back(acc); }
+                        hog_length = std::max(hog_length, se + 1);
+                        sc.acc_intervals_map[acc].emplace_back(ss, se);
+                        { auto [it2, ins] = sc.acc_pident_map.emplace(acc, pu8); if (!ins && pu8 < it2->second) it2->second = pu8; }
+                        for (uint32_t k = 0; k < nobs; ++k) {
+                            uint32_t hoff = read_u32_le(q); q += 4;
+                            uint8_t cod = *q++;
+                            sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
+                        }
+                    }
+                    ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
+                                                                n_accs, hog_length, out_zstd_level);
+                    emit(std::move(r));
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(err_mtx);
+                if (!failed.exchange(true)) err = e.what();
+            }
+        };
+        size_t bt = std::max<size_t>(1, std::min(nt, hkeys.size()));
+        std::vector<std::thread> pool;
+        for (size_t t = 1; t < bt; ++t) pool.emplace_back(p2);
+        p2();
+        for (auto& t : pool) t.join();
+        if (failed.load()) throw std::runtime_error("spill pass 2: " + err);
+        // free this bucket's backing store
+        std::vector<uint8_t>().swap(data);
+        ftruncate(bfd[b], 0);
+    }
+}
 
 inline void merge_batches(const std::vector<std::string>& input_paths,
                           const std::string& out_lhg,

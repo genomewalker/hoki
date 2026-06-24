@@ -167,6 +167,7 @@ int main(int argc, char* argv[]) {
         int n_threads = 0;
         int out_zstd_level = 6;
         bool do_profile = false;
+        size_t spill_budget = 8ull << 30;   // peak RAM target for the spill working set
         std::string hog_range_start, hog_range_end;
         std::vector<std::string> pos;
         for (int i = 2; i < argc; ++i) {
@@ -174,6 +175,14 @@ int main(int argc, char* argv[]) {
             if      (a == "-t" && i+1 < argc)          n_threads       = std::stoi(argv[++i]);
             else if (a == "-zo" && i+1 < argc)         out_zstd_level  = std::stoi(argv[++i]);
             else if (a == "--profile")                 do_profile      = true;
+            else if (a == "--flush" && i+1 < argc) {
+                std::string sv = argv[++i]; size_t mul = 1;
+                if (!sv.empty()) { char c = sv.back();
+                    if (c=='K'||c=='k') mul=1ull<<10; else if (c=='M'||c=='m') mul=1ull<<20;
+                    else if (c=='G'||c=='g') mul=1ull<<30; else if (c=='T'||c=='t') mul=1ull<<40;
+                    if (mul>1) sv.pop_back(); }
+                spill_budget = std::stoull(sv) * mul;
+            }
             else if (a == "--hog-range" && i+2 < argc) { hog_range_start = argv[++i]; hog_range_end = argv[++i]; }
             else pos.emplace_back(a);
         }
@@ -286,74 +295,11 @@ int main(int argc, char* argv[]) {
         size_t nt = size_t(n_threads > 0 ? n_threads : int(std::thread::hardware_concurrency()));
         nt = std::max<size_t>(1, std::min(nt, hog_list.size()));
 
-        // Parallel compute: workers steal HOGs, store results in pre-allocated slots.
-        // Streaming pipeline: workers compute+compress HOG payloads into results[hi];
-        // a dedicated writer thread drains them in index order, freeing each payload
-        // immediately. A window cap bounds resident payloads to WINDOW (workers block
-        // before computing index hi once they run WINDOW ahead of the writer), so peak
-        // memory is O(WINDOW × payload) instead of O(full .lhg output).
-        std::vector<lhi::ShardResult> results(hog_list.size());
-        std::atomic<size_t> next_h{0};
-        std::atomic<bool>   sfailed{false};
-        std::string         serr;
-        std::mutex          serr_mtx;
-
-        // Completion-order pipeline: workers compute HOG payloads into results[hi] and
-        // push hi onto a queue; a single writer drains the queue in COMPLETION order
-        // (not hog-index order) and frees each payload immediately. The .lhgi index is
-        // sorted by hog_id at the end, so physical order in the .lhg is irrelevant —
-        // writing in completion order removes the head-of-line stall where one slow HOG
-        // blocked the writer while finished payloads piled up in RAM.
-        std::deque<size_t>      done_q;
-        std::mutex              done_mtx;
-        std::condition_variable done_cv;
-        std::atomic<uint64_t> prof_decode{0}, prof_build{0}, prof_compress{0};
-        std::atomic<uint64_t> slowest_ns{0};
-        std::string slowest_hog; std::mutex slowest_mtx;
-
-        auto sworker = [&]() {
-            lhi::ShardScratch sc(accessions.size());
-            uint64_t td = 0, tb = 0, tc = 0;
-            for (;;) {
-                size_t hi = next_h.fetch_add(1, std::memory_order_relaxed);
-                if (hi >= hog_list.size() || sfailed.load(std::memory_order_relaxed)) break;
-                uint64_t c0 = do_profile ? clock_ns() : 0;
-                try {
-                    results[hi] = lhi::merge_shard_compute_extents(
-                        hog_list[hi]->first, hog_list[hi]->second, tfd_ints, sc,
-                        fd_acc_remap, out_zstd_level,
-                        do_profile ? &td : nullptr, do_profile ? &tb : nullptr,
-                        do_profile ? &tc : nullptr);
-                } catch (const std::exception& e) {
-                    { std::lock_guard<std::mutex> lk(serr_mtx);
-                      if (!sfailed.exchange(true)) serr = e.what(); }
-                    done_cv.notify_all();
-                    break;
-                }
-                {
-                    std::lock_guard<std::mutex> lk(done_mtx);
-                    done_q.push_back(hi);
-                }
-                done_cv.notify_one();
-                if (do_profile) {
-                    uint64_t dt = clock_ns() - c0;
-                    if (dt > slowest_ns.load(std::memory_order_relaxed)) {
-                        std::lock_guard<std::mutex> lk(slowest_mtx);
-                        if (dt > slowest_ns.load(std::memory_order_relaxed)) {
-                            slowest_ns.store(dt, std::memory_order_relaxed);
-                            slowest_hog = hog_list[hi]->first;
-                        }
-                    }
-                }
-            }
-            if (do_profile) {
-                prof_decode.fetch_add(td, std::memory_order_relaxed);
-                prof_build.fetch_add(tb, std::memory_order_relaxed);
-                prof_compress.fetch_add(tc, std::memory_order_relaxed);
-            }
-        };
-
-        // Writer state lives in outer scope so the index/footer pass below can use it.
+        // ── Memory-bounded merge: decode-once + hash-partition spill ─────────────
+        // Peak RAM is bounded by --flush (default 8 GiB) regardless of shard size:
+        // every distinct frame is decoded once and its records spilled to per-hog
+        // bucket files; buckets are then built one at a time. emit() appends each
+        // finished HOG to the .lhg under a lock and records its index entry.
         lhi::UniqueFd fd_out(open(out_lhg.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
         if (fd_out < 0) { std::cerr << "cannot create: " << out_lhg << "\n"; return 1; }
         uint8_t fhdr[lhi::LHG_HEADER_SZ] = {};
@@ -364,68 +310,49 @@ int main(int argc, char* argv[]) {
         lhi::GlobalIndex gi;
         gi.accessions = accessions;
         uint64_t data_pos = lhi::LHG_HEADER_SZ;
-        std::string writer_err;
-
-        auto writer_fn = [&]() {
-            lhi::WriteBuffer wb;
+        lhi::WriteBuffer wb;
+        std::mutex emit_mtx;
+        std::string emit_err;
+        auto emit = [&](lhi::ShardResult&& r) {
+            std::lock_guard<std::mutex> lk(emit_mtx);
+            if (!emit_err.empty()) return;
             try {
-                size_t written = 0;
-                while (written < hog_list.size()) {
-                    size_t hi;
-                    {
-                        std::unique_lock<std::mutex> lk(done_mtx);
-                        done_cv.wait(lk, [&]{ return !done_q.empty() ||
-                                                     sfailed.load(std::memory_order_relaxed); });
-                        if (done_q.empty()) return;   // sfailed with nothing left → abort
-                        hi = done_q.front(); done_q.pop_front();
-                    }
-                    ++written;
-                    auto& r = results[hi];
-                    uint8_t hdr8[8];
-                    memcpy(hdr8, lhi::LHG_HOG_ENTRY_MAGIC, 4);
-                    for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(r.stored_sz >> (8*i));
-
-                    lhi::HogIndexEntry e;
-                    e.hog_id       = std::move(r.hog_id);
-                    e.data_offset  = data_pos;
-                    e.data_length  = uint64_t(8) + r.payload.size();
-                    e.n_accessions = r.n_accs;
-                    gi.entries.push_back(std::move(e));
-
-                    wb.append(fd_out, out_lhg, hdr8, 8);
-                    wb.append(fd_out, out_lhg, r.payload.data(), r.payload.size());
-                    data_pos += uint64_t(8) + r.payload.size();
-                    std::vector<uint8_t>().swap(r.payload);
-                }
-                wb.flush_to(fd_out, out_lhg);
-            } catch (const std::exception& ex) {
-                writer_err = ex.what();
-                sfailed.store(true, std::memory_order_relaxed);
-            }
+                uint8_t hdr8[8];
+                memcpy(hdr8, lhi::LHG_HOG_ENTRY_MAGIC, 4);
+                for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(r.stored_sz >> (8*i));
+                lhi::HogIndexEntry e;
+                e.hog_id       = std::move(r.hog_id);
+                e.data_offset  = data_pos;
+                e.data_length  = uint64_t(8) + r.payload.size();
+                e.n_accessions = r.n_accs;
+                gi.entries.push_back(std::move(e));
+                wb.append(fd_out, out_lhg, hdr8, 8);
+                wb.append(fd_out, out_lhg, r.payload.data(), r.payload.size());
+                data_pos += uint64_t(8) + r.payload.size();
+            } catch (const std::exception& ex) { emit_err = ex.what(); }
         };
 
-        std::thread writer_thread(writer_fn);
-        {
-            std::vector<std::thread> pool;
-            pool.reserve(nt - 1);
-            for (size_t t = 1; t < nt; ++t) pool.emplace_back(sworker);
-            sworker();
-            for (auto& t : pool) t.join();
-        }
-        writer_thread.join();
-        if (sfailed.load()) {
-            std::cerr << "error: " << (writer_err.empty() ? serr : writer_err) << "\n";
+        std::string spill_dir = out_lhg + ".spilltmp";
+        ::mkdir(spill_dir.c_str(), 0755);
+        auto cleanup_spill = [&]() {
+            for (size_t b = 0; ; ++b) {
+                std::string bp = spill_dir + "/bucket." + std::to_string(b);
+                if (::unlink(bp.c_str()) != 0) break;
+            }
+            ::rmdir(spill_dir.c_str());
+        };
+        try {
+            lhi::run_merge_shard_spill(hog_list, tfd_ints, fd_acc_remap,
+                                       accessions.size(), spill_budget, nt, out_zstd_level,
+                                       spill_dir, do_profile, emit);
+        } catch (const std::exception& e) {
+            std::cerr << "error: " << e.what() << "\n";
+            cleanup_spill();
             return 1;
         }
-        if (do_profile) {
-            uint64_t d = prof_decode.load(), b = prof_build.load(), c = prof_compress.load();
-            uint64_t tot = d + b + c; if (!tot) tot = 1;
-            std::fprintf(stderr, "profile[hogs]     n=%zu threads=%zu\n", hog_list.size(), nt);
-            std::fprintf(stderr, "profile[decode]   %.1fs (%d%%)  pread+zstd+deserialize\n", d/1e9, int(d*100/tot));
-            std::fprintf(stderr, "profile[build]    %.1fs (%d%%)  invert+coverage+serialize\n", b/1e9, int(b*100/tot));
-            std::fprintf(stderr, "profile[compress] %.1fs (%d%%)  zstd out\n", c/1e9, int(c*100/tot));
-            std::fprintf(stderr, "profile[slowest]  %s  %.2fs (single HOG)\n", slowest_hog.c_str(), slowest_ns.load()/1e9);
-        }
+        wb.flush_to(fd_out, out_lhg);
+        cleanup_spill();
+        if (!emit_err.empty()) { std::cerr << "error: " << emit_err << "\n"; return 1; }
 
         // Sort index entries by hog_id (physical order = completion order, may differ)
         std::sort(gi.entries.begin(), gi.entries.end(),
