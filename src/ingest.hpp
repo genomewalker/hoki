@@ -442,8 +442,8 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
         PartitionWriter& pw = *writers[tid];
         size_t mem_bytes    = 0;
-        // User --flush N means per-worker budget; auto-detected splits total by N
-        const size_t thr    = (opts.flush_bytes != 0) ? opts.flush_bytes : flush_threshold / N;
+        uint32_t rss_tick   = 0;
+        const size_t thr    = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold) / N;
 
         // Persistent CCtx: reused across all flush cycles, freed at end of worker.
         ZSTD_CCtx* cctx = ZSTD_createCCtx();
@@ -768,6 +768,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             }
 
             if (mem_bytes > thr) flush();
+            else if (mem_bytes > thr / 4 && (++rss_tick & 0xFFF) == 0 && read_rss_bytes() / N > thr) flush();
         }; // end process lambda
 
         Batch batch;
