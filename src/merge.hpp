@@ -348,60 +348,63 @@ inline void serialize_compress_streamed(
 // then yields each position's obs (global acc, cnum, codon) on demand — reproducing
 // decode_block byte-for-byte one position at a time.
 struct LhgColCursor {
-    const std::vector<uint32_t>* remap = nullptr;   // local idx -> global acc
     std::vector<uint32_t> pos_vals, nobs;           // per position
     size_t n_pos = 0, cur = 0;
-    const uint8_t *p_acc = nullptr, *p_cnum = nullptr, *p_codon = nullptr, *end = nullptr;
+    const uint8_t *p = nullptr, *end = nullptr, *acc_start = nullptr;  // p = current column read ptr
 
-    void init(const InvBlock& blk, const std::vector<uint32_t>& remap_) {
-        remap = &remap_;
-        const uint8_t* p = blk.pos_ptr; end = blk.end;
-        uint32_t np = 0; int n = read_varint(p, end, &np); if (!n) throw std::runtime_error("cursor: pos count"); p += n;
+    void init(const InvBlock& blk) {
+        const uint8_t* q = blk.pos_ptr; end = blk.end;
+        uint32_t np = 0; int n = read_varint(q, end, &np); if (!n) throw std::runtime_error("cursor: pos count"); q += n;
         n_pos = np; pos_vals.resize(np); nobs.resize(np);
-        uint32_t prev = 0; uint64_t tot = 0;
+        uint32_t prev = 0;
         for (uint32_t i = 0; i < np; ++i) {
-            uint32_t d = 0; n = read_varint(p, end, &d); if (!n) throw std::runtime_error("cursor: pos delta"); p += n;
+            uint32_t d = 0; n = read_varint(q, end, &d); if (!n) throw std::runtime_error("cursor: pos delta"); q += n;
             prev += d; pos_vals[i] = prev;
-            uint32_t no = 0; n = read_varint(p, end, &no); if (!n) throw std::runtime_error("cursor: n_obs"); p += n;
-            nobs[i] = no; tot += no;
+            uint32_t no = 0; n = read_varint(q, end, &no); if (!n) throw std::runtime_error("cursor: n_obs"); q += n;
+            nobs[i] = no;
         }
-        p_acc = p;
-        const uint8_t* q = p_acc;                                   // skip acc column -> cnum start
-        for (uint64_t i = 0; i < tot; ++i) { uint32_t d; int m = read_varint(q, end, &d); if (!m) throw std::runtime_error("cursor: acc skip"); q += m; }
-        p_cnum = q;
-        for (uint64_t i = 0; i < tot; ++i) { uint32_t d; int m = read_varint(q, end, &d); if (!m) throw std::runtime_error("cursor: cnum skip"); q += m; }
-        p_codon = q;
+        acc_start = p = q; cur = 0;        // p is now at the acc column; no pre-scan of cnum/codon
     }
+    void rewind(const uint8_t* col) { p = col; cur = 0; }   // start a new column pass; p ends at next col start
     bool done() const { return cur >= n_pos; }
     uint32_t pos() const { return pos_vals[cur]; }
-    // Append current position's obs to `out`; advance. Mirrors decode_block exactly.
-    void emit(std::vector<InvObs>& out) {
-        uint32_t no = nobs[cur];
-        size_t base = out.size();
-        uint32_t prev_li = 0;
+    // Pass A: merged-local acc indices for the current position (base + local_li); advance.
+    void read_acc(std::vector<uint32_t>& out, uint32_t base) {
+        uint32_t no = nobs[cur], prev_li = 0;
         for (uint32_t i = 0; i < no; ++i) {
-            uint32_t d = 0; int m = read_varint(p_acc, end, &d); p_acc += m; prev_li += d;
-            if (prev_li >= remap->size()) throw std::runtime_error("cursor: acc_idx OOB");
-            out.push_back(InvObs{ (*remap)[prev_li], 0, 0 });
+            uint32_t d = 0; int m = read_varint(p, end, &d); p += m; prev_li += d;
+            out.push_back(base + prev_li);
         }
-        for (uint32_t i = 0; i < no; ++i) { uint32_t c = 0; int m = read_varint(p_cnum, end, &c); p_cnum += m; out[base + i].cnum = c; }
-        if (p_codon >= end) throw std::runtime_error("cursor: codon trunc");
-        uint8_t consensus = *p_codon++;
-        for (uint32_t i = 0; i < no; ++i) out[base + i].codon_idx = consensus;
-        uint32_t nvar = 0; int m = read_varint(p_codon, end, &nvar); p_codon += m;
-        static thread_local std::vector<uint32_t> ords; ords.resize(nvar);
+        ++cur;
+    }
+    // Pass B: cnum per obs.
+    void read_cnum(std::vector<uint32_t>& out) {
+        uint32_t no = nobs[cur];
+        for (uint32_t i = 0; i < no; ++i) { uint32_t c = 0; int m = read_varint(p, end, &c); p += m; out.push_back(c); }
+        ++cur;
+    }
+    // Pass C: reconstructed codon per obs (consensus + variants, in obs order).
+    void read_codon(std::vector<uint8_t>& out) {
+        uint32_t no = nobs[cur];
+        if (p >= end) throw std::runtime_error("cursor: codon trunc");
+        uint8_t consensus = *p++;
+        size_t base = out.size();
+        out.resize(base + no, consensus);
+        uint32_t nvar = 0; int m = read_varint(p, end, &nvar); p += m;
         uint32_t prev_ord = 0;
-        for (uint32_t v = 0; v < nvar; ++v) { uint32_t d = 0; int mm = read_varint(p_codon, end, &d); p_codon += mm; prev_ord += d; ords[v] = prev_ord; }
-        for (uint32_t v = 0; v < nvar; ++v) { uint8_t vc = *p_codon++; out[base + ords[v]].codon_idx = vc; }
+        static thread_local std::vector<uint32_t> ords; ords.resize(nvar);
+        for (uint32_t v = 0; v < nvar; ++v) { uint32_t d = 0; int mm = read_varint(p, end, &d); p += mm; prev_ord += d; ords[v] = prev_ord; }
+        for (uint32_t v = 0; v < nvar; ++v) { uint8_t vc = *p++; out[base + ords[v]] = vc; }
         ++cur;
     }
 };
 
 // Streaming windowed merge: union N position-sorted .lhg blocks into one payload with
 // O(Σ raw blocks + one-position window) memory — no materialized per-block or merged obs
-// vectors. Byte-identical to the decode_block+merge_lhg_blocks+serialize path. `remaps[bi]`
-// maps block bi's local acc idx -> global acc. `local_accs` is the sorted global acc-union;
-// pident/covered_aa are indexed parallel to it. Output compressed payload appended to `out`.
+// vectors. Byte-identical to the decode_block+merge_lhg_blocks+serialize path. Column-major:
+// three position-lockstep heap passes (acc, cnum, codon) over the blocks, so each column's
+// start is discovered as the previous pass ends — no pre-scan. acc maps via base[bi]+local_li
+// (shards hold contiguous ordered global-acc ranges), avoiding the per-position rank walk.
 inline void build_inverted_streamed_lhg(
         std::vector<InvBlock>& blocks,
         const std::vector<const std::vector<uint32_t>*>& remaps,
@@ -411,7 +414,6 @@ inline void build_inverted_streamed_lhg(
     const size_t N = blocks.size();
     uint32_t n_local = uint32_t(local_accs.size());
 
-    // Section buffers (compact varint columns), built once then streamed.
     std::vector<uint8_t> head, pos_hdr, acc_col, cnum_col, codon_col;
     // Header: acc-dict + coverage (matches serialize_inverted_block sections 1-2).
     write_varint(head, n_local);
@@ -421,58 +423,72 @@ inline void build_inverted_streamed_lhg(
     write_varint(head, hog_length);
     for (uint32_t li = 0; li < n_local; ++li) write_varint(head, li < covered_aa.size() ? covered_aa[li] : 0);
 
-    // Cursors + min-heap over positions.
+    // Merged-local base offset per block: rank of the block's smallest merged-global acc in
+    // the sorted union. Block bi's accs occupy [base[bi], base[bi]+n_bi); local_li -> base+li.
+    std::vector<uint32_t> base(N, 0);
+    for (size_t bi = 0; bi < N; ++bi) {
+        const auto& rm = *remaps[bi];
+        uint32_t g0 = rm.empty() ? 0 : rm[0];
+        base[bi] = uint32_t(std::lower_bound(local_accs.begin(), local_accs.end(), g0) - local_accs.begin());
+    }
+
     std::vector<LhgColCursor> cur(N);
-    for (size_t bi = 0; bi < N; ++bi) cur[bi].init(blocks[bi], *remaps[bi]);
+    for (size_t bi = 0; bi < N; ++bi) cur[bi].init(blocks[bi]);
+
     struct HItem { uint32_t pos; size_t src; };
     auto cmp = [](const HItem& a, const HItem& b) { return a.pos > b.pos; };
-    std::priority_queue<HItem, std::vector<HItem>, decltype(cmp)> heap(cmp);
-    for (size_t bi = 0; bi < N; ++bi) if (!cur[bi].done()) heap.push({cur[bi].pos(), bi});
-
-    std::vector<InvObs> win; win.reserve(1u << 20);
-    std::vector<std::vector<InvObs>> win_by_src(N);
-    uint32_t n_pos = 0, prev_pos = 0;
-    while (!heap.empty()) {
-        uint32_t cp = heap.top().pos;
-        for (auto& v : win_by_src) v.clear();
-        while (!heap.empty() && heap.top().pos == cp) {
-            size_t bi = heap.top().src; heap.pop();
-            cur[bi].emit(win_by_src[bi]);
-            if (!cur[bi].done()) heap.push({cur[bi].pos(), bi});
+    // Run one position-lockstep heap pass; `emit(bi)` reads block bi's current-position column
+    // into its bucket, `flush(buckets)` writes the merged (bi-order) column for that position.
+    auto run_pass = [&](auto emit, auto flush) {
+        std::priority_queue<HItem, std::vector<HItem>, decltype(cmp)> heap(cmp);
+        for (size_t bi = 0; bi < N; ++bi) if (!cur[bi].done()) heap.push({cur[bi].pos(), bi});
+        while (!heap.empty()) {
+            uint32_t cp = heap.top().pos;
+            while (!heap.empty() && heap.top().pos == cp) {
+                size_t bi = heap.top().src; heap.pop();
+                emit(bi);
+                if (!cur[bi].done()) heap.push({cur[bi].pos(), bi});
+            }
+            flush(cp);
         }
-        // Concatenate in block (cursor) order — NOT sorted — to match merge_lhg_blocks
-        // byte-for-byte. Shards hold contiguous, ordered global-acc ranges, so block order
-        // is already globally acc-monotonic (serialize's lacc_ptr walk requires that).
-        win.clear();
-        for (size_t bi = 0; bi < N; ++bi)
-            win.insert(win.end(), win_by_src[bi].begin(), win_by_src[bi].end());
-        uint32_t no = uint32_t(win.size());
-        // Position header (Δpos, n_obs).
-        write_varint(pos_hdr, cp - prev_pos); prev_pos = cp;
-        write_varint(pos_hdr, no);
-        // acc column: Δ(merged-local idx), reset per pos (monotonic walk over sorted local_accs).
-        { uint32_t lacc = 0, prev_li = 0;
-          for (uint32_t i = 0; i < no; ++i) {
-              while (lacc < n_local && local_accs[lacc] < win[i].acc_idx) ++lacc;
-              write_varint(acc_col, lacc - prev_li); prev_li = lacc;
-          } }
-        // cnum column.
-        for (uint32_t i = 0; i < no; ++i) write_varint(cnum_col, win[i].cnum);
-        // codon column: per-position consensus (lowest codon among max count) + variants.
-        { uint32_t counts[64] = {};
-          for (uint32_t i = 0; i < no; ++i) counts[win[i].codon_idx & 0x3F]++;
-          uint8_t best = 0; uint32_t best_cnt = 0;
-          for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
-          codon_col.push_back(best);
-          write_varint(codon_col, no - best_cnt);
-          uint32_t prev_ord = 0;
-          for (uint32_t i = 0; i < no; ++i) if (win[i].codon_idx != best) { write_varint(codon_col, i - prev_ord); prev_ord = i; }
-          for (uint32_t i = 0; i < no; ++i) if (win[i].codon_idx != best) codon_col.push_back(win[i].codon_idx); }
-        ++n_pos;
-    }
-    // Cursors are exhausted — free the decompressed input blocks before compressing so peak
-    // is columns + output, not columns + output + inputs.
-    win.clear(); win.shrink_to_fit();
+    };
+
+    // Pass A: acc column + position headers. Buckets keep bi order.
+    std::vector<std::vector<uint32_t>> buck(N);
+    uint32_t n_pos = 0, prev_pos = 0;
+    run_pass(
+        [&](size_t bi) { cur[bi].read_acc(buck[bi], base[bi]); },
+        [&](uint32_t cp) {
+            uint32_t no = 0; for (auto& b : buck) no += uint32_t(b.size());
+            write_varint(pos_hdr, cp - prev_pos); prev_pos = cp; write_varint(pos_hdr, no);
+            uint32_t prev_li = 0;
+            for (size_t bi = 0; bi < N; ++bi) { for (uint32_t v : buck[bi]) { write_varint(acc_col, v - prev_li); prev_li = v; } buck[bi].clear(); }
+            ++n_pos;
+        });
+
+    // Pass B: cnum column.
+    for (size_t bi = 0; bi < N; ++bi) cur[bi].rewind(cur[bi].p);   // p is at cnum start after pass A
+    run_pass(
+        [&](size_t bi) { cur[bi].read_cnum(buck[bi]); },
+        [&](uint32_t) { for (size_t bi = 0; bi < N; ++bi) { for (uint32_t v : buck[bi]) write_varint(cnum_col, v); buck[bi].clear(); } });
+
+    // Pass C: codon column.
+    std::vector<std::vector<uint8_t>> kbuck(N);
+    for (size_t bi = 0; bi < N; ++bi) cur[bi].rewind(cur[bi].p);   // p is at codon start after pass B
+    run_pass(
+        [&](size_t bi) { cur[bi].read_codon(kbuck[bi]); },
+        [&](uint32_t) {
+            uint32_t counts[64] = {}; uint32_t no = 0;
+            for (size_t bi = 0; bi < N; ++bi) { for (uint8_t c : kbuck[bi]) counts[c & 0x3F]++; no += uint32_t(kbuck[bi].size()); }
+            uint8_t best = 0; uint32_t best_cnt = 0;
+            for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
+            codon_col.push_back(best); write_varint(codon_col, no - best_cnt);
+            uint32_t i = 0, prev_ord = 0;
+            for (size_t bi = 0; bi < N; ++bi) for (uint8_t c : kbuck[bi]) { if (c != best) { write_varint(codon_col, i - prev_ord); prev_ord = i; } ++i; }
+            for (size_t bi = 0; bi < N; ++bi) { for (uint8_t c : kbuck[bi]) if (c != best) codon_col.push_back(c); kbuck[bi].clear(); }
+        });
+
+    // Cursors exhausted — free the decompressed input blocks before compressing.
     for (auto& b : blocks) { std::vector<uint8_t>().swap(b.raw); b.pos_ptr = b.end = nullptr; }
 
     // Prepend n_pos to the position-header section (it precedes the per-pos entries).
