@@ -128,6 +128,7 @@ struct ShardResult {
     std::string hog_id;
     uint32_t stored_sz = 0;  // with flag bits (0x40000000=zstd, 0x80000000=raw)
     uint32_t n_accs    = 0;
+    bool     is_v9     = true;   // finalize emits the v9 (uid+trailer) layout
     std::vector<uint8_t> payload;
 };
 
@@ -517,6 +518,71 @@ inline void build_inverted_streamed_lhg(
     feed(head, false); feed(trailer, false); feed(ph, false); feed(uid_col, false); feed(codon_col, true);
 }
 
+// v9 serialize from a materialized `positions` vector (obs hold GLOBAL acc_idx). Builds the
+// same uid-trailer + Δ-uid layout as build_inverted_streamed_lhg, mapping global acc -> local
+// via local_accs. Used by finalize for the small-HOG (merge) and merge-shard build paths.
+inline void serialize_inverted_block_v9(
+        std::vector<uint8_t>& raw,
+        const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
+        const std::vector<InvPosition>& positions, uint32_t hog_length,
+        const std::vector<uint32_t>& covered_aa) {
+    raw.clear();
+    uint32_t n_local = uint32_t(local_accs.size());
+    write_varint(raw, n_local);
+    { uint32_t prev = 0; for (uint32_t li = 0; li < n_local; ++li) {
+        write_varint(raw, local_accs[li] - prev); prev = local_accs[li];
+        raw.push_back(li < local_acc_pident.size() ? local_acc_pident[li] : 0); } }
+    write_varint(raw, hog_length);
+    for (uint32_t li = 0; li < n_local; ++li) write_varint(raw, li < covered_aa.size() ? covered_aa[li] : 0);
+
+    auto to_local = [&](uint32_t g) -> uint32_t {
+        return uint32_t(std::lower_bound(local_accs.begin(), local_accs.end(), g) - local_accs.begin()); };
+    auto pack = [](uint32_t a, uint32_t c) -> uint64_t { return (uint64_t(a) << 32) | c; };
+
+    std::unordered_set<uint64_t> uni;
+    for (const auto& pos : positions)
+        for (const auto& o : pos.obs) uni.insert(pack(to_local(o.acc_idx), o.cnum));
+    std::vector<uint64_t> us(uni.begin(), uni.end());
+    std::sort(us.begin(), us.end());
+    std::unordered_set<uint64_t>().swap(uni);
+    std::unordered_map<uint64_t, uint32_t> uidmap; uidmap.reserve(us.size() * 2);
+    write_varint(raw, uint32_t(us.size()));
+    { uint32_t prev_acc = 0;
+      for (uint32_t u = 0; u < us.size(); ++u) {
+          uint32_t a = uint32_t(us[u] >> 32), c = uint32_t(us[u] & 0xFFFFFFFF);
+          write_varint(raw, a - prev_acc); prev_acc = a; write_varint(raw, c);
+          uidmap.emplace(us[u], u);
+      } }
+    std::vector<uint64_t>().swap(us);
+
+    std::vector<uint8_t> ph, uc, kc;
+    write_varint(ph, uint32_t(positions.size()));
+    uint32_t prev_pos = 0;
+    std::vector<std::pair<uint64_t, uint8_t>> obs;
+    for (const auto& pos : positions) {
+        obs.clear(); obs.reserve(pos.obs.size());
+        for (const auto& o : pos.obs) obs.push_back({pack(to_local(o.acc_idx), o.cnum), o.codon_idx});
+        std::sort(obs.begin(), obs.end(), [](const std::pair<uint64_t,uint8_t>& x, const std::pair<uint64_t,uint8_t>& y){ return x.first < y.first; });
+        write_varint(ph, pos.hog_pos - prev_pos); prev_pos = pos.hog_pos;
+        write_varint(ph, uint32_t(obs.size()));
+        uint32_t prev_uid = 0;
+        for (auto& x : obs) { uint32_t uid = uidmap[x.first]; write_varint(uc, uid - prev_uid); prev_uid = uid; }
+        uint32_t no = uint32_t(obs.size());
+        uint32_t counts[64] = {};
+        for (auto& x : obs) counts[x.second & 0x3F]++;
+        uint8_t best = 0; uint32_t best_cnt = 0;
+        for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
+        kc.push_back(best); write_varint(kc, no - best_cnt);
+        uint32_t prev_ord = 0;
+        for (uint32_t i = 0; i < no; ++i) if (obs[i].second != best) { write_varint(kc, i - prev_ord); prev_ord = i; }
+        for (uint32_t i = 0; i < no; ++i) if (obs[i].second != best) kc.push_back(obs[i].second);
+    }
+    raw.insert(raw.end(), ph.begin(), ph.end());
+    raw.insert(raw.end(), uc.begin(), uc.end());
+    raw.insert(raw.end(), kc.begin(), kc.end());
+}
+
+// Always emits a v9 block (uid trailer + Δ-uid column). The caller writes the LHH2 magic.
 inline void finalize_inverted_payload(
         const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
         const std::vector<InvPosition>& positions, uint32_t hog_length,
@@ -526,20 +592,9 @@ inline void finalize_inverted_payload(
         std::vector<uint8_t>& sb_cnum, std::vector<uint8_t>& sb_codon,
         ZSTD_CCtx* cctx, int level, uint64_t* ser_done_ns,
         uint32_t& stored_sz, const uint8_t*& payload, size_t& payload_sz) {
-    // Stream the big ones: a one-shot serialize+compress holds the full raw block AND a
-    // compressBound buffer (~2x raw) resident; streaming caps that at one 8 MiB chunk.
-    size_t n_obs_total = 0;
-    for (const auto& p : positions) n_obs_total += p.obs.size();
-    if (cctx && n_obs_total > 2'000'000) {
-        serialize_compress_streamed(local_accs, local_acc_pident, positions, hog_length,
-                                    covered_aa_v, cctx, level, inv_raw, hog_cbuf);
-        if (ser_done_ns) *ser_done_ns = clock_ns();
-        stored_sz = 0x40000000u; payload = hog_cbuf.data(); payload_sz = hog_cbuf.size();
-        return;
-    }
+    (void)sb_hdr; (void)sb_acc; (void)sb_cnum; (void)sb_codon;
     inv_raw.clear();
-    serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
-                             covered_aa_v, sb_hdr, sb_acc, sb_cnum, sb_codon);
+    serialize_inverted_block_v9(inv_raw, local_accs, local_acc_pident, positions, hog_length, covered_aa_v);
     if (ser_done_ns) *ser_done_ns = clock_ns();
     size_t raw_sz = inv_raw.size();
     size_t bound = ZSTD_compressBound(raw_sz);
@@ -1536,7 +1591,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         gr.hog_id = hog_id;
         gr.n_accs = sc.n_accs;
         gr.stored_sz = stored_sz;
-        gr.is_v9 = streamed_big;          // streaming build emitted the v9 uid+trailer layout
+        gr.is_v9 = true;                  // both the streaming build and finalize emit v9
         gr.payload.assign(payload, payload + payload_sz);
         size_t psz = gr.payload.size();
         {

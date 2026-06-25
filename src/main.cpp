@@ -336,7 +336,7 @@ int main(int argc, char* argv[]) {
             if (!emit_err.empty()) return;
             try {
                 uint8_t hdr8[8];
-                memcpy(hdr8, lhi::LHG_HOG_ENTRY_MAGIC, 4);
+                memcpy(hdr8, r.is_v9 ? lhi::LHG_HOG_ENTRY_MAGIC_V2 : lhi::LHG_HOG_ENTRY_MAGIC, 4);
                 for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(r.stored_sz >> (8*i));
                 lhi::HogIndexEntry e;
                 e.hog_id       = std::move(r.hog_id);
