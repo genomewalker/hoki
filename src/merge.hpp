@@ -266,6 +266,82 @@ inline uint32_t merged_interval_cov(std::vector<std::pair<uint32_t,uint32_t>>& i
 // uses ZSTD_compress2 (persistent ctx); else one-shot ZSTD_compress at `level`. If
 // ser_done_ns!=null it is set right after serialize (before compress) so callers can split
 // build vs compress timing. Shared by the spill build and the merge_batches reduce build.
+// Streaming serialize+compress: emits the SAME byte layout as serialize_inverted_block
+// (acc-dict, coverage, position headers, then acc/cnum/codon columns) but feeds it through
+// ZSTD_compressStream2 in <=CHUNK pieces, so neither the whole serialized block nor a
+// compressBound output buffer is ever materialized. This is what lets a super-HOG (e.g.
+// chr2H18749, ~10 GiB serialized) build within --flush instead of needing ~2x that resident.
+// `chunk` is reused scratch (bounded to ~CHUNK); compressed bytes are appended to `out`.
+inline void serialize_compress_streamed(
+        const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
+        const std::vector<InvPosition>& positions, uint32_t hog_length,
+        const std::vector<uint32_t>& covered_aa, ZSTD_CCtx* cctx, int level,
+        std::vector<uint8_t>& chunk, std::vector<uint8_t>& out) {
+    static constexpr size_t CHUNK = 8u << 20;
+    (void)level;   // the persistent cctx already carries the configured level; session-only
+    out.clear(); chunk.clear();
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);   // reset keeps compressionLevel param
+    std::vector<uint8_t> ob(ZSTD_CStreamOutSize());
+    auto push = [&](bool last) {
+        ZSTD_inBuffer in{ chunk.data(), chunk.size(), 0 };
+        for (;;) {
+            ZSTD_outBuffer o{ ob.data(), ob.size(), 0 };
+            size_t r = ZSTD_compressStream2(cctx, &o, &in, last ? ZSTD_e_end : ZSTD_e_continue);
+            if (ZSTD_isError(r)) throw std::runtime_error(std::string("zstd stream: ") + ZSTD_getErrorName(r));
+            out.insert(out.end(), ob.data(), ob.data() + o.pos);
+            if (last) { if (r == 0) break; }
+            else if (in.pos == in.size) break;
+        }
+        chunk.clear();
+    };
+    auto flush_if_big = [&]{ if (chunk.size() >= CHUNK) push(false); };
+
+    uint32_t n_local = uint32_t(local_accs.size());
+    write_varint(chunk, n_local);
+    uint32_t prev_gacc = 0;
+    for (uint32_t li = 0; li < n_local; ++li) {
+        write_varint(chunk, local_accs[li] - prev_gacc); prev_gacc = local_accs[li];
+        chunk.push_back(li < local_acc_pident.size() ? local_acc_pident[li] : 0);
+        flush_if_big();
+    }
+    write_varint(chunk, hog_length);
+    for (uint32_t li = 0; li < n_local; ++li) {
+        write_varint(chunk, li < covered_aa.size() ? covered_aa[li] : 0);
+        flush_if_big();
+    }
+    uint32_t n_pos = uint32_t(positions.size());
+    write_varint(chunk, n_pos);
+    uint32_t prev_pos = 0;
+    for (const auto& pos : positions) {
+        write_varint(chunk, pos.hog_pos - prev_pos); prev_pos = pos.hog_pos;
+        write_varint(chunk, uint32_t(pos.obs.size()));
+        flush_if_big();
+    }
+    for (const auto& pos : positions) {                       // acc column (li deltas, reset per pos)
+        uint32_t lacc = 0, prev_li = 0;
+        for (const auto& o : pos.obs) { while (local_accs[lacc] < o.acc_idx) ++lacc;
+            write_varint(chunk, lacc - prev_li); prev_li = lacc; }
+        flush_if_big();
+    }
+    for (const auto& pos : positions) {                       // cnum column
+        for (const auto& o : pos.obs) write_varint(chunk, o.cnum);
+        flush_if_big();
+    }
+    for (const auto& pos : positions) {                       // codon column
+        uint32_t n_obs = uint32_t(pos.obs.size());
+        uint32_t counts[64] = {};
+        for (const auto& o : pos.obs) counts[o.codon_idx & 0x3F]++;
+        uint8_t best = 0; uint32_t best_cnt = 0;
+        for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
+        chunk.push_back(best); write_varint(chunk, n_obs - best_cnt);
+        uint32_t prev_ord = 0;
+        for (uint32_t i = 0; i < n_obs; ++i) if (pos.obs[i].codon_idx != best) { write_varint(chunk, i - prev_ord); prev_ord = i; }
+        for (const auto& o : pos.obs) if (o.codon_idx != best) chunk.push_back(o.codon_idx);
+        flush_if_big();
+    }
+    push(true);
+}
+
 inline void finalize_inverted_payload(
         const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
         const std::vector<InvPosition>& positions, uint32_t hog_length,
@@ -275,6 +351,17 @@ inline void finalize_inverted_payload(
         std::vector<uint8_t>& sb_cnum, std::vector<uint8_t>& sb_codon,
         ZSTD_CCtx* cctx, int level, uint64_t* ser_done_ns,
         uint32_t& stored_sz, const uint8_t*& payload, size_t& payload_sz) {
+    // Stream the big ones: a one-shot serialize+compress holds the full raw block AND a
+    // compressBound buffer (~2x raw) resident; streaming caps that at one 8 MiB chunk.
+    size_t n_obs_total = 0;
+    for (const auto& p : positions) n_obs_total += p.obs.size();
+    if (cctx && n_obs_total > 2'000'000) {
+        serialize_compress_streamed(local_accs, local_acc_pident, positions, hog_length,
+                                    covered_aa_v, cctx, level, inv_raw, hog_cbuf);
+        if (ser_done_ns) *ser_done_ns = clock_ns();
+        stored_sz = 0x40000000u; payload = hog_cbuf.data(); payload_sz = hog_cbuf.size();
+        return;
+    }
     inv_raw.clear();
     serialize_inverted_block(inv_raw, local_accs, local_acc_pident, positions, hog_length,
                              covered_aa_v, sb_hdr, sb_acc, sb_cnum, sb_codon);

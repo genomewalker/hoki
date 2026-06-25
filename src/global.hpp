@@ -336,13 +336,31 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
         out.raw.assign(cbuf, cbuf + payload_sz);
     } else if (is_zstd) {
         unsigned long long rsz = ZSTD_getFrameContentSize(cbuf, payload_sz);
-        if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
-            throw std::runtime_error("cannot determine ZSTD raw size for HOG " + entry.hog_id);
-        out.raw.resize(size_t(rsz));
-        size_t dz = ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf, payload_sz);
-        if (ZSTD_isError(dz))
-            throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
-        out.raw.resize(dz);
+        if (rsz == ZSTD_CONTENTSIZE_ERROR)
+            throw std::runtime_error("corrupt ZSTD frame for HOG " + entry.hog_id);
+        if (rsz != ZSTD_CONTENTSIZE_UNKNOWN) {
+            out.raw.resize(size_t(rsz));
+            size_t dz = ZSTD_decompress(out.raw.data(), out.raw.size(), cbuf, payload_sz);
+            if (ZSTD_isError(dz))
+                throw std::runtime_error(std::string("zstd HOG decompress: ") + ZSTD_getErrorName(dz));
+            out.raw.resize(dz);
+        } else {
+            // Streaming frame (super-HOG built with ZSTD_compressStream2, no content-size
+            // header) — decompress incrementally into out.raw.
+            ZSTD_DCtx* dctx = ZSTD_createDCtx();
+            if (!dctx) throw std::runtime_error("ZSTD_createDCtx failed");
+            ZSTD_inBuffer in{ cbuf, payload_sz, 0 };
+            std::vector<uint8_t> tmp(ZSTD_DStreamOutSize());
+            out.raw.clear();
+            while (in.pos < in.size) {
+                ZSTD_outBuffer o{ tmp.data(), tmp.size(), 0 };
+                size_t ret = ZSTD_decompressStream(dctx, &o, &in);
+                if (ZSTD_isError(ret)) { ZSTD_freeDCtx(dctx);
+                    throw std::runtime_error(std::string("zstd HOG stream decompress: ") + ZSTD_getErrorName(ret)); }
+                out.raw.insert(out.raw.end(), tmp.data(), tmp.data() + o.pos);
+            }
+            ZSTD_freeDCtx(dctx);
+        }
     } else {
         throw std::runtime_error("unsupported compression in HOG entry: " + entry.hog_id);
     }
