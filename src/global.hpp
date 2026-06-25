@@ -71,6 +71,11 @@ constexpr uint8_t LHG_FILE_MAGIC[4]      = {'L','H','G','G'};
 constexpr uint8_t LHG_INDEX_MAGIC[4]     = {'L','H','G','I'};
 constexpr uint8_t LHG_ACC_MAGIC[4]       = {'L','H','G','A'};
 constexpr uint8_t LHG_HOG_ENTRY_MAGIC[4] = {'L','H','H','E'};
+// v9 block: acc+cnum columns replaced by a unitig trailer + a Δ-uid column (the unitig
+// (acc,cnum) is constant across its ~150 positions, so a Δ-encoded uid compresses like the
+// acc column while folding cnum into the trailer — ~60% smaller blocks, lossless). Detected
+// per-block by magic so v8 (LHHE) and v9 (LHH2) coexist in one file; reader handles both.
+constexpr uint8_t LHG_HOG_ENTRY_MAGIC_V2[4] = {'L','H','H','2'};
 constexpr uint8_t LHG_VERSION            = 8;
 constexpr size_t  LHG_HEADER_SZ          = 16; // magic(4)+ver(1)+flags(1)+pad(2)+index_offset(8)
 
@@ -300,6 +305,10 @@ struct InvBlock {
     std::vector<uint32_t> covered_aa;      // AA covered per local acc
     const uint8_t*        pos_ptr = nullptr;
     const uint8_t*        end     = nullptr;
+    // v9 only: unitig trailer (decode resolves a per-obs uid -> these). Empty for v8.
+    bool                  is_v9 = false;
+    std::vector<uint32_t> trailer_acc;      // per uid: local acc idx (into local_accs)
+    std::vector<uint32_t> trailer_cnum;     // per uid: contig/unitig number
 };
 
 // Decompress raw HOG payload into out.raw and parse the block header (local acc dict
@@ -310,8 +319,10 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
     (void)lhg_path;
     uint8_t hoe_buf[8];
     if (::pread(fd, hoe_buf, 8, off_t(entry.data_offset)) != 8) return false;
-    if (memcmp(hoe_buf, LHG_HOG_ENTRY_MAGIC, 4) != 0)
+    bool v9 = (memcmp(hoe_buf, LHG_HOG_ENTRY_MAGIC_V2, 4) == 0);
+    if (!v9 && memcmp(hoe_buf, LHG_HOG_ENTRY_MAGIC, 4) != 0)
         throw std::runtime_error("bad HOG entry magic for " + entry.hog_id);
+    out.is_v9 = v9;
     uint32_t stored = read_u32_le(hoe_buf + 4);
     bool is_raw  = (stored >> 31) & 1;
     bool is_zstd = !is_raw && ((stored >> 30) & 1);
@@ -410,6 +421,26 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
         }
     }
 
+    // v9: unitig trailer (n_unitigs, then per unitig: Δ(acc_local), cnum). Decode resolves
+    // each obs's uid against this; the acc/cnum columns are replaced by a single Δ-uid column.
+    if (v9) {
+        uint32_t n_uni = 0;
+        n = read_varint(p, out.end, &n_uni);
+        if (!n) throw std::runtime_error("corrupt unitig trailer for HOG " + entry.hog_id);
+        p += n;
+        out.trailer_acc.resize(n_uni);
+        out.trailer_cnum.resize(n_uni);
+        uint32_t prev_acc = 0;
+        for (uint32_t u = 0; u < n_uni; ++u) {
+            uint32_t da = 0; n = read_varint(p, out.end, &da);
+            if (!n) throw std::runtime_error("truncated trailer acc for HOG " + entry.hog_id);
+            p += n; prev_acc += da; out.trailer_acc[u] = prev_acc;
+            uint32_t c = 0; n = read_varint(p, out.end, &c);
+            if (!n) throw std::runtime_error("truncated trailer cnum for HOG " + entry.hog_id);
+            p += n; out.trailer_cnum[u] = c;
+        }
+    }
+
     out.pos_ptr = p;
     return true;
 }
@@ -452,9 +483,27 @@ inline std::vector<InvPosition> decode_block(const InvBlock& blk) {
         total_obs += nob;
     }
 
-    // Acc column: delta-encoded local_acc_idx, delta resets per position.
+    // Acc column. v8: Δ(local_acc_idx) reset per position. v9: a single Δ(uid) column
+    // (reset per position) resolved through the unitig trailer to (acc, cnum) — both filled here.
     std::vector<uint32_t> all_lidx(total_obs);
-    {
+    std::vector<uint32_t> all_cnum;          // populated here for v9; v8 reads its own column below
+    if (blk.is_v9) {
+        all_cnum.resize(total_obs);
+        uint32_t obs_i = 0;
+        for (uint32_t pi = 0; pi < n_positions; ++pi) {
+            uint32_t prev_uid = 0;
+            for (uint32_t k = 0; k < n_obs_vec[pi]; ++k) {
+                uint32_t d = 0;
+                n = read_varint(p, end, &d); if (!n) throw std::runtime_error("decode_block: corrupt uid column");
+                p += n;
+                prev_uid += d;
+                if (prev_uid >= blk.trailer_acc.size()) throw std::runtime_error("decode_block: uid OOB");
+                all_lidx[obs_i] = blk.trailer_acc[prev_uid];
+                all_cnum[obs_i] = blk.trailer_cnum[prev_uid];
+                ++obs_i;
+            }
+        }
+    } else {
         uint32_t obs_i = 0;
         for (uint32_t pi = 0; pi < n_positions; ++pi) {
             uint32_t prev_li = 0;
@@ -482,14 +531,23 @@ inline std::vector<InvPosition> decode_block(const InvBlock& blk) {
         }
     }
 
-    // Cnum column (per-obs, global).
-    for (uint32_t pi = 0; pi < n_positions; ++pi) {
-        for (uint32_t i = 0; i < n_obs_vec[pi]; ++i) {
-            uint32_t c = 0;
-            n = read_varint(p, end, &c);
-            if (!n) throw std::runtime_error("decode_block: corrupt cnum column");
-            p += n;
-            result[pi].obs[i].cnum = c;
+    // Cnum column. v9 already resolved cnum via the trailer (in all_cnum); v8 reads it here.
+    if (blk.is_v9) {
+        uint32_t obs_off = 0;
+        for (uint32_t pi = 0; pi < n_positions; ++pi) {
+            uint32_t nob = n_obs_vec[pi];
+            for (uint32_t i = 0; i < nob; ++i) result[pi].obs[i].cnum = all_cnum[obs_off + i];
+            obs_off += nob;
+        }
+    } else {
+        for (uint32_t pi = 0; pi < n_positions; ++pi) {
+            for (uint32_t i = 0; i < n_obs_vec[pi]; ++i) {
+                uint32_t c = 0;
+                n = read_varint(p, end, &c);
+                if (!n) throw std::runtime_error("decode_block: corrupt cnum column");
+                p += n;
+                result[pi].obs[i].cnum = c;
+            }
         }
     }
 
