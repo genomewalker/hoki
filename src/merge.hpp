@@ -342,6 +342,161 @@ inline void serialize_compress_streamed(
     push(true);
 }
 
+// ── Memory-bounded streaming merge for big all-.lhg HOGs ──────────────────────
+// A cursor walks one decompressed InvBlock.raw WITHOUT decode_block (which would
+// materialize every obs). It pre-scans to locate the acc/cnum/codon column starts,
+// then yields each position's obs (global acc, cnum, codon) on demand — reproducing
+// decode_block byte-for-byte one position at a time.
+struct LhgColCursor {
+    const std::vector<uint32_t>* remap = nullptr;   // local idx -> global acc
+    std::vector<uint32_t> pos_vals, nobs;           // per position
+    size_t n_pos = 0, cur = 0;
+    const uint8_t *p_acc = nullptr, *p_cnum = nullptr, *p_codon = nullptr, *end = nullptr;
+
+    void init(const InvBlock& blk, const std::vector<uint32_t>& remap_) {
+        remap = &remap_;
+        const uint8_t* p = blk.pos_ptr; end = blk.end;
+        uint32_t np = 0; int n = read_varint(p, end, &np); if (!n) throw std::runtime_error("cursor: pos count"); p += n;
+        n_pos = np; pos_vals.resize(np); nobs.resize(np);
+        uint32_t prev = 0; uint64_t tot = 0;
+        for (uint32_t i = 0; i < np; ++i) {
+            uint32_t d = 0; n = read_varint(p, end, &d); if (!n) throw std::runtime_error("cursor: pos delta"); p += n;
+            prev += d; pos_vals[i] = prev;
+            uint32_t no = 0; n = read_varint(p, end, &no); if (!n) throw std::runtime_error("cursor: n_obs"); p += n;
+            nobs[i] = no; tot += no;
+        }
+        p_acc = p;
+        const uint8_t* q = p_acc;                                   // skip acc column -> cnum start
+        for (uint64_t i = 0; i < tot; ++i) { uint32_t d; int m = read_varint(q, end, &d); if (!m) throw std::runtime_error("cursor: acc skip"); q += m; }
+        p_cnum = q;
+        for (uint64_t i = 0; i < tot; ++i) { uint32_t d; int m = read_varint(q, end, &d); if (!m) throw std::runtime_error("cursor: cnum skip"); q += m; }
+        p_codon = q;
+    }
+    bool done() const { return cur >= n_pos; }
+    uint32_t pos() const { return pos_vals[cur]; }
+    // Append current position's obs to `out`; advance. Mirrors decode_block exactly.
+    void emit(std::vector<InvObs>& out) {
+        uint32_t no = nobs[cur];
+        size_t base = out.size();
+        uint32_t prev_li = 0;
+        for (uint32_t i = 0; i < no; ++i) {
+            uint32_t d = 0; int m = read_varint(p_acc, end, &d); p_acc += m; prev_li += d;
+            if (prev_li >= remap->size()) throw std::runtime_error("cursor: acc_idx OOB");
+            out.push_back(InvObs{ (*remap)[prev_li], 0, 0 });
+        }
+        for (uint32_t i = 0; i < no; ++i) { uint32_t c = 0; int m = read_varint(p_cnum, end, &c); p_cnum += m; out[base + i].cnum = c; }
+        if (p_codon >= end) throw std::runtime_error("cursor: codon trunc");
+        uint8_t consensus = *p_codon++;
+        for (uint32_t i = 0; i < no; ++i) out[base + i].codon_idx = consensus;
+        uint32_t nvar = 0; int m = read_varint(p_codon, end, &nvar); p_codon += m;
+        static thread_local std::vector<uint32_t> ords; ords.resize(nvar);
+        uint32_t prev_ord = 0;
+        for (uint32_t v = 0; v < nvar; ++v) { uint32_t d = 0; int mm = read_varint(p_codon, end, &d); p_codon += mm; prev_ord += d; ords[v] = prev_ord; }
+        for (uint32_t v = 0; v < nvar; ++v) { uint8_t vc = *p_codon++; out[base + ords[v]].codon_idx = vc; }
+        ++cur;
+    }
+};
+
+// Streaming windowed merge: union N position-sorted .lhg blocks into one payload with
+// O(Σ raw blocks + one-position window) memory — no materialized per-block or merged obs
+// vectors. Byte-identical to the decode_block+merge_lhg_blocks+serialize path. `remaps[bi]`
+// maps block bi's local acc idx -> global acc. `local_accs` is the sorted global acc-union;
+// pident/covered_aa are indexed parallel to it. Output compressed payload appended to `out`.
+inline void build_inverted_streamed_lhg(
+        std::vector<InvBlock>& blocks,
+        const std::vector<const std::vector<uint32_t>*>& remaps,
+        const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
+        const std::vector<uint32_t>& covered_aa, uint32_t hog_length,
+        ZSTD_CCtx* cctx, std::vector<uint8_t>& out) {
+    const size_t N = blocks.size();
+    uint32_t n_local = uint32_t(local_accs.size());
+
+    // Section buffers (compact varint columns), built once then streamed.
+    std::vector<uint8_t> head, pos_hdr, acc_col, cnum_col, codon_col;
+    // Header: acc-dict + coverage (matches serialize_inverted_block sections 1-2).
+    write_varint(head, n_local);
+    { uint32_t prev = 0; for (uint32_t li = 0; li < n_local; ++li) {
+        write_varint(head, local_accs[li] - prev); prev = local_accs[li];
+        head.push_back(li < local_acc_pident.size() ? local_acc_pident[li] : 0); } }
+    write_varint(head, hog_length);
+    for (uint32_t li = 0; li < n_local; ++li) write_varint(head, li < covered_aa.size() ? covered_aa[li] : 0);
+
+    // Cursors + min-heap over positions.
+    std::vector<LhgColCursor> cur(N);
+    for (size_t bi = 0; bi < N; ++bi) cur[bi].init(blocks[bi], *remaps[bi]);
+    struct HItem { uint32_t pos; size_t src; };
+    auto cmp = [](const HItem& a, const HItem& b) { return a.pos > b.pos; };
+    std::priority_queue<HItem, std::vector<HItem>, decltype(cmp)> heap(cmp);
+    for (size_t bi = 0; bi < N; ++bi) if (!cur[bi].done()) heap.push({cur[bi].pos(), bi});
+
+    std::vector<InvObs> win; win.reserve(1u << 20);
+    std::vector<std::vector<InvObs>> win_by_src(N);
+    uint32_t n_pos = 0, prev_pos = 0;
+    while (!heap.empty()) {
+        uint32_t cp = heap.top().pos;
+        for (auto& v : win_by_src) v.clear();
+        while (!heap.empty() && heap.top().pos == cp) {
+            size_t bi = heap.top().src; heap.pop();
+            cur[bi].emit(win_by_src[bi]);
+            if (!cur[bi].done()) heap.push({cur[bi].pos(), bi});
+        }
+        // Concatenate in block (cursor) order — NOT sorted — to match merge_lhg_blocks
+        // byte-for-byte. Shards hold contiguous, ordered global-acc ranges, so block order
+        // is already globally acc-monotonic (serialize's lacc_ptr walk requires that).
+        win.clear();
+        for (size_t bi = 0; bi < N; ++bi)
+            win.insert(win.end(), win_by_src[bi].begin(), win_by_src[bi].end());
+        uint32_t no = uint32_t(win.size());
+        // Position header (Δpos, n_obs).
+        write_varint(pos_hdr, cp - prev_pos); prev_pos = cp;
+        write_varint(pos_hdr, no);
+        // acc column: Δ(merged-local idx), reset per pos (monotonic walk over sorted local_accs).
+        { uint32_t lacc = 0, prev_li = 0;
+          for (uint32_t i = 0; i < no; ++i) {
+              while (lacc < n_local && local_accs[lacc] < win[i].acc_idx) ++lacc;
+              write_varint(acc_col, lacc - prev_li); prev_li = lacc;
+          } }
+        // cnum column.
+        for (uint32_t i = 0; i < no; ++i) write_varint(cnum_col, win[i].cnum);
+        // codon column: per-position consensus (lowest codon among max count) + variants.
+        { uint32_t counts[64] = {};
+          for (uint32_t i = 0; i < no; ++i) counts[win[i].codon_idx & 0x3F]++;
+          uint8_t best = 0; uint32_t best_cnt = 0;
+          for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
+          codon_col.push_back(best);
+          write_varint(codon_col, no - best_cnt);
+          uint32_t prev_ord = 0;
+          for (uint32_t i = 0; i < no; ++i) if (win[i].codon_idx != best) { write_varint(codon_col, i - prev_ord); prev_ord = i; }
+          for (uint32_t i = 0; i < no; ++i) if (win[i].codon_idx != best) codon_col.push_back(win[i].codon_idx); }
+        ++n_pos;
+    }
+    // Cursors are exhausted — free the decompressed input blocks before compressing so peak
+    // is columns + output, not columns + output + inputs.
+    win.clear(); win.shrink_to_fit();
+    for (auto& b : blocks) { std::vector<uint8_t>().swap(b.raw); b.pos_ptr = b.end = nullptr; }
+
+    // Prepend n_pos to the position-header section (it precedes the per-pos entries).
+    std::vector<uint8_t> ph; write_varint(ph, n_pos);
+    ph.insert(ph.end(), pos_hdr.begin(), pos_hdr.end());
+    std::vector<uint8_t>().swap(pos_hdr);
+
+    // Stream header + pos-headers + columns through one ZSTD frame.
+    out.clear();
+    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
+    std::vector<uint8_t> ob(ZSTD_CStreamOutSize());
+    auto feed = [&](const std::vector<uint8_t>& buf, bool last) {
+        ZSTD_inBuffer in{ buf.data(), buf.size(), 0 };
+        for (;;) {
+            ZSTD_outBuffer o{ ob.data(), ob.size(), 0 };
+            size_t r = ZSTD_compressStream2(cctx, &o, &in, last ? ZSTD_e_end : ZSTD_e_continue);
+            if (ZSTD_isError(r)) throw std::runtime_error(std::string("zstd merge stream: ") + ZSTD_getErrorName(r));
+            out.insert(out.end(), ob.data(), ob.data() + o.pos);
+            if (last) { if (r == 0) break; } else if (in.pos == in.size) break;
+        }
+    };
+    feed(head, false); feed(ph, false); feed(acc_col, false); feed(cnum_col, false); feed(codon_col, true);
+}
+
 inline void finalize_inverted_payload(
         const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
         const std::vector<InvPosition>& positions, uint32_t hog_length,
@@ -913,7 +1068,8 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     const size_t out_budget   = std::max<size_t>(mem_budget / 4, size_t(64) << 20);
     const size_t build_budget = mem_budget > out_budget ? mem_budget - out_budget : mem_budget;
     const size_t rss_cap      = mem_budget;
-    static constexpr size_t MEM_FACTOR = 24;
+    // Streaming build peak ≈ Σ decompressed inputs + columns ≈ compressed bytes × ~8.
+    static constexpr size_t MEM_FACTOR = 8;
     size_t                  build_in_use = 0;
     std::mutex              build_mtx;
     std::condition_variable build_cv;
@@ -1000,6 +1156,11 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         uint64_t t0 = clock_ns();
         uint64_t t_dec_end = 0, t_build_end = 0;
 
+        // Big all-.lhg HOGs take the memory-bounded streaming merge (no materialized obs);
+        // stream_blocks then points at the decoded blocks the cursors walk at finalize.
+        bool streamed_big = false;
+        std::vector<InvBlock>* stream_blocks = nullptr;
+
         if (all_lhg) {
             // Shared tail for both decode strategies: `blocks` holds the n_blocks decoded
             // InvBlocks; accumulate coverage/pident, remap to global acc space, then K-way
@@ -1076,6 +1237,35 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                 }
             };
 
+            // Big-HOG path: build only the acc-union + coverage/pident from headers (no obs
+            // decode), so build_inverted_streamed_lhg can window-merge the blocks at finalize.
+            auto build_acc_maps_only = [&](std::vector<InvBlock>& blocks) {
+                sc.hog_length = 0; sc.acc_intervals_map.clear();
+                sc.acc_covered_aa_map.clear(); sc.acc_pident_map.clear();
+                for (size_t bi = 0; bi < n_blocks; ++bi) {
+                    const auto& remap = src_remap[refs[group_start + bi].source_file_idx];
+                    const InvBlock& blk = blocks[bi];
+                    sc.hog_length = std::max(sc.hog_length, blk.hog_length);
+                    for (size_t li = 0; li < blk.local_accs.size(); ++li) {
+                        if (li >= remap.size()) continue;
+                        uint32_t gacc = remap[li];
+                        if (li < blk.covered_aa.size()) sc.acc_covered_aa_map[gacc] += blk.covered_aa[li];
+                        if (li < blk.local_acc_pident.size()) {
+                            uint8_t pid = blk.local_acc_pident[li];
+                            auto it = sc.acc_pident_map.find(gacc);
+                            if (it == sc.acc_pident_map.end() || pid < it->second) sc.acc_pident_map[gacc] = pid;
+                        }
+                        mark_acc(gacc);
+                    }
+                }
+            };
+            // Dispatch: >64 MiB decompressed input → streaming merge; else the in-RAM path.
+            auto process_blocks = [&](std::vector<InvBlock>& blocks) {
+                size_t raw_tot = 0; for (auto& b : blocks) raw_tot += b.raw.size();
+                if (raw_tot > (64u << 20)) { build_acc_maps_only(blocks); streamed_big = true; stream_blocks = &blocks; }
+                else                       { merge_lhg_blocks(blocks); }
+            };
+
             bool is_hot = (int(n_blocks) > hot_threshold);
             if (is_hot) {
                 // Hot path: fan the per-block pread+decompress out to the worker pool.
@@ -1098,7 +1288,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     else     std::this_thread::yield();
                 }
                 t_dec_end = clock_ns();
-                merge_lhg_blocks(hot_states[g]->blocks);
+                process_blocks(hot_states[g]->blocks);
             } else {
                 // Cold path: decode all blocks inline on this thread.
                 auto& blocks = sc.blocks; blocks.clear(); blocks.resize(n_blocks);
@@ -1113,7 +1303,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                         throw std::runtime_error("failed to read .lhg HOG " + hog_id);
                 }
                 t_dec_end = clock_ns();
-                merge_lhg_blocks(blocks);
+                process_blocks(blocks);
             }
         } else {
             // Mixed/LHB groups: accumulate into a flat (pos, obs) vector, sort once.
@@ -1302,9 +1492,21 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
 
         // Serialize + compress the inverted block (shared with the spill build).
         uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
-        finalize_inverted_payload(local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
-                                  inv_raw, hog_cbuf, sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf,
-                                  sc.ser_codon_buf, cctx, 0, &t_build_end, stored_sz, payload, payload_sz);
+        if (streamed_big) {
+            // Memory-bounded windowed merge: no materialized obs vectors (frees input raw
+            // before compress). Output compressed payload lands in hog_cbuf.
+            std::vector<const std::vector<uint32_t>*> remaps; remaps.reserve(n_blocks);
+            for (size_t bi = 0; bi < n_blocks; ++bi)
+                remaps.push_back(&src_remap[refs[group_start + bi].source_file_idx]);
+            build_inverted_streamed_lhg(*stream_blocks, remaps, local_accs, local_acc_pident,
+                                        covered_aa_v, sc.hog_length, cctx, hog_cbuf);
+            t_build_end = clock_ns();
+            stored_sz = 0x40000000u; payload = hog_cbuf.data(); payload_sz = hog_cbuf.size();
+        } else {
+            finalize_inverted_payload(local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
+                                      inv_raw, hog_cbuf, sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf,
+                                      sc.ser_codon_buf, cctx, 0, &t_build_end, stored_sz, payload, payload_sz);
+        }
         tl_decode   += t_dec_end - t0;
         tl_build    += t_build_end - t_dec_end;
         tl_compress += clock_ns() - t_build_end;
