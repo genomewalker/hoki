@@ -315,12 +315,21 @@ inline bool read_hog_inverted_fd(int fd, const std::string& lhg_path,
     uint32_t stored = read_u32_le(hoe_buf + 4);
     bool is_raw  = (stored >> 31) & 1;
     bool is_zstd = !is_raw && ((stored >> 30) & 1);
-    uint32_t payload_sz = stored & (is_raw ? 0x7FFFFFFFu : 0x3FFFFFFFu);
-    if (payload_sz > 256u * 1024 * 1024) return false;
+    // Size comes from the uint64 index, not the inline word: a merged super-HOG block
+    // can exceed the inline field's 30-bit size range (~1 GiB), at which point the size
+    // bits collide with the raw/zstd flag bits. data_length (= 8-byte header + payload)
+    // always carries the true length, so flags come from the inline word, size from here.
+    if (entry.data_length < 8) return false;
+    size_t payload_sz = size_t(entry.data_length - 8);
 
     std::vector<uint8_t> cbuf_owned(payload_sz);
-    if (::pread(fd, cbuf_owned.data(), payload_sz, off_t(entry.data_offset) + 8) != ssize_t(payload_sz))
-        return false;
+    { size_t got = 0;                                   // pread caps at ~2 GiB/call; loop for big blocks
+      while (got < payload_sz) {
+          ssize_t r = ::pread(fd, cbuf_owned.data() + got, payload_sz - got,
+                              off_t(entry.data_offset) + 8 + off_t(got));
+          if (r <= 0) return false;
+          got += size_t(r);
+      } }
     const uint8_t* cbuf = cbuf_owned.data();
 
     if (is_raw) {
@@ -601,7 +610,16 @@ inline std::vector<uint8_t> build_index_bytes(const std::vector<HogIndexEntry>& 
     buf.insert(buf.end(), LHG_INDEX_MAGIC, LHG_INDEX_MAGIC + 4);
     uint32_t n = uint32_t(entries.size());
     for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(n >> (8 * i)));
-    for (auto& e : entries) {
+    // GlobalIndex::find binary-searches, so the serialized order MUST be sorted by
+    // hog_id. merge-shard pre-sorts; merge_batches emits in completion order — sort
+    // here so every .lhgi is searchable regardless of the caller. (Sort pointers to
+    // avoid copying entries; already-sorted input costs near-nothing.)
+    std::vector<const HogIndexEntry*> order; order.reserve(entries.size());
+    for (auto& e : entries) order.push_back(&e);
+    std::sort(order.begin(), order.end(),
+              [](const HogIndexEntry* a, const HogIndexEntry* b){ return a->hog_id < b->hog_id; });
+    for (auto* ep : order) {
+        const auto& e = *ep;
         write_varint(buf, uint32_t(e.hog_id.size()));
         buf.insert(buf.end(), e.hog_id.begin(), e.hog_id.end());
         for (int i = 0; i < 8; ++i) buf.push_back(uint8_t(e.data_offset  >> (8 * i)));

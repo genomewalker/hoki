@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <fcntl.h>
 #include <unistd.h>
+#include <malloc.h>
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
@@ -37,6 +38,19 @@ static inline uint64_t clock_ns() {
 }
 
 namespace lhi {
+
+// Fast resident-set read via /proc/self/statm (single line: field 2 = resident pages).
+// Cheap enough to poll in the build-admission predicate (vs parsing /proc/self/status).
+inline size_t fast_rss_bytes() {
+    int fd = ::open("/proc/self/statm", O_RDONLY);
+    if (fd < 0) return 0;
+    char b[64]; ssize_t n = ::read(fd, b, sizeof(b) - 1); ::close(fd);
+    if (n <= 0) return 0;
+    b[n] = 0;
+    const char* p = b; while (*p && *p != ' ') ++p;   // skip total size, reach resident
+    size_t pages = strtoull(p, nullptr, 10);
+    return pages * size_t(sysconf(_SC_PAGESIZE));
+}
 
 // 8 MB write buffer: reduces per-HOG write() syscalls from 3 to ~0.003
 // (one flush per ~2730 HOGs instead of 3 syscalls per HOG).
@@ -271,8 +285,10 @@ inline void finalize_inverted_payload(
     size_t csz = cctx ? ZSTD_compress2(cctx, hog_cbuf.data(), bound, inv_raw.data(), raw_sz)
                       : ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, level);
     bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
-    if (use_raw) { stored_sz = uint32_t(raw_sz) | 0x80000000u; payload = inv_raw.data();  payload_sz = raw_sz; }
-    else         { stored_sz = uint32_t(csz)   | 0x40000000u; payload = hog_cbuf.data(); payload_sz = csz; }
+    // Inline word carries flags only; the true (uint64) length lives in the index, so
+    // blocks may exceed the old 30-bit inline size limit (merged super-HOGs hit ~2 GiB).
+    if (use_raw) { stored_sz = 0x80000000u; payload = inv_raw.data();  payload_sz = raw_sz; }
+    else         { stored_sz = 0x40000000u; payload = hog_cbuf.data(); payload_sz = csz; }
 }
 
 inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardScratch& sc,
@@ -365,6 +381,7 @@ inline void run_merge_shard_spill(
               << " buckets (budget " << (budget >> 20) << " MiB, -t " << nt << ")\n";
 
     std::atomic<bool> failed{false}; std::string err; std::mutex err_mtx;
+    uint64_t _t0 = clock_ns();
 
     // ── pass 1: decode each frame once, scatter records to bucket files ───────
     {
@@ -420,18 +437,22 @@ inline void run_merge_shard_spill(
         for (auto& t : pool) t.join();
         if (failed.load()) throw std::runtime_error("spill pass 1: " + err);
     }
+    uint64_t _t_p1 = clock_ns() - _t0;
+    uint64_t _t_read = 0, _t_build = 0;
 
     // ── pass 2: build one bucket at a time (parallel HOGs within a bucket) ────
     for (size_t b = 0; b < B; ++b) {
         off_t sz = lseek(bfd[b], 0, SEEK_END);
         if (sz <= 0) continue;
         std::vector<uint8_t> data; data.resize(size_t(sz));
+        uint64_t _r0 = clock_ns();
         { size_t got = 0;
           while (got < size_t(sz)) {
               ssize_t r = ::pread(bfd[b], data.data() + got, size_t(sz) - got, off_t(got));
               if (r <= 0) throw std::runtime_error("bucket read failed");
               got += size_t(r);
           } }
+        _t_read += clock_ns() - _r0;
         // group record spans by hog_idx
         std::unordered_map<uint32_t, std::vector<uint64_t>> groups;  // hog_idx -> record start offsets (64-bit: buckets exceed 4GB at scale)
         size_t off = 0;
@@ -445,6 +466,10 @@ inline void run_merge_shard_spill(
         }
         std::vector<uint32_t> hkeys; hkeys.reserve(groups.size());
         for (auto& kv : groups) hkeys.push_back(kv.first);
+        // LPT scheduling: biggest HOGs first so a giant one can't strand a thread
+        // at the tail while the rest idle (the pass2-build Amdahl bottleneck).
+        std::sort(hkeys.begin(), hkeys.end(),
+                  [&](uint32_t a, uint32_t b){ return groups[a].size() > groups[b].size(); });
 
         std::atomic<size_t> gnext{0};
         auto p2 = [&]() {
@@ -487,15 +512,20 @@ inline void run_merge_shard_spill(
             }
         };
         size_t bt = std::max<size_t>(1, std::min(nt, hkeys.size()));
+        uint64_t _b0 = clock_ns();
         std::vector<std::thread> pool;
         for (size_t t = 1; t < bt; ++t) pool.emplace_back(p2);
         p2();
         for (auto& t : pool) t.join();
+        _t_build += clock_ns() - _b0;
         if (failed.load()) throw std::runtime_error("spill pass 2: " + err);
         // free this bucket's backing store
         std::vector<uint8_t>().swap(data);
         ftruncate(bfd[b], 0);
     }
+    if (do_profile)
+        std::fprintf(stderr, "spill-prof: pass1(decode+spill) %.1fs | pass2-read %.1fs | pass2-build+compress %.1fs\n",
+                     _t_p1/1e9, _t_read/1e9, _t_build/1e9);
 }
 
 inline void merge_batches(const std::vector<std::string>& input_paths,
@@ -510,6 +540,14 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                           int out_zstd_level = 6,
                           size_t mem_budget = 16ull << 30) {
     // out_zstd_level: ZSTD compression level (default 3)
+
+    // Pin a fixed mmap threshold so the per-HOG build buffers (inv_raw/hog_cbuf, multi-GB
+    // for super-HOGs) are always mmap-backed and returned to the OS on free. Without this,
+    // glibc's *dynamic* threshold ratchets up after freeing large mmap blocks, routes
+    // subsequent big allocations through the sbrk arena, and never returns them — so RSS
+    // climbs unbounded even though live memory stays within the build budget.
+    mallopt(M_MMAP_THRESHOLD, 4 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 16 * 1024 * 1024);
 
     // Pass 1: parallel scan of all inputs into per-file ref lists; avoids single-threaded 12s serial cost.
     size_t scan_threads = std::max<size_t>(1, std::min<size_t>(
@@ -772,6 +810,27 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
     std::condition_variable space_cv;    // worker backpressure release
     size_t                  unwritten_bytes = 0;
 
+    // --flush is the TOTAL RSS budget (like ingest/merge-shard). Two consumers share it:
+    // unwritten OUTPUT payloads (out_budget) and per-HOG BUILD scratch — decoded input
+    // blocks + serialized inv_raw + compress buffer — which dominates (it was ~560 GB,
+    // 32 workers × multi-GB, while output stayed ~24 GB). Bound concurrent builds so their
+    // summed estimated cost stays under build_budget. est = compressed block bytes ×
+    // MEM_FACTOR (decoded ~4x + inv_raw ~4x + cbuf). A lone worker always proceeds, so a
+    // single HOG larger than the budget runs (the effective --flush floor is the biggest
+    // HOG's scratch). ceiling: a HOG whose scratch exceeds RAM still OOMs; upgrade: stream
+    // the per-HOG serialize/compress instead of materializing inv_raw whole.
+    // est = compressed bytes × MEM_FACTOR is only a herd-limiter (it prevents 32 workers
+    // admitting at once); the real ceiling is a hard ACTUAL-RSS guard, because per-HOG
+    // scratch is dominated by the *decompressed* inv_raw (5-8× the compressed input) and
+    // no static factor predicts it reliably. A lone worker always proceeds.
+    const size_t out_budget   = std::max<size_t>(mem_budget / 4, size_t(64) << 20);
+    const size_t build_budget = mem_budget > out_budget ? mem_budget - out_budget : mem_budget;
+    const size_t rss_cap      = mem_budget;
+    static constexpr size_t MEM_FACTOR = 24;
+    size_t                  build_in_use = 0;
+    std::mutex              build_mtx;
+    std::condition_variable build_cv;
+
     // Per-worker reusable containers — cleared (not reallocated) per group.
     struct WorkerScratch {
         // Distinct-acc counter: seen_epoch[gacc]==epoch ⇒ already counted this group.
@@ -999,9 +1058,9 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
                     uint32_t compressed_sz = read_u32_le(hdr_bytes + 8);
                     uint32_t raw_sz        = read_u32_le(hdr_bytes + 12);
 
-                    if (compressed_sz > 256u * 1024 * 1024)
+                    if (compressed_sz > 1024u * 1024 * 1024)
                         throw std::runtime_error("compressed_sz OOB for HOG " + hog_id);
-                    if (raw_sz > 512u * 1024 * 1024)
+                    if (raw_sz > 4096u * 1024 * 1024ull)
                         throw std::runtime_error("raw_sz OOB for HOG " + hog_id);
 
                     const size_t pay_off = hdr_off + sizeof(hdr_bytes);
@@ -1171,7 +1230,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         size_t psz = gr.payload.size();
         {
             std::unique_lock<std::mutex> lk(done_mtx);
-            space_cv.wait(lk, [&]{ return unwritten_bytes <= mem_budget ||
+            space_cv.wait(lk, [&]{ return unwritten_bytes <= out_budget ||
                                           failed.load(std::memory_order_relaxed); });
             done_q.push_back(g);
             unwritten_bytes += psz;
@@ -1199,15 +1258,41 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
             size_t di = next_group.fetch_add(1, std::memory_order_relaxed);
             if (di < dispatch_order.size() && !failed.load(std::memory_order_relaxed)) {
                 size_t g = dispatch_order[di];
+                // Reserve build-scratch budget before decoding so concurrent builds stay
+                // within --flush; a lone worker proceeds regardless (oversized-HOG floor).
+                size_t est = std::max<size_t>(group_sz[g] * MEM_FACTOR, size_t(1) << 20);
+                {
+                    std::unique_lock<std::mutex> lk(build_mtx);
+                    build_cv.wait(lk, [&]{
+                        if (failed.load(std::memory_order_relaxed)) return true;
+                        if (build_in_use == 0) return true;                 // lone runner → progress
+                        return build_in_use + est <= build_budget &&        // herd limit
+                               fast_rss_bytes() < rss_cap;                  // hard RSS ceiling
+                    });
+                    build_in_use += est;
+                }
+                bool group_ok = true;
                 try {
                     process_group(g, cctx, dctx, cbuf_in, raw_block, inv_raw, hog_cbuf,
                                   scratch, tl_decode, tl_build, tl_compress);
                 } catch (const std::exception& e) {
+                    group_ok = false;
                     { std::lock_guard<std::mutex> lk(err_mtx);
                       if (!failed.exchange(true)) first_error = e.what(); }
                     done_cv.notify_all(); space_cv.notify_all();
-                    break;
                 }
+                { std::lock_guard<std::mutex> lk(build_mtx); build_in_use -= est; }
+                build_cv.notify_all();
+                // Return grown scratch to the OS so 32 workers don't retain GBs of capacity
+                // after a big HOG (the slab-retention pattern). Small HOGs keep their buffers
+                // for reuse; only oversized ones (>64 MiB) are released.
+                auto shrink_big = [](std::vector<uint8_t>& v){
+                    if (v.capacity() > (size_t(64) << 20)) std::vector<uint8_t>().swap(v); };
+                shrink_big(inv_raw); shrink_big(hog_cbuf); shrink_big(cbuf_in); shrink_big(raw_block);
+                // After a big HOG, reclaim arena pages (sub-mmap-threshold allocations) so RSS
+                // tracks live memory. Gated to large groups to avoid the trim cost on small ones.
+                if (est > (size_t(512) << 20)) malloc_trim(0);
+                if (!group_ok) break;
                 continue;
             }
             HotDecodeTask dt{0, 0};
