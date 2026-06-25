@@ -371,30 +371,19 @@ inline void run_merge_shard_spill(
         std::atomic<size_t> fnext{0};
         auto p1 = [&]() {
             ZSTD_DCtx* dctx = ZSTD_createDCtx();
-            ZSTD_CCtx* cctx = ZSTD_createCCtx();   // fast (level 1) spill compression
-            std::vector<uint8_t> cbuf, frame, cspill;
+            std::vector<uint8_t> cbuf, frame;
             std::vector<uint32_t> ccnum; std::vector<VarNTRecord> recs;
             std::vector<std::vector<uint8_t>> lbuf(B);
             const size_t CHUNK = 8u * 1024 * 1024;
-            // Spill buckets are written as a sequence of independently zstd-1-compressed
-            // chunks: [u32 compressed_size][compressed bytes]. The spill is a transient
-            // NFS round-trip (~5x bloated raw); level-1 compression (~2-3x, near-free CPU)
-            // cuts both the write (pass 1) and read (pass 2) of that round-trip.
             auto flush_b = [&](size_t b) {
                 if (lbuf[b].empty()) return;
-                size_t bound = ZSTD_compressBound(lbuf[b].size());
-                cspill.resize(bound);
-                size_t csz = ZSTD_compressCCtx(cctx, cspill.data(), bound,
-                                               lbuf[b].data(), lbuf[b].size(), 1);
-                if (ZSTD_isError(csz)) throw std::runtime_error(std::string("spill zstd: ") + ZSTD_getErrorName(csz));
-                uint32_t u = uint32_t(csz);
                 std::lock_guard<std::mutex> lk(*bmtx[b]);
-                auto wr = [&](const void* pp, size_t n) {
-                    const uint8_t* d = static_cast<const uint8_t*>(pp); size_t done = 0;
-                    while (done < n) { ssize_t w = ::write(bfd[b], d + done, n - done);
-                        if (w <= 0) throw std::runtime_error("bucket write failed"); done += size_t(w); }
-                };
-                wr(&u, 4); wr(cspill.data(), csz);
+                const uint8_t* d = lbuf[b].data(); size_t rem = lbuf[b].size(), done = 0;
+                while (done < rem) {
+                    ssize_t w = ::write(bfd[b], d + done, rem - done);
+                    if (w <= 0) throw std::runtime_error("bucket write failed");
+                    done += size_t(w);
+                }
                 lbuf[b].clear();
             };
             try {
@@ -423,7 +412,7 @@ inline void run_merge_shard_spill(
                 std::lock_guard<std::mutex> lk(err_mtx);
                 if (!failed.exchange(true)) err = e.what();
             }
-            ZSTD_freeDCtx(dctx); ZSTD_freeCCtx(cctx);
+            ZSTD_freeDCtx(dctx);
         };
         std::vector<std::thread> pool;
         for (size_t t = 1; t < nt; ++t) pool.emplace_back(p1);
@@ -436,30 +425,13 @@ inline void run_merge_shard_spill(
     for (size_t b = 0; b < B; ++b) {
         off_t sz = lseek(bfd[b], 0, SEEK_END);
         if (sz <= 0) continue;
-        std::vector<uint8_t> cdata; cdata.resize(size_t(sz));
+        std::vector<uint8_t> data; data.resize(size_t(sz));
         { size_t got = 0;
           while (got < size_t(sz)) {
-              ssize_t r = ::pread(bfd[b], cdata.data() + got, size_t(sz) - got, off_t(got));
+              ssize_t r = ::pread(bfd[b], data.data() + got, size_t(sz) - got, off_t(got));
               if (r <= 0) throw std::runtime_error("bucket read failed");
               got += size_t(r);
           } }
-        // decompress the framed zstd-1 chunks ([u32 csz][zstd]) into the raw record stream
-        std::vector<uint8_t> data;
-        { ZSTD_DCtx* bd = ZSTD_createDCtx(); size_t coff = 0;
-          while (coff + 4 <= cdata.size()) {
-              uint32_t csz = read_u32_le(&cdata[coff]); coff += 4;
-              if (csz == 0 || coff + csz > cdata.size()) break;
-              unsigned long long rsz = ZSTD_getFrameContentSize(&cdata[coff], csz);
-              if (rsz == ZSTD_CONTENTSIZE_UNKNOWN || rsz == ZSTD_CONTENTSIZE_ERROR) {
-                  ZSTD_freeDCtx(bd); throw std::runtime_error("bad spill chunk size"); }
-              size_t old = data.size(); data.resize(old + size_t(rsz));
-              size_t rz = ZSTD_decompressDCtx(bd, data.data() + old, size_t(rsz), &cdata[coff], csz);
-              if (ZSTD_isError(rz)) { ZSTD_freeDCtx(bd); throw std::runtime_error(ZSTD_getErrorName(rz)); }
-              coff += csz;
-          }
-          ZSTD_freeDCtx(bd);
-        }
-        std::vector<uint8_t>().swap(cdata);
         // group record spans by hog_idx
         std::unordered_map<uint32_t, std::vector<uint64_t>> groups;  // hog_idx -> record start offsets (64-bit: buckets exceed 4GB at scale)
         size_t off = 0;
