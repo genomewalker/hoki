@@ -865,20 +865,14 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
     for (auto& t : pool) t.join();
 
-    // ── Merge per-worker sidecars → partition.idx ─────────────────────────────
-    // Each worker's idx_ has grown all run (one extent per (HOG, flush)); at scale that
-    // is the largest live structure. Build the merged map ONE worker at a time and free
-    // each worker's sidecar as it is consumed — otherwise the merged copy + all 16 live
-    // sidecars coexist (2× the index), which is the end-of-run RSS spike. clear_index()
-    // + a trim returns the freed slabs to the OS so peak ≈ merged map + one worker.
-    std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
-    for (size_t t = 0; t < N; ++t) {
-        for (const auto& [hog, extents] : writers[t]->index())
-            for (auto e : extents) { e.thread_idx = uint32_t(t); global_idx[hog].push_back(e); }
-        writers[t]->clear_index();
-        malloc_trim(0);
-    }
-    write_partition_index(global_idx, uint32_t(N), out_dir + "/partition.idx");
+    // ── Write partition.idx by streaming each worker's index directly ─────────
+    // The per-worker idx_ (one extent per (HOG,flush)) is the largest live structure at
+    // scale (~8.5 GB on disk for a big shard). Don't build a merged std::map copy + a full
+    // serialized buf — that doubled-then-tripled the index in RAM at finalization (the
+    // end-of-run spike). write_partition_index_streamed emits each worker's hogs in 32 MB
+    // chunks and frees each worker as it goes; load_partition_index re-groups across the
+    // per-thread entries. Peak at finalization ≈ one chunk, not the whole index.
+    write_partition_index_streamed(writers, uint32_t(N), out_dir + "/partition.idx");
     write_acc_registry(acc_vec, out_dir + "/acc.registry");
 
     uint64_t tot_written=0, tot_skipped=0, tot_obs=0;
