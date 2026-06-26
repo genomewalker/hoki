@@ -100,6 +100,7 @@ int main(int argc, char* argv[]) {
         int hot_threshold = 100;
         int out_compress_level = 6;
         size_t mem_budget = 16ull << 30;
+        size_t max_fanin = 0;   // 0 = auto from --flush; bounds blocks-resident per HOG
         std::vector<std::string> pos;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -117,6 +118,7 @@ int main(int argc, char* argv[]) {
             else if (a == "-t"        && i+1 < argc)        n_threads         = std::stoi(argv[++i]);
             else if (a == "--profile")                      do_profile        = true;
             else if (a == "--hot-threshold" && i+1 < argc) hot_threshold      = std::stoi(argv[++i]);
+            else if (a == "--max-fanin" && i+1 < argc)      max_fanin          = std::stoull(argv[++i]);
             else pos.emplace_back(a);
         }
         if (pos.size() < 3) { usage(argv[0]); return 1; }
@@ -144,9 +146,17 @@ int main(int argc, char* argv[]) {
                 std::cerr << "merge: found " << inputs.size() << " .lhg files in " << dir << "\n";
             }
         }
-        lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end,
-                           n_buckets, n_threads, do_profile, hot_threshold, out_compress_level,
-                           mem_budget);
+        // Auto fan-in from --flush so the super-HOG's N-blocks-resident floor fits the budget.
+        if (max_fanin == 0) max_fanin = std::clamp<size_t>(mem_budget / (size_t(1536) << 20), 4, 64);
+        if (hog_start.empty() && hog_end.empty() && n_buckets == 1 && inputs.size() > max_fanin) {
+            std::cerr << "merge: hierarchical (N=" << inputs.size() << " max_fanin=" << max_fanin << ")\n";
+            lhi::merge_hierarchical(inputs, out_lhg, out_lhgi, max_fanin, n_threads, do_profile,
+                                    out_compress_level, mem_budget);
+        } else {
+            lhi::merge_batches(inputs, out_lhg, out_lhgi, hog_start, hog_end,
+                               n_buckets, n_threads, do_profile, hot_threshold, out_compress_level,
+                               mem_budget);
+        }
         return 0;
     }
 
@@ -362,7 +372,11 @@ int main(int argc, char* argv[]) {
         try {
             lhi::run_merge_shard_spill(hog_list, tfd_ints, fd_acc_remap,
                                        accessions.size(), spill_budget, nt, out_zstd_level,
-                                       spill_dir, do_profile, emit);
+                                       spill_dir, do_profile, emit,
+                                       // free the per-HOG extent vectors after pass1 (~the input
+                                       // index, several GB); pass2 only needs the HOG names.
+                                       [&]{ for (auto& kv : merged_idx)
+                                                std::vector<lhi::PartitionIndexExtent>().swap(kv.second); });
         } catch (const std::exception& e) {
             std::cerr << "error: " << e.what() << "\n";
             cleanup_spill();
