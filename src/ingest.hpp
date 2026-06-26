@@ -349,6 +349,13 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
     // Limit glibc per-thread arenas to N+1 to cap RSS inflation.
     mallopt(M_ARENA_MAX, int(N) + 1);
+    // Pin the mmap threshold (8 MiB). By default glibc RAISES it whenever a large mmap'd
+    // block is freed (assuming reuse), which then routes the big per-flush snapshot buffers
+    // into the arenas, where freeing them only returns the memory to glibc — not the OS.
+    // Setting it explicitly also disables that dynamic growth, so buffers ≥8 MiB stay
+    // mmap-backed and munmap straight back to the OS on free. The buffers are per-flush
+    // (thousands), not per-record, so the extra mmap/munmap syscalls are negligible.
+    mallopt(M_MMAP_THRESHOLD, 8 << 20);
 
     // ── Global acc registry (dispatcher-owned, no lock needed) ───────────────
     SvDict             acc_map;
@@ -776,6 +783,12 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                 // snapshot stays resident while new data piles on and RSS blows past budget.
                 flush();
                 if (flush_future.valid()) flush_future.get();
+                // Return the freed slabs to the OS. Without this, glibc keeps them in its
+                // per-thread arenas as fragmented free chunks (845M alloc/free churn over 16
+                // arenas), so RSS only ever climbs and this guard becomes a no-op — peak RSS
+                // settles ~2.7x the working set (65 GB vs a 24 GB budget). Trimming only here
+                // (the over-budget path, ~rare) keeps it off the hot flush path.
+                malloc_trim(0);
             }
         }; // end process lambda
 
