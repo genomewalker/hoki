@@ -457,13 +457,16 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         // final flush, a transient that roughly doubles it — so target accumulation at a
         // QUARTER of the cap per worker (cap/2 total, halved again for the async snapshot).
         // The peak (steady + final-flush spike) then lands at/under --flush.
-        // Drive the hard cap at 90% of --flush so the non-evictable index (worker idx_, which
-        // grows all run and can't be flushed) plus the ~256-record overshoot between RSS checks
-        // still land strictly UNDER the budget. Measured: at 100% the peak was 24.1 GB on a 24 GB
-        // budget (0.1 over); the 10% headroom flushes data harder, leaving room for the index.
-        const size_t rss_cap = size_t((opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold)
-                                      * 9 / 10);
-        const size_t thr     = std::max<size_t>(1, rss_cap / (N * 4));
+        const size_t flush_budget = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold);
+        // The DATA-flush trigger is sized off the FULL budget — DON'T tighten it for headroom.
+        // Lowering thr means smaller batches → more flushes → more frames → a BIGGER partition
+        // index, which is non-evictable and grows RAM: headroom that defeats itself, plus flush
+        // overhead. Keep thr at full budget.
+        const size_t thr     = std::max<size_t>(1, flush_budget / (N * 4));
+        // Headroom lives ONLY in the hard RSS guard: fire at 95% of --flush so the index + the
+        // ~256-record overshoot between checks land strictly under budget, without changing how
+        // often data is flushed. (Measured: peak was 24.1 GB at 100% on a 24 GB budget.)
+        const size_t rss_cap = flush_budget * 95 / 100;
 
         // cctx is now owned by PartitionWriter; no per-worker CCtx needed here.
 
