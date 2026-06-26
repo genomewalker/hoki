@@ -34,8 +34,12 @@ static void usage(const char* prog) {
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
         << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> <part_dir>...|<parent_dir>|-\n"
         << "                  parent_dir (no partition.idx at root): scanned via opendir — no shell, no ARG_MAX\n"
+        << "  " << prog << " merge-index <out.lhgx> <shard1.lhg>...|<shard_dir>\n"
+        << "                  combine N per-shard indexes; query across shards (no data merge)\n"
         << "  " << prog << " saav    <global.lhg> <global.lhgi> <HOG_ID> <POS> [AA] [--min-pident N]\n"
+        << "  " << prog << " saav    <index.lhgx> <HOG_ID> <POS> [AA] [--min-pident N]   (cross-shard)\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
+        << "  " << prog << " freq    <index.lhgx> <HOG_ID> [--min-pident N]              (cross-shard)\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
 }
 
@@ -92,7 +96,38 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (mode == "merge-index") {
+        // Combine N per-shard indexes into one .lhgx for cross-shard query.
+        if (argc < 4) { usage(argv[0]); return 1; }
+        std::string out_lhgx = argv[2];
+        std::vector<std::string> inputs(argv + 3, argv + argc);
+        if (inputs.size() == 1) {
+            struct stat st{};
+            if (stat(inputs[0].c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                std::string dir = inputs[0];
+                if (!dir.empty() && dir.back() != '/') dir += '/';
+                inputs.clear();
+                DIR* d = opendir(dir.c_str());
+                if (!d) { std::cerr << "merge-index: cannot open dir " << dir << "\n"; return 1; }
+                struct dirent* ent;
+                while ((ent = readdir(d))) {
+                    std::string n = ent->d_name;
+                    if (n.size() > 4 && n.substr(n.size()-4) == ".lhg") inputs.push_back(dir + n);
+                }
+                closedir(d);
+                std::sort(inputs.begin(), inputs.end());
+                if (inputs.empty()) { std::cerr << "merge-index: no .lhg in " << dir << "\n"; return 1; }
+            }
+        }
+        std::cerr << "merge-index: " << inputs.size() << " shards → " << out_lhgx << "\n";
+        if (!lhi::write_multi_index(inputs, out_lhgx)) { std::cerr << "merge-index: failed\n"; return 1; }
+        return 0;
+    }
+
     if (mode == "merge") {
+        std::cerr << "merge: DEPRECATED — at scale prefer `merge-index` (one .lhgx over N shards) "
+                     "+ cross-shard saav/freq. The data merge is slow, memory-heavy, and saves no "
+                     "storage (disjoint accessions). Use it only for a small single-artifact merge.\n";
         std::string hog_start, hog_end;
         int n_buckets = 1;
         int n_threads = 0;
@@ -413,6 +448,24 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "saav") {
+        // Cross-shard: `saav <index.lhgx> <hog> <pos> [aa] [--min-pident N]`.
+        std::string a2 = (argc > 2) ? argv[2] : "";
+        if (a2.size() > 5 && a2.substr(a2.size()-5) == ".lhgx") {
+            if (argc < 5) { usage(argv[0]); return 1; }
+            std::string hog_id = argv[3];
+            uint32_t    pos    = uint32_t(std::stoul(argv[4]));
+            std::optional<uint8_t> aa;
+            uint8_t min_pident = 0;
+            for (int i = 5; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--min-pident" && i+1 < argc) min_pident = uint8_t(std::stoul(argv[++i]));
+                else if (aa == std::nullopt && a.size() == 1) aa = lhi::encode_aa(a[0]);
+            }
+            lhi::MultiIndex mi;
+            if (!mi.load(a2)) { std::cerr << "cannot load cross-shard index " << a2 << "\n"; return 1; }
+            lhi::query_saav_multi(mi, hog_id, pos, aa, min_pident);
+            return 0;
+        }
         if (argc < 6) { usage(argv[0]); return 1; }
         std::string lhg_path  = argv[2];
         std::string lhgi_path = argv[3];
@@ -436,6 +489,21 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "freq") {
+        // Cross-shard: `freq <index.lhgx> <hog> [--min-pident N]`.
+        std::string a2 = (argc > 2) ? argv[2] : "";
+        if (a2.size() > 5 && a2.substr(a2.size()-5) == ".lhgx") {
+            if (argc < 4) { usage(argv[0]); return 1; }
+            std::string hog_id = argv[3];
+            uint8_t min_pident = 0;
+            for (int i = 4; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--min-pident" && i+1 < argc) min_pident = uint8_t(std::stoul(argv[++i]));
+            }
+            lhi::MultiIndex mi;
+            if (!mi.load(a2)) { std::cerr << "cannot load cross-shard index " << a2 << "\n"; return 1; }
+            lhi::query_freq_multi(mi, hog_id, min_pident);
+            return 0;
+        }
         if (argc < 5) { usage(argv[0]); return 1; }
         std::string lhg_path  = argv[2];
         std::string lhgi_path = argv[3];

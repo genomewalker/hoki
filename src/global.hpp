@@ -12,6 +12,8 @@
 #include <cstring>
 #include <cstdio>
 #include <optional>
+#include <map>
+#include <array>
 
 // .lhg — LHG Global file.
 // .lhgi — LHG Index: companion small file; load once, range-GET .lhg per HOG.
@@ -76,6 +78,11 @@ constexpr uint8_t LHG_HOG_ENTRY_MAGIC[4] = {'L','H','H','E'};
 // acc column while folding cnum into the trailer — ~60% smaller blocks, lossless). Detected
 // per-block by magic so v8 (LHHE) and v9 (LHH2) coexist in one file; reader handles both.
 constexpr uint8_t LHG_HOG_ENTRY_MAGIC_V2[4] = {'L','H','H','2'};
+// .lhgx — combined cross-shard index: header + N×(path + per-shard index section). Maps a
+// HOG to whichever shards contain it so queries read blocks from the N_H shards directly
+// (accessions are disjoint across shards → union = concat) instead of materializing a merged
+// .lhg. Replaces the data merge at scale.
+constexpr uint8_t LHGX_MAGIC[4]          = {'L','H','G','X'};
 constexpr uint8_t LHG_VERSION            = 8;
 constexpr size_t  LHG_HEADER_SZ          = 16; // magic(4)+ver(1)+flags(1)+pad(2)+index_offset(8)
 
@@ -116,6 +123,10 @@ struct GlobalIndex {
         if (lseek(fd, off_t(idx_off), SEEK_SET) < 0) return false;
         return load_from_fd(fd);
     }
+
+    // Read one index section from an already-open fd at the current offset (used by
+    // MultiIndex, which concatenates N per-shard index sections in one .lhgx file).
+    bool load_from_open_fd(int fd) { return load_from_fd(fd); }
 
 private:
     bool load_from_fd(int fd) {
@@ -599,19 +610,14 @@ void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
                 const std::string& hog_id,
                 uint8_t min_pident = 0);
 
-inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
-                       const std::string& hog_id, uint32_t pos,
-                       std::optional<uint8_t> aa_filter, uint8_t min_pident) {
-    const auto* entry = idx.find(hog_id);
-    if (!entry) {
-        std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str());
-        return;
-    }
-    InvBlock blk;
-    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+// ── Per-block query primitives (shared by single-shard and cross-shard paths) ──
+// A block carries LOCAL acc indices; `accs` is the owning shard's registry (acc_idx→id).
+// Cross-shard: accessions are disjoint per shard, so each block resolves against its own
+// registry and saav rows concat / freq counts add.
 
-    std::printf("acc_id\tunitig_id\thog_pos\tobs_aa\tcodon\tpident\n");
-
+// Emit SAAV rows for the matching position in one block.
+inline void emit_saav_block(const InvBlock& blk, const std::vector<std::string>& accs,
+                            uint32_t pos, std::optional<uint8_t> aa_filter, uint8_t min_pident) {
     auto positions = decode_block(blk);
     for (const auto& ip : positions) {
         if (ip.hog_pos != pos) continue;
@@ -626,8 +632,7 @@ inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
             if (aa_filter && aa != *aa_filter) continue;
             char aac = (aa < 20) ? AA_ALPHA[aa] : 'X';
             char cdn[3]; unpack_codon(packed, cdn);
-            const std::string& acc = (gacc < idx.accessions.size())
-                                   ? idx.accessions[gacc] : std::string();
+            const std::string& acc = (gacc < accs.size()) ? accs[gacc] : std::string();
             std::string uni = acc + "_" + std::to_string(o.cnum);
             std::printf("%s\t%s\t%u\t%c\t%c%c%c\t%u\n",
                         acc.c_str(), uni.c_str(), ip.hog_pos, aac,
@@ -637,21 +642,11 @@ inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
     }
 }
 
-inline void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
-                       const std::string& hog_id, uint8_t min_pident) {
-    const auto* entry = idx.find(hog_id);
-    if (!entry) {
-        std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str());
-        return;
-    }
-    InvBlock blk;
-    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
-
-    std::printf("hog_pos\tcodon\tobs_aa\tn_accessions\n");
-
+// Accumulate per-(pos,codon) distinct-accession counts for one block into `agg`.
+inline void accumulate_freq_block(const InvBlock& blk, uint8_t min_pident,
+                                  std::map<uint32_t, std::array<uint32_t, 64>>& agg) {
     auto positions = decode_block(blk);
     for (const auto& ip : positions) {
-        // Count distinct accessions per codon at this position.
         std::array<uint32_t, 64> count{};
         std::array<uint32_t, 64> last_acc{};
         bool seen[64] = {false};
@@ -661,22 +656,47 @@ inline void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
             if (blk.local_acc_pident[li] < min_pident) continue;
             uint32_t gacc = blk.local_accs[li];
             uint8_t c = o.codon_idx & 0x3F;
-            if (!seen[c] || last_acc[c] != gacc) {
-                ++count[c];
-                last_acc[c] = gacc;
-                seen[c] = true;
-            }
+            if (!seen[c] || last_acc[c] != gacc) { ++count[c]; last_acc[c] = gacc; seen[c] = true; }
         }
-        for (uint8_t c = 0; c < 64; ++c) {
+        auto& a = agg[ip.hog_pos];
+        for (int c = 0; c < 64; ++c) a[c] += count[c];
+    }
+}
+
+inline void print_freq(const std::map<uint32_t, std::array<uint32_t, 64>>& agg) {
+    std::printf("hog_pos\tcodon\tobs_aa\tn_accessions\n");
+    for (const auto& [pos, count] : agg) {
+        for (int c = 0; c < 64; ++c) {
             if (count[c] == 0) continue;
             uint8_t packed = uint8_t(c << 2);
             uint8_t aa = codon_to_aa(packed);
             char aac = (aa < 20) ? AA_ALPHA[aa] : 'X';
             char cdn[3]; unpack_codon(packed, cdn);
-            std::printf("%u\t%c%c%c\t%c\t%u\n",
-                        ip.hog_pos, cdn[0], cdn[1], cdn[2], aac, count[c]);
+            std::printf("%u\t%c%c%c\t%c\t%u\n", pos, cdn[0], cdn[1], cdn[2], aac, count[c]);
         }
     }
+}
+
+inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
+                       const std::string& hog_id, uint32_t pos,
+                       std::optional<uint8_t> aa_filter, uint8_t min_pident) {
+    const auto* entry = idx.find(hog_id);
+    if (!entry) { std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str()); return; }
+    InvBlock blk;
+    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+    std::printf("acc_id\tunitig_id\thog_pos\tobs_aa\tcodon\tpident\n");
+    emit_saav_block(blk, idx.accessions, pos, aa_filter, min_pident);
+}
+
+inline void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
+                       const std::string& hog_id, uint8_t min_pident) {
+    const auto* entry = idx.find(hog_id);
+    if (!entry) { std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str()); return; }
+    InvBlock blk;
+    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+    std::map<uint32_t, std::array<uint32_t, 64>> agg;
+    accumulate_freq_block(blk, min_pident, agg);
+    print_freq(agg);
 }
 
 // Serialize index entries + accession registry to bytes (both .lhg and .lhgi).
@@ -712,6 +732,94 @@ inline std::vector<uint8_t> build_index_bytes(const std::vector<HogIndexEntry>& 
     // Trailing Adler-32 over all preceding index bytes (validated on load).
     write_u32(buf, adler32(buf.data(), buf.size()));
     return buf;
+}
+
+// ── Cross-shard index (.lhgx) ────────────────────────────────────────────────
+// Combines N per-shard indexes into one file so a query opens one index, not N.
+// Layout: "LHGX" ver(1) n_shards(u32 LE), then per shard: path_len(u32 LE) + path
+// + that shard's full index section (build_index_bytes output, adler-terminated).
+
+// Build a .lhgx from a list of shard .lhg paths (companion .lhgi auto-detected).
+// Streams one shard at a time → only one shard's index is resident.
+inline bool write_multi_index(const std::vector<std::string>& lhg_paths,
+                              const std::string& out_lhgx) {
+    UniqueFd fd(open(out_lhgx.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    if (fd < 0) return false;
+    auto wr = [&](const void* d, size_t n) -> bool {
+        const char* p = (const char*)d; size_t o = 0;
+        while (o < n) { ssize_t w = ::write(fd, p + o, n - o); if (w <= 0) return false; o += size_t(w); }
+        return true;
+    };
+    auto wr_u32 = [&](uint32_t v) -> bool { uint8_t b[4]; for (int i=0;i<4;++i) b[i]=uint8_t(v>>(8*i)); return wr(b,4); };
+    uint8_t ver = 1;
+    if (!wr(LHGX_MAGIC, 4) || !wr(&ver, 1) || !wr_u32(uint32_t(lhg_paths.size()))) return false;
+    for (const auto& p : lhg_paths) {
+        GlobalIndex gi;
+        std::string lhgi = (p.size() > 4 && p.substr(p.size()-4) == ".lhg")
+                         ? p.substr(0, p.size()-4) + ".lhgi" : p + ".lhgi";
+        if (!gi.load(lhgi) && !gi.load_from_lhg(p)) {
+            std::fprintf(stderr, "merge-index: cannot load index for %s\n", p.c_str());
+            return false;
+        }
+        auto ib = build_index_bytes(gi.entries, gi.accessions);
+        if (!wr_u32(uint32_t(p.size())) || !wr(p.data(), p.size()) || !wr(ib.data(), ib.size()))
+            return false;
+    }
+    return true;
+}
+
+struct MultiIndex {
+    std::vector<std::string> lhg_paths;
+    std::vector<GlobalIndex> indexes;   // parallel to lhg_paths
+
+    bool load(const std::string& path) {
+        UniqueFd fd(open(path.c_str(), O_RDONLY));
+        if (fd < 0) return false;
+        auto rd = [&](void* d, size_t n) -> bool {
+            char* p = (char*)d; size_t o = 0;
+            while (o < n) { ssize_t r = ::read(fd, p + o, n - o); if (r <= 0) return false; o += size_t(r); }
+            return true;
+        };
+        auto rd_u32 = [&](uint32_t& v) -> bool { uint8_t b[4]; if (!rd(b,4)) return false;
+            v = uint32_t(b[0])|uint32_t(b[1])<<8|uint32_t(b[2])<<16|uint32_t(b[3])<<24; return true; };
+        uint8_t hdr[5];
+        if (!rd(hdr, 5) || memcmp(hdr, LHGX_MAGIC, 4) != 0) return false;
+        uint32_t n = 0;
+        if (!rd_u32(n) || n > 1000000) return false;
+        lhg_paths.resize(n); indexes.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t L = 0;
+            if (!rd_u32(L)) return false;
+            lhg_paths[i].resize(L);
+            if (L && !rd(&lhg_paths[i][0], L)) return false;
+            if (!indexes[i].load_from_open_fd(fd)) return false;
+        }
+        return true;
+    }
+};
+
+inline void query_saav_multi(const MultiIndex& mi, const std::string& hog_id, uint32_t pos,
+                             std::optional<uint8_t> aa_filter, uint8_t min_pident) {
+    std::printf("acc_id\tunitig_id\thog_pos\tobs_aa\tcodon\tpident\n");
+    for (size_t s = 0; s < mi.indexes.size(); ++s) {
+        const auto* e = mi.indexes[s].find(hog_id);
+        if (!e) continue;
+        InvBlock blk;
+        if (!read_hog_inverted(mi.lhg_paths[s], *e, blk)) continue;
+        emit_saav_block(blk, mi.indexes[s].accessions, pos, aa_filter, min_pident);
+    }
+}
+
+inline void query_freq_multi(const MultiIndex& mi, const std::string& hog_id, uint8_t min_pident) {
+    std::map<uint32_t, std::array<uint32_t, 64>> agg;
+    for (size_t s = 0; s < mi.indexes.size(); ++s) {
+        const auto* e = mi.indexes[s].find(hog_id);
+        if (!e) continue;
+        InvBlock blk;
+        if (!read_hog_inverted(mi.lhg_paths[s], *e, blk)) continue;
+        accumulate_freq_block(blk, min_pident, agg);
+    }
+    print_freq(agg);
 }
 
 } // namespace lhi
