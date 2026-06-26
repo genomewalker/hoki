@@ -677,7 +677,11 @@ inline void finalize_inverted_payload(
 
 inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardScratch& sc,
                                                uint32_t n_accs, uint32_t hog_length,
-                                               int out_zstd_level, int zstd_workers = 0) {
+                                               int out_zstd_level, int zstd_workers = 0,
+                                               uint64_t* build_ns = nullptr,
+                                               uint64_t* ser_ns = nullptr,
+                                               uint64_t* comp_ns = nullptr) {
+    uint64_t _bt0 = clock_ns();
     ShardResult res; res.hog_id = hog_id;
     auto& flat_inv = sc.flat_inv;
     uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
@@ -707,9 +711,14 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
         if (it3 != sc.acc_intervals_map.end()) covered_aa_v[li] += merged_interval_cov(it3->second);
     }
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
+    uint64_t _bt1 = clock_ns(), _ser_done = 0;
     finalize_inverted_payload(local_accs, local_acc_pident, positions, hog_length, covered_aa_v,
                               sc.inv_raw, sc.hog_cbuf, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b,
-                              nullptr, out_zstd_level, zstd_workers, nullptr, stored_sz, payload, payload_sz);
+                              nullptr, out_zstd_level, zstd_workers, &_ser_done, stored_sz, payload, payload_sz);
+    uint64_t _bt2 = clock_ns();
+    if (build_ns) *build_ns = _bt1 - _bt0;            // positions construction + sort
+    if (ser_ns)   *ser_ns   = _ser_done - _bt1;       // serialize_inverted_block_v9
+    if (comp_ns)  *comp_ns  = _bt2 - _ser_done;       // zstd compress (MT for super-HOG)
     res.stored_sz = stored_sz; res.n_accs = n_accs;
     res.payload.assign(payload, payload + payload_sz);
     return res;
@@ -837,6 +846,9 @@ inline void run_merge_shard_spill(
 
     uint64_t _t_p1 = clock_ns() - _t0;
     uint64_t _t_read = 0, _t_build = 0;
+    // Pass-2 fine split (atomic: accumulated across build threads). Separates the lumped
+    // "build+compress" so the MT-zstd effect on the super-HOG compress is visible.
+    std::atomic<uint64_t> _t_recread{0}, _t_invbuild{0}, _t_ser{0}, _t_compress{0};
 
     // ── pass 2: build one bucket at a time (parallel HOGs within a bucket) ────
     for (size_t b = 0; b < B; ++b) {
@@ -891,6 +903,7 @@ inline void run_merge_shard_spill(
                     sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
                     size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
                     guard.acquire(est);
+                    uint64_t _rr0 = clock_ns();
                     for (uint64_t ro : groups[hidx]) {
                         const uint8_t* q = &data[ro];
                         q += 4;                              // skip hog_idx
@@ -910,10 +923,16 @@ inline void run_merge_shard_spill(
                             sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
                         }
                     }
+                    _t_recread.fetch_add(clock_ns() - _rr0, std::memory_order_relaxed);
                     // Lone-runner big builds (the super-HOG) get multi-threaded zstd on the
                     // idle cores; finalize gates it on block size so only the giant block uses it.
+                    uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
                     ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
-                                                                n_accs, hog_length, out_zstd_level, int(nt));
+                                                                n_accs, hog_length, out_zstd_level, int(nt),
+                                                                &_b_ns, &_s_ns, &_c_ns);
+                    _t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
+                    _t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
+                    _t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
                     emit(std::move(r));
                     release_if_big(sc.flat_inv, size_t(32) << 20);
                     release_if_big(sc.inv_raw,  size_t(32) << 20);
@@ -942,9 +961,13 @@ inline void run_merge_shard_spill(
         std::vector<uint8_t>().swap(data);
         ftruncate(bfd[b], 0);
     }
-    if (do_profile)
-        std::fprintf(stderr, "spill-prof: pass1(decode+spill) %.1fs | pass2-read %.1fs | pass2-build+compress %.1fs\n",
+    if (do_profile) {
+        std::fprintf(stderr, "spill-prof: pass1(decode+spill) %.1fs | pass2-read %.1fs | pass2-build+compress %.1fs (wall)\n",
                      _t_p1/1e9, _t_read/1e9, _t_build/1e9);
+        // Per-thread CPU-time split of pass2 (sums across build threads; > wall when parallel).
+        std::fprintf(stderr, "spill-prof: pass2 cpu split — recread %.1fs | invbuild %.1fs | serialize %.1fs | compress %.1fs\n",
+                     _t_recread.load()/1e9, _t_invbuild.load()/1e9, _t_ser.load()/1e9, _t_compress.load()/1e9);
+    }
 }
 
 inline void merge_batches(const std::vector<std::string>& input_paths,
