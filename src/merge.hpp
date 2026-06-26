@@ -902,6 +902,11 @@ inline void run_merge_shard_spill(
                     release_if_big(sc.flat_inv, size_t(32) << 20);
                     release_if_big(sc.inv_raw,  size_t(32) << 20);
                     release_if_big(sc.hog_cbuf, size_t(32) << 20);
+                    // Big builds (the super-HOG lone-runner) leave large freed slabs that glibc
+                    // keeps in the worker arena — RSS then overshoots --flush by the slab size
+                    // (~4-5 GB) even though the data is gone. Return it to the OS, as the data
+                    // merge already does (merge.hpp:~1724). Gated on est so small builds skip it.
+                    if (est > (size_t(256) << 20)) malloc_trim(0);
                     guard.release(est);
                 }
             } catch (const std::exception& e) {
