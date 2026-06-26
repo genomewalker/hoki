@@ -352,11 +352,14 @@ struct LhgPosCursor {
     std::vector<uint32_t> pos_vals, nobs;
     size_t n_pos = 0, cur = 0;
     uint32_t base = 0;                                   // merged-local base for this block
+    bool v9 = false;                                     // input block layout
+    const std::vector<uint32_t> *tr_acc = nullptr, *tr_cnum = nullptr;  // v9 trailer
     const uint8_t *end = nullptr, *acc0 = nullptr, *cnum0 = nullptr, *codon0 = nullptr;
     const uint8_t *pa = nullptr, *pc = nullptr, *pk = nullptr;
 
     void init(const InvBlock& blk, uint32_t base_) {
-        base = base_; const uint8_t* q = blk.pos_ptr; end = blk.end;
+        base = base_; v9 = blk.is_v9; tr_acc = &blk.trailer_acc; tr_cnum = &blk.trailer_cnum;
+        const uint8_t* q = blk.pos_ptr; end = blk.end;
         uint32_t np = 0; int n = read_varint(q, end, &np); if (!n) throw std::runtime_error("cursor: pos count"); q += n;
         n_pos = np; pos_vals.resize(np); nobs.resize(np);
         uint32_t prev = 0; uint64_t tot = 0;
@@ -367,9 +370,12 @@ struct LhgPosCursor {
             nobs[i] = no; tot += no;
         }
         acc0 = q; const uint8_t* z = q;
-        for (uint64_t j = 0; j < tot; ++j) { uint32_t d; int m = read_varint(z, end, &d); if (!m) throw std::runtime_error("cursor: acc skip"); z += m; }
+        // v8: acc col + cnum col + codon col. v9: uid col + codon col (acc/cnum via trailer).
+        for (uint64_t j = 0; j < tot; ++j) { uint32_t d; int m = read_varint(z, end, &d); if (!m) throw std::runtime_error("cursor: col skip"); z += m; }
         cnum0 = z;
-        for (uint64_t j = 0; j < tot; ++j) { uint32_t d; int m = read_varint(z, end, &d); if (!m) throw std::runtime_error("cursor: cnum skip"); z += m; }
+        if (!v9) {
+            for (uint64_t j = 0; j < tot; ++j) { uint32_t d; int m = read_varint(z, end, &d); if (!m) throw std::runtime_error("cursor: cnum skip"); z += m; }
+        }
         codon0 = z;
         reset();
     }
@@ -378,16 +384,27 @@ struct LhgPosCursor {
     uint32_t pos() const { return pos_vals[cur]; }
     // Append the current position's obs (merged-local acc, cnum, codon) to parallel buckets; advance.
     void emit(std::vector<uint32_t>& oa, std::vector<uint32_t>& oc, std::vector<uint8_t>& ok) {
-        uint32_t no = nobs[cur], prev_li = 0;
-        for (uint32_t i = 0; i < no; ++i) { uint32_t d = 0; int m = read_varint(pa, end, &d); pa += m; prev_li += d; oa.push_back(base + prev_li); }
-        for (uint32_t i = 0; i < no; ++i) { uint32_t c = 0; int m = read_varint(pc, end, &c); pc += m; oc.push_back(c); }
+        uint32_t no = nobs[cur];
+        if (v9) {
+            uint32_t prev_uid = 0;
+            for (uint32_t i = 0; i < no; ++i) {
+                uint32_t d = 0; int m = read_varint(pa, end, &d); pa += m; prev_uid += d;
+                if (prev_uid >= tr_acc->size()) throw std::runtime_error("cursor: uid OOB");
+                oa.push_back(base + (*tr_acc)[prev_uid]); oc.push_back((*tr_cnum)[prev_uid]);
+            }
+        } else {
+            uint32_t prev_li = 0;
+            for (uint32_t i = 0; i < no; ++i) { uint32_t d = 0; int m = read_varint(pa, end, &d); pa += m; prev_li += d; oa.push_back(base + prev_li); }
+            for (uint32_t i = 0; i < no; ++i) { uint32_t c = 0; int m = read_varint(pc, end, &c); pc += m; oc.push_back(c); }
+        }
         if (pk >= end) throw std::runtime_error("cursor: codon trunc");
         uint8_t cons = *pk++; size_t b = ok.size(); ok.resize(b + no, cons);
         uint32_t nvar = 0; int m = read_varint(pk, end, &nvar); pk += m;
+        if (nvar > no) throw std::runtime_error("cursor: nvar > nobs");
         static thread_local std::vector<uint32_t> ords; ords.resize(nvar);
         uint32_t prev_ord = 0;
         for (uint32_t v = 0; v < nvar; ++v) { uint32_t d = 0; int mm = read_varint(pk, end, &d); pk += mm; prev_ord += d; ords[v] = prev_ord; }
-        for (uint32_t v = 0; v < nvar; ++v) { uint8_t vc = *pk++; ok[b + ords[v]] = vc; }
+        for (uint32_t v = 0; v < nvar; ++v) { if (ords[v] >= no) throw std::runtime_error("cursor: codon ord OOB"); uint8_t vc = *pk++; ok[b + ords[v]] = vc; }
         ++cur;
     }
 };
@@ -681,10 +698,13 @@ inline void run_merge_shard_spill(
             frames[fi].exts.push_back({hi, &e});
         }
 
-    // Spill format expands the compressed bytes several-fold; size B so each bucket
-    // (~est_spill / B) fits the budget.
-    size_t est_spill = sum_csz * 10;   // spill record format expands ~8x; margin keeps buckets <= budget
-    size_t B = std::max<size_t>(1, (est_spill + budget - 1) / budget);
+    // Pass-2 peak RAM = the bucket read whole (`data`) + the `groups` offset-map (~0.3-0.5x
+    // bucket) + nt per-HOG build scratch — all resident together. --flush must bound the SUM,
+    // not just the bucket, and the spill-size estimate is imprecise. So size buckets to ~1/3 of
+    // --flush, reserving the rest for the groups map + build scratch + estimate error.
+    size_t est_spill = sum_csz * 10;   // spill record format expands ~8x
+    size_t bucket_budget = std::max<size_t>(budget / 3, size_t(64) << 20);
+    size_t B = std::max<size_t>(1, (est_spill + bucket_budget - 1) / bucket_budget);
     std::vector<UniqueFd> bfd; bfd.reserve(B);
     std::vector<std::unique_ptr<std::mutex>> bmtx;
     for (size_t b = 0; b < B; ++b) {
@@ -772,6 +792,7 @@ inline void run_merge_shard_spill(
         _t_read += clock_ns() - _r0;
         // group record spans by hog_idx
         std::unordered_map<uint32_t, std::vector<uint64_t>> groups;  // hog_idx -> record start offsets (64-bit: buckets exceed 4GB at scale)
+        std::unordered_map<uint32_t, uint64_t> group_bytes;          // hog_idx -> spill bytes (build-scratch estimate)
         size_t off = 0;
         while (off + 25 <= data.size()) {
             uint64_t rstart = off;
@@ -780,6 +801,7 @@ inline void run_merge_shard_spill(
             uint32_t nobs = read_u32_le(&data[off]); off += 4;
             off += size_t(nobs) * 5;
             groups[hog_idx].push_back(rstart);
+            group_bytes[hog_idx] += off - rstart;
         }
         std::vector<uint32_t> hkeys; hkeys.reserve(groups.size());
         for (auto& kv : groups) hkeys.push_back(kv.first);
@@ -787,6 +809,15 @@ inline void run_merge_shard_spill(
         // at the tail while the rest idle (the pass2-build Amdahl bottleneck).
         std::sort(hkeys.begin(), hkeys.end(),
                   [&](uint32_t a, uint32_t b){ return groups[a].size() > groups[b].size(); });
+
+        // Bound concurrent per-HOG build scratch to a share of --flush so pass2 RSS (bucket +
+        // groups + builds) stays within budget. est ≈ hog spill bytes × FACTOR (flat_inv +
+        // inv_raw + cbuf vs the ~5 B/obs spill record); a lone worker always proceeds.
+        const size_t build_budget = std::max<size_t>(budget / 2, size_t(64) << 20);
+        constexpr size_t MS_BUILD_FACTOR = 6;
+        size_t build_in_use = 0;
+        std::mutex build_mtx;
+        std::condition_variable build_cv;
 
         std::atomic<size_t> gnext{0};
         auto p2 = [&]() {
@@ -800,6 +831,14 @@ inline void run_merge_shard_spill(
                     uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
                     sc.seen_accs.clear(); sc.flat_inv.clear();
                     sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
+                    size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
+                    {
+                        std::unique_lock<std::mutex> lk(build_mtx);
+                        build_cv.wait(lk, [&]{ return build_in_use == 0 ||
+                                                      build_in_use + est <= build_budget ||
+                                                      failed.load(std::memory_order_relaxed); });
+                        build_in_use += est;
+                    }
                     for (uint64_t ro : groups[hidx]) {
                         const uint8_t* q = &data[ro];
                         q += 4;                              // skip hog_idx
@@ -822,6 +861,12 @@ inline void run_merge_shard_spill(
                     ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
                                                                 n_accs, hog_length, out_zstd_level);
                     emit(std::move(r));
+                    // Release grown per-HOG scratch so nt workers don't each retain a big HOG's
+                    // capacity (the slab-retention pattern); small HOGs keep buffers for reuse.
+                    auto rel = [](auto& v){ if (v.capacity() > (size_t(32) << 20)) { std::decay_t<decltype(v)>().swap(v); } };
+                    rel(sc.flat_inv); rel(sc.inv_raw); rel(sc.hog_cbuf);
+                    { std::lock_guard<std::mutex> lk(build_mtx); build_in_use -= est; }
+                    build_cv.notify_all();
                 }
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(err_mtx);
