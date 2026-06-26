@@ -588,8 +588,16 @@ inline void serialize_inverted_block_v9(
     write_varint(raw, hog_length);
     for (uint32_t li = 0; li < n_local; ++li) write_varint(raw, li < covered_aa.size() ? covered_aa[li] : 0);
 
-    auto to_local = [&](uint32_t g) -> uint32_t {
-        return uint32_t(std::lower_bound(local_accs.begin(), local_accs.end(), g) - local_accs.begin()); };
+    // Flat global→local table: O(1) lookup vs O(log n_local) binary search. to_local runs
+    // twice per observation (trailer build + per-position encode), so for the super-HOG
+    // (~150M obs over a ~125K-acc dict) the old lower_bound was ~62% of serialize time.
+    // local_accs is sorted, so size the table to its max global id (≤ shard acc count).
+    std::vector<uint32_t> g2l;
+    if (n_local) {
+        g2l.assign(size_t(local_accs.back()) + 1, 0);
+        for (uint32_t li = 0; li < n_local; ++li) g2l[local_accs[li]] = li;
+    }
+    auto to_local = [&](uint32_t g) -> uint32_t { return g2l[g]; };
     auto pack = [](uint32_t a, uint32_t c) -> uint64_t { return (uint64_t(a) << 32) | c; };
 
     std::unordered_set<uint64_t> uni;
