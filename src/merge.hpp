@@ -643,7 +643,7 @@ inline void finalize_inverted_payload(
         std::vector<uint8_t>& inv_raw, std::vector<uint8_t>& hog_cbuf,
         std::vector<uint8_t>& sb_hdr, std::vector<uint8_t>& sb_acc,
         std::vector<uint8_t>& sb_cnum, std::vector<uint8_t>& sb_codon,
-        ZSTD_CCtx* cctx, int level, uint64_t* ser_done_ns,
+        ZSTD_CCtx* cctx, int level, int zstd_workers, uint64_t* ser_done_ns,
         uint32_t& stored_sz, const uint8_t*& payload, size_t& payload_sz) {
     (void)sb_hdr; (void)sb_acc; (void)sb_cnum; (void)sb_codon;
     inv_raw.clear();
@@ -652,8 +652,22 @@ inline void finalize_inverted_payload(
     size_t raw_sz = inv_raw.size();
     size_t bound = ZSTD_compressBound(raw_sz);
     hog_cbuf.resize(bound);
-    size_t csz = cctx ? ZSTD_compress2(cctx, hog_cbuf.data(), bound, inv_raw.data(), raw_sz)
-                      : ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, level);
+    size_t csz;
+    if (cctx) {
+        csz = ZSTD_compress2(cctx, hog_cbuf.data(), bound, inv_raw.data(), raw_sz);
+    } else if (zstd_workers > 1 && raw_sz > (size_t(128) << 20)) {
+        // Pass2 wall is dominated (~60%) by compressing the one super-HOG block single-threaded
+        // while the other build threads idle (LPT runs it first; it finishes last, alone). Give
+        // that lone giant block the idle cores via multi-threaded zstd. Gated on raw_sz so only
+        // the super-HOG (≫128 MiB) qualifies — small blocks stay single-threaded, no oversubscribe.
+        ZSTD_CCtx* mt = ZSTD_createCCtx();
+        ZSTD_CCtx_setParameter(mt, ZSTD_c_compressionLevel, level);
+        ZSTD_CCtx_setParameter(mt, ZSTD_c_nbWorkers, zstd_workers);
+        csz = ZSTD_compress2(mt, hog_cbuf.data(), bound, inv_raw.data(), raw_sz);
+        ZSTD_freeCCtx(mt);
+    } else {
+        csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, level);
+    }
     bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
     // Inline word carries flags only; the true (uint64) length lives in the index, so
     // blocks may exceed the old 30-bit inline size limit (merged super-HOGs hit ~2 GiB).
@@ -663,7 +677,7 @@ inline void finalize_inverted_payload(
 
 inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardScratch& sc,
                                                uint32_t n_accs, uint32_t hog_length,
-                                               int out_zstd_level) {
+                                               int out_zstd_level, int zstd_workers = 0) {
     ShardResult res; res.hog_id = hog_id;
     auto& flat_inv = sc.flat_inv;
     uint32_t max_pos = hog_length > 0 ? hog_length - 1 : 0;
@@ -695,7 +709,7 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
     finalize_inverted_payload(local_accs, local_acc_pident, positions, hog_length, covered_aa_v,
                               sc.inv_raw, sc.hog_cbuf, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b,
-                              nullptr, out_zstd_level, nullptr, stored_sz, payload, payload_sz);
+                              nullptr, out_zstd_level, zstd_workers, nullptr, stored_sz, payload, payload_sz);
     res.stored_sz = stored_sz; res.n_accs = n_accs;
     res.payload.assign(payload, payload + payload_sz);
     return res;
@@ -896,8 +910,10 @@ inline void run_merge_shard_spill(
                             sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
                         }
                     }
+                    // Lone-runner big builds (the super-HOG) get multi-threaded zstd on the
+                    // idle cores; finalize gates it on block size so only the giant block uses it.
                     ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
-                                                                n_accs, hog_length, out_zstd_level);
+                                                                n_accs, hog_length, out_zstd_level, int(nt));
                     emit(std::move(r));
                     release_if_big(sc.flat_inv, size_t(32) << 20);
                     release_if_big(sc.inv_raw,  size_t(32) << 20);
@@ -1663,7 +1679,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         } else {
             finalize_inverted_payload(local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
                                       inv_raw, hog_cbuf, sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf,
-                                      sc.ser_codon_buf, cctx, 0, &t_build_end, stored_sz, payload, payload_sz);
+                                      sc.ser_codon_buf, cctx, 0, 0, &t_build_end, stored_sz, payload, payload_sz);
         }
         tl_decode   += t_dec_end - t0;
         tl_build    += t_build_end - t_dec_end;
