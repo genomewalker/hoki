@@ -578,7 +578,7 @@ inline void serialize_inverted_block_v9(
         std::vector<uint8_t>& raw,
         const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
         const std::vector<InvPosition>& positions, uint32_t hog_length,
-        const std::vector<uint32_t>& covered_aa) {
+        const std::vector<uint32_t>& covered_aa, int n_threads = 1) {
     raw.clear();
     uint32_t n_local = uint32_t(local_accs.size());
     write_varint(raw, n_local);
@@ -616,31 +616,70 @@ inline void serialize_inverted_block_v9(
       } }
     std::vector<uint64_t>().swap(us);
 
-    std::vector<uint8_t> ph, uc, kc;
+    // Position headers (Δpos + n_obs) — cheap, serial.
+    std::vector<uint8_t> ph;
     write_varint(ph, uint32_t(positions.size()));
-    uint32_t prev_pos = 0;
-    std::vector<std::pair<uint64_t, uint8_t>> obs;
-    for (const auto& pos : positions) {
-        obs.clear(); obs.reserve(pos.obs.size());
-        for (const auto& o : pos.obs) obs.push_back({pack(to_local(o.acc_idx), o.cnum), o.codon_idx});
-        std::sort(obs.begin(), obs.end(), [](const std::pair<uint64_t,uint8_t>& x, const std::pair<uint64_t,uint8_t>& y){ return x.first < y.first; });
-        write_varint(ph, pos.hog_pos - prev_pos); prev_pos = pos.hog_pos;
-        write_varint(ph, uint32_t(obs.size()));
-        uint32_t prev_uid = 0;
-        for (auto& x : obs) { uint32_t uid = uidmap[x.first]; write_varint(uc, uid - prev_uid); prev_uid = uid; }
-        uint32_t no = uint32_t(obs.size());
-        uint32_t counts[64] = {};
-        for (auto& x : obs) counts[x.second & 0x3F]++;
-        uint8_t best = 0; uint32_t best_cnt = 0;
-        for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
-        kc.push_back(best); write_varint(kc, no - best_cnt);
-        uint32_t prev_ord = 0;
-        for (uint32_t i = 0; i < no; ++i) if (obs[i].second != best) { write_varint(kc, i - prev_ord); prev_ord = i; }
-        for (uint32_t i = 0; i < no; ++i) if (obs[i].second != best) kc.push_back(obs[i].second);
+    { uint32_t prev_pos = 0;
+      for (const auto& pos : positions) {
+          write_varint(ph, pos.hog_pos - prev_pos); prev_pos = pos.hog_pos;
+          write_varint(ph, uint32_t(pos.obs.size()));
+      } }
+
+    // Encode positions [pb,pe) → uid column (uc) + codon column (kc). Positions are independent
+    // (Δ-uid/codon reset each position), so disjoint position ranges encode in parallel and the
+    // ordered concatenation of their buffers reproduces the single-thread layout exactly.
+    auto encode_range = [&](size_t pb, size_t pe, std::vector<uint8_t>& uc, std::vector<uint8_t>& kc) {
+        std::vector<std::pair<uint64_t, uint8_t>> obs;
+        for (size_t pi = pb; pi < pe; ++pi) {
+            const auto& pos = positions[pi];
+            obs.clear(); obs.reserve(pos.obs.size());
+            for (const auto& o : pos.obs) obs.push_back({pack(to_local(o.acc_idx), o.cnum), o.codon_idx});
+            std::sort(obs.begin(), obs.end(),
+                      [](const std::pair<uint64_t,uint8_t>& x, const std::pair<uint64_t,uint8_t>& y){ return x.first < y.first; });
+            uint32_t prev_uid = 0;
+            for (auto& x : obs) { uint32_t uid = uidmap.find(x.first)->second; write_varint(uc, uid - prev_uid); prev_uid = uid; }
+            uint32_t no = uint32_t(obs.size());
+            uint32_t counts[64] = {};
+            for (auto& x : obs) counts[x.second & 0x3F]++;
+            uint8_t best = 0; uint32_t best_cnt = 0;
+            for (int c = 0; c < 64; ++c) if (counts[c] > best_cnt) { best_cnt = counts[c]; best = uint8_t(c); }
+            kc.push_back(best); write_varint(kc, no - best_cnt);
+            uint32_t prev_ord = 0;
+            for (uint32_t i = 0; i < no; ++i) if (obs[i].second != best) { write_varint(kc, i - prev_ord); prev_ord = i; }
+            for (uint32_t i = 0; i < no; ++i) if (obs[i].second != best) kc.push_back(obs[i].second);
+        }
+    };
+
+    size_t total_obs = 0; for (const auto& pos : positions) total_obs += pos.obs.size();
+    size_t nt = size_t(std::max(1, n_threads));
+    // Only the super-HOG (the LPT lone-runner with idle cores) is worth threading; small blocks
+    // keep the serial path so the thread-spawn cost never dominates.
+    if (nt > 1 && total_obs > 4'000'000 && positions.size() >= nt) {
+        // Split into nt CONTIGUOUS position ranges of ~equal obs (prefix-sum) — balances the deep
+        // positions while keeping ranges ordered so concatenation needs no reordering.
+        std::vector<size_t> bnd(nt + 1, 0); bnd[nt] = positions.size();
+        size_t acc = 0, target = (total_obs + nt - 1) / nt, k = 1;
+        for (size_t pi = 0; pi < positions.size() && k < nt; ++pi) {
+            acc += positions[pi].obs.size();
+            if (acc >= target * k) bnd[k++] = pi + 1;
+        }
+        for (; k < nt; ++k) bnd[k] = positions.size();
+        std::vector<std::vector<uint8_t>> ucs(nt), kcs(nt);
+        std::vector<std::thread> pool;
+        for (size_t t = 1; t < nt; ++t)
+            pool.emplace_back([&, t]{ encode_range(bnd[t], bnd[t+1], ucs[t], kcs[t]); });
+        encode_range(bnd[0], bnd[1], ucs[0], kcs[0]);
+        for (auto& th : pool) th.join();
+        raw.insert(raw.end(), ph.begin(), ph.end());
+        for (size_t t = 0; t < nt; ++t) raw.insert(raw.end(), ucs[t].begin(), ucs[t].end());
+        for (size_t t = 0; t < nt; ++t) raw.insert(raw.end(), kcs[t].begin(), kcs[t].end());
+    } else {
+        std::vector<uint8_t> uc, kc;
+        encode_range(0, positions.size(), uc, kc);
+        raw.insert(raw.end(), ph.begin(), ph.end());
+        raw.insert(raw.end(), uc.begin(), uc.end());
+        raw.insert(raw.end(), kc.begin(), kc.end());
     }
-    raw.insert(raw.end(), ph.begin(), ph.end());
-    raw.insert(raw.end(), uc.begin(), uc.end());
-    raw.insert(raw.end(), kc.begin(), kc.end());
 }
 
 // Always emits a v9 block (uid trailer + Δ-uid column). The caller writes the LHH2 magic.
@@ -655,7 +694,10 @@ inline void finalize_inverted_payload(
         uint32_t& stored_sz, const uint8_t*& payload, size_t& payload_sz) {
     (void)sb_hdr; (void)sb_acc; (void)sb_cnum; (void)sb_codon;
     inv_raw.clear();
-    serialize_inverted_block_v9(inv_raw, local_accs, local_acc_pident, positions, hog_length, covered_aa_v);
+    // zstd_workers carries the available core count (nt) — reuse it to parallelize the per-position
+    // serialize for the super-HOG (gated on obs count inside), the merge-shard Amdahl tail.
+    serialize_inverted_block_v9(inv_raw, local_accs, local_acc_pident, positions, hog_length,
+                                covered_aa_v, zstd_workers);
     if (ser_done_ns) *ser_done_ns = clock_ns();
     size_t raw_sz = inv_raw.size();
     size_t bound = ZSTD_compressBound(raw_sz);
