@@ -730,7 +730,8 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
                                                int out_zstd_level, int zstd_workers = 0,
                                                uint64_t* build_ns = nullptr,
                                                uint64_t* ser_ns = nullptr,
-                                               uint64_t* comp_ns = nullptr) {
+                                               uint64_t* comp_ns = nullptr,
+                                               const std::atomic<int>* active_builds = nullptr) {
     uint64_t _bt0 = clock_ns();
     ShardResult res; res.hog_id = hog_id;
     auto& flat_inv = sc.flat_inv;
@@ -762,9 +763,14 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
     }
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
     uint64_t _bt1 = clock_ns(), _ser_done = 0;
+    // Only thread the heavy serialize/compress when this is the lone active build (the LPT
+    // tail) — else nt sub-threads oversubscribe against the other build threads. active==1
+    // means just us; >1 means siblings are running, so stay single-threaded.
+    int eff_workers = (active_builds && active_builds->load(std::memory_order_relaxed) > 1)
+                      ? 1 : zstd_workers;
     finalize_inverted_payload(local_accs, local_acc_pident, positions, hog_length, covered_aa_v,
                               sc.inv_raw, sc.hog_cbuf, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b,
-                              nullptr, out_zstd_level, zstd_workers, &_ser_done, stored_sz, payload, payload_sz);
+                              nullptr, out_zstd_level, eff_workers, &_ser_done, stored_sz, payload, payload_sz);
     uint64_t _bt2 = clock_ns();
     if (build_ns) *build_ns = _bt1 - _bt0;            // positions construction + sort
     if (ser_ns)   *ser_ns   = _ser_done - _bt1;       // serialize_inverted_block_v9
@@ -940,6 +946,10 @@ inline void run_merge_shard_spill(
         BuildMemGuard guard; guard.init(budget, &failed);
 
         std::atomic<size_t> gnext{0};
+        // Live count of builds in their heavy phase. The super-HOG's per-position serialize /
+        // MT-zstd may only thread when it's the LONE runner (the LPT tail) — otherwise its nt
+        // threads oversubscribe against the other 15 build threads still doing small HOGs.
+        std::atomic<int> active_heavy{0};
         auto p2 = [&]() {
             ShardScratch sc(n_accessions);
             try {
@@ -953,6 +963,7 @@ inline void run_merge_shard_spill(
                     sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
                     size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
                     guard.acquire(est);
+                    active_heavy.fetch_add(1, std::memory_order_relaxed);
                     uint64_t _rr0 = clock_ns();
                     for (uint64_t ro : groups[hidx]) {
                         const uint8_t* q = &data[ro];
@@ -979,10 +990,11 @@ inline void run_merge_shard_spill(
                     uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
                     ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
                                                                 n_accs, hog_length, out_zstd_level, int(nt),
-                                                                &_b_ns, &_s_ns, &_c_ns);
+                                                                &_b_ns, &_s_ns, &_c_ns, &active_heavy);
                     _t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
                     _t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
                     _t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
+                    active_heavy.fetch_sub(1, std::memory_order_relaxed);
                     emit(std::move(r));
                     release_if_big(sc.flat_inv, size_t(32) << 20);
                     release_if_big(sc.inv_raw,  size_t(32) << 20);
