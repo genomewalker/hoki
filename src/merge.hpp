@@ -704,9 +704,9 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
         positions.push_back(std::move(ip));
     }
     for (auto& e : flat_inv) positions[cs_pidx[e.first]].obs.push_back(std::move(e.second));
-    for (auto& pos : positions)
-        std::sort(pos.obs.begin(), pos.obs.end(),
-                  [](const InvObs& a, const InvObs& b) { return a.acc_idx < b.acc_idx; });
+    // NOTE: no per-position sort here — serialize_inverted_block_v9 copies each position's obs
+    // and re-sorts them by (local_acc, cnum) anyway, so sorting by acc_idx here was pure waste
+    // (a full sort of every observation, the bulk of invbuild). Output is identical.
     std::vector<uint32_t> local_accs(sc.seen_accs);
     std::sort(local_accs.begin(), local_accs.end());
     std::vector<uint8_t>  local_acc_pident(local_accs.size(), 0);
