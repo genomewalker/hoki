@@ -872,7 +872,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     // end-of-run spike). write_partition_index_streamed emits each worker's hogs in 32 MB
     // chunks and frees each worker as it goes; load_partition_index re-groups across the
     // per-thread entries. Peak at finalization ≈ one chunk, not the whole index.
-    write_partition_index_streamed(writers, uint32_t(N), out_dir + "/partition.idx");
+    uint64_t n_index_entries = write_partition_index_streamed(writers, uint32_t(N), out_dir + "/partition.idx");
     write_acc_registry(acc_vec, out_dir + "/acc.registry");
 
     uint64_t tot_written=0, tot_skipped=0, tot_obs=0;
@@ -884,7 +884,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     std::cerr << "ingest: " << tot_written << " records, " << tot_skipped << " skipped, "
               << tot_obs << " obs dropped, "
               << acc_vec.size() << " accessions, "
-              << global_idx.size() << " HOGs → " << out_dir
+              << n_index_entries << " index entries → " << out_dir
               << " (" << N << " threads)\n";
     std::cerr << "ingest: worker load [";
     for (size_t t=0;t<N;++t) std::cerr << (t?",":"") << "t" << t << ":" << w_written[t];

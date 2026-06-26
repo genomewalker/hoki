@@ -269,7 +269,7 @@ inline void write_partition_index(
 // A HOG appears once per thread that holds it; load_partition_index accumulates extents
 // per HOG across entries, so the header n_hogs is the TOTAL (thread,hog) entry count.
 // This avoids the merged-copy (global_idx) that doubled the index RAM at finalization.
-inline void write_partition_index_streamed(
+inline uint64_t write_partition_index_streamed(
         std::vector<std::unique_ptr<PartitionWriter>>& writers,
         uint32_t n_threads, const std::string& out_path) {
     UniqueFd fd(::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
@@ -313,6 +313,7 @@ inline void write_partition_index_streamed(
         writers[t]->clear_index();   // release this worker's index now
     }
     if (!buf.empty()) write_all(buf.data(), buf.size());
+    return total_entries;
 }
 
 // Load partition index. n_threads_out receives the number of tN.lhp files.
