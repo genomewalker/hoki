@@ -4,6 +4,7 @@
 #include "batch.hpp"
 #include "container.hpp"
 #include "partition.hpp"
+#include "convert.hpp"
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -254,16 +255,7 @@ inline void spill_extent_into(const uint8_t* frame_ptr, size_t frame_len,
         p += n;
         std::string_view uid(reinterpret_cast<const char*>(p), len);
         p += len;
-        uint32_t cnum = j;
-        auto fs = uid.find('_');
-        if (fs != std::string_view::npos && fs + 1 < uid.size()) {
-            auto fe = uid.find('_', fs + 1);
-            auto part = (fe != std::string_view::npos) ? uid.substr(fs+1, fe-fs-1) : uid.substr(fs+1);
-            uint32_t v = 0;
-            auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
-            if (cr.ec == std::errc{}) cnum = v;
-        }
-        contig_cnum[j] = cnum;
+        contig_cnum[j] = parse_cnum(uid, j);
     }
     recs.clear();
     if (!deserialize_varnt_block_split(p, end, bmp_sec + ext.bmp_off, cdn_sec + ext.cdn_off, recs))
@@ -739,6 +731,109 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
 using ShardHogList =
     std::vector<const std::pair<const std::string, std::vector<PartitionIndexExtent>>*>;
 
+// Build every HOG present in one bucket's spill records. `data` holds spill records whose
+// hog_idx field is already GLOBAL (the spill scatter / the fused remap guarantee this). Groups
+// by hog_idx, schedules biggest-first (LPT), builds each HOG's inverted block under the memory
+// guard, and emits it. Shared by the decode-scatter path (run_merge_shard_spill) and the fused
+// path (run_merge_shard_fused). Throws via `failed`/`err` on the first error.
+inline void build_bucket(
+        std::vector<uint8_t>& data,
+        size_t n_accessions, size_t budget, size_t nt, int out_zstd_level,
+        const std::function<const std::string&(uint32_t)>& name_of,
+        const std::function<void(ShardResult&&)>& emit,
+        std::atomic<bool>& failed, std::string& err, std::mutex& err_mtx,
+        std::atomic<uint64_t>& t_recread, std::atomic<uint64_t>& t_invbuild,
+        std::atomic<uint64_t>& t_ser, std::atomic<uint64_t>& t_compress) {
+    // group record spans by hog_idx
+    std::unordered_map<uint32_t, std::vector<uint64_t>> groups;  // hog_idx -> record start offsets (64-bit: buckets exceed 4GB at scale)
+    std::unordered_map<uint32_t, uint64_t> group_bytes;          // hog_idx -> spill bytes (build-scratch estimate)
+    size_t off = 0;
+    while (off + 25 <= data.size()) {
+        uint64_t rstart = off;
+        uint32_t hog_idx = read_u32_le(&data[off]);
+        off += 4 + 4 + 4 + 4 + 4 + 1;  // hog,acc,cnum,sstart,send,pu8
+        uint32_t nobs = read_u32_le(&data[off]); off += 4;
+        off += size_t(nobs) * 5;
+        groups[hog_idx].push_back(rstart);
+        group_bytes[hog_idx] += off - rstart;
+    }
+    std::vector<uint32_t> hkeys; hkeys.reserve(groups.size());
+    for (auto& kv : groups) hkeys.push_back(kv.first);
+    // LPT scheduling: biggest HOGs first so a giant one can't strand a thread
+    // at the tail while the rest idle (the pass2-build Amdahl bottleneck).
+    std::sort(hkeys.begin(), hkeys.end(),
+              [&](uint32_t a, uint32_t b){ return groups[a].size() > groups[b].size(); });
+
+    // Bound concurrent per-HOG build scratch to a share of --flush so RSS (bucket + groups +
+    // builds) stays within budget. est ≈ hog spill bytes × FACTOR (flat_inv + inv_raw + cbuf
+    // vs the ~5 B/obs spill record). Shared guard with merge_batches.
+    constexpr size_t MS_BUILD_FACTOR = 6;
+    BuildMemGuard guard; guard.init(budget, &failed);
+
+    std::atomic<size_t> gnext{0};
+    auto p2 = [&]() {
+        ShardScratch sc(n_accessions);
+        try {
+            for (;;) {
+                size_t gi = gnext.fetch_add(1, std::memory_order_relaxed);
+                if (gi >= hkeys.size() || failed.load(std::memory_order_relaxed)) break;
+                uint32_t hidx = hkeys[gi];
+                if (++sc.epoch == 0) { std::fill(sc.seen_epoch.begin(), sc.seen_epoch.end(), 0); sc.epoch = 1; }
+                uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
+                sc.seen_accs.clear(); sc.flat_inv.clear();
+                sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
+                size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
+                guard.acquire(est);
+                uint64_t _rr0 = clock_ns();
+                for (uint64_t ro : groups[hidx]) {
+                    const uint8_t* q = &data[ro];
+                    q += 4;                              // skip hog_idx
+                    uint32_t acc  = read_u32_le(q); q += 4;
+                    uint32_t cnum = read_u32_le(q); q += 4;
+                    uint32_t ss   = read_u32_le(q); q += 4;
+                    uint32_t se   = read_u32_le(q); q += 4;
+                    uint8_t  pu8  = *q++;
+                    uint32_t nobs = read_u32_le(q); q += 4;
+                    if (sc.seen_epoch[acc] != epoch) { sc.seen_epoch[acc] = epoch; ++n_accs; sc.seen_accs.push_back(acc); }
+                    hog_length = std::max(hog_length, se + 1);
+                    sc.acc_intervals_map[acc].emplace_back(ss, se);
+                    { auto [it2, ins] = sc.acc_pident_map.emplace(acc, pu8); if (!ins && pu8 < it2->second) it2->second = pu8; }
+                    for (uint32_t k = 0; k < nobs; ++k) {
+                        uint32_t hoff = read_u32_le(q); q += 4;
+                        uint8_t cod = *q++;
+                        sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
+                    }
+                }
+                t_recread.fetch_add(clock_ns() - _rr0, std::memory_order_relaxed);
+                uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
+                ShardResult r = build_inverted_from_scratch(name_of(hidx), sc,
+                                                            n_accs, hog_length, out_zstd_level,
+                                                            &_b_ns, &_s_ns, &_c_ns);
+                t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
+                t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
+                t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
+                emit(std::move(r));
+                release_if_big(sc.flat_inv, size_t(32) << 20);
+                release_if_big(sc.inv_raw,  size_t(32) << 20);
+                release_if_big(sc.hog_cbuf, size_t(32) << 20);
+                // Big builds (the super-HOG) leave large freed slabs that glibc keeps in the
+                // worker arena — RSS then overshoots --flush by the slab size. Return it to the
+                // OS. Gated on est so small builds skip the syscall.
+                if (est > (size_t(256) << 20)) malloc_trim(0);
+                guard.release(est);
+            }
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lk(err_mtx);
+            if (!failed.exchange(true)) err = e.what();
+        }
+    };
+    size_t bt = std::max<size_t>(1, std::min(nt, hkeys.size()));
+    std::vector<std::thread> pool;
+    for (size_t t = 1; t < bt; ++t) pool.emplace_back(p2);
+    p2();
+    for (auto& t : pool) t.join();
+}
+
 // Memory-bounded merge of one shard set. emit() is called once per built HOG and
 // must be thread-safe. Peak RAM is bounded by `budget` regardless of shard size.
 inline void run_merge_shard_spill(
@@ -875,98 +970,12 @@ inline void run_merge_shard_spill(
               got += size_t(r);
           } }
         _t_read += clock_ns() - _r0;
-        // group record spans by hog_idx
-        std::unordered_map<uint32_t, std::vector<uint64_t>> groups;  // hog_idx -> record start offsets (64-bit: buckets exceed 4GB at scale)
-        std::unordered_map<uint32_t, uint64_t> group_bytes;          // hog_idx -> spill bytes (build-scratch estimate)
-        size_t off = 0;
-        while (off + 25 <= data.size()) {
-            uint64_t rstart = off;
-            uint32_t hog_idx = read_u32_le(&data[off]);
-            off += 4 + 4 + 4 + 4 + 4 + 1;  // hog,acc,cnum,sstart,send,pu8
-            uint32_t nobs = read_u32_le(&data[off]); off += 4;
-            off += size_t(nobs) * 5;
-            groups[hog_idx].push_back(rstart);
-            group_bytes[hog_idx] += off - rstart;
-        }
-        std::vector<uint32_t> hkeys; hkeys.reserve(groups.size());
-        for (auto& kv : groups) hkeys.push_back(kv.first);
-        // LPT scheduling: biggest HOGs first so a giant one can't strand a thread
-        // at the tail while the rest idle (the pass2-build Amdahl bottleneck).
-        std::sort(hkeys.begin(), hkeys.end(),
-                  [&](uint32_t a, uint32_t b){ return groups[a].size() > groups[b].size(); });
-
-        // Bound concurrent per-HOG build scratch to a share of --flush so pass2 RSS (bucket +
-        // groups + builds) stays within budget. est ≈ hog spill bytes × FACTOR (flat_inv +
-        // inv_raw + cbuf vs the ~5 B/obs spill record). Shared guard with merge_batches.
-        constexpr size_t MS_BUILD_FACTOR = 6;
-        BuildMemGuard guard; guard.init(budget, &failed);
-
-        std::atomic<size_t> gnext{0};
-        auto p2 = [&]() {
-            ShardScratch sc(n_accessions);
-            try {
-                for (;;) {
-                    size_t gi = gnext.fetch_add(1, std::memory_order_relaxed);
-                    if (gi >= hkeys.size() || failed.load(std::memory_order_relaxed)) break;
-                    uint32_t hidx = hkeys[gi];
-                    if (++sc.epoch == 0) { std::fill(sc.seen_epoch.begin(), sc.seen_epoch.end(), 0); sc.epoch = 1; }
-                    uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
-                    sc.seen_accs.clear(); sc.flat_inv.clear();
-                    sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
-                    size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
-                    guard.acquire(est);
-                    uint64_t _rr0 = clock_ns();
-                    for (uint64_t ro : groups[hidx]) {
-                        const uint8_t* q = &data[ro];
-                        q += 4;                              // skip hog_idx
-                        uint32_t acc  = read_u32_le(q); q += 4;
-                        uint32_t cnum = read_u32_le(q); q += 4;
-                        uint32_t ss   = read_u32_le(q); q += 4;
-                        uint32_t se   = read_u32_le(q); q += 4;
-                        uint8_t  pu8  = *q++;
-                        uint32_t nobs = read_u32_le(q); q += 4;
-                        if (sc.seen_epoch[acc] != epoch) { sc.seen_epoch[acc] = epoch; ++n_accs; sc.seen_accs.push_back(acc); }
-                        hog_length = std::max(hog_length, se + 1);
-                        sc.acc_intervals_map[acc].emplace_back(ss, se);
-                        { auto [it2, ins] = sc.acc_pident_map.emplace(acc, pu8); if (!ins && pu8 < it2->second) it2->second = pu8; }
-                        for (uint32_t k = 0; k < nobs; ++k) {
-                            uint32_t hoff = read_u32_le(q); q += 4;
-                            uint8_t cod = *q++;
-                            sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
-                        }
-                    }
-                    _t_recread.fetch_add(clock_ns() - _rr0, std::memory_order_relaxed);
-                    // Lone-runner big builds (the super-HOG) get multi-threaded zstd on the
-                    // idle cores; finalize gates it on block size so only the giant block uses it.
-                    uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
-                    ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
-                                                                n_accs, hog_length, out_zstd_level,
-                                                                &_b_ns, &_s_ns, &_c_ns);
-                    _t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
-                    _t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
-                    _t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
-                    emit(std::move(r));
-                    release_if_big(sc.flat_inv, size_t(32) << 20);
-                    release_if_big(sc.inv_raw,  size_t(32) << 20);
-                    release_if_big(sc.hog_cbuf, size_t(32) << 20);
-                    // Big builds (the super-HOG lone-runner) leave large freed slabs that glibc
-                    // keeps in the worker arena — RSS then overshoots --flush by the slab size
-                    // (~4-5 GB) even though the data is gone. Return it to the OS, as the data
-                    // merge already does (merge.hpp:~1724). Gated on est so small builds skip it.
-                    if (est > (size_t(256) << 20)) malloc_trim(0);
-                    guard.release(est);
-                }
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(err_mtx);
-                if (!failed.exchange(true)) err = e.what();
-            }
-        };
-        size_t bt = std::max<size_t>(1, std::min(nt, hkeys.size()));
+        // Build every HOG in this bucket. Records already carry global hog_idx (the scatter
+        // wrote fe.hog_idx, which indexes hog_list).
+        auto name_of = [&](uint32_t hidx) -> const std::string& { return hog_list[hidx]->first; };
         uint64_t _b0 = clock_ns();
-        std::vector<std::thread> pool;
-        for (size_t t = 1; t < bt; ++t) pool.emplace_back(p2);
-        p2();
-        for (auto& t : pool) t.join();
+        build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
+                     failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
         _t_build += clock_ns() - _b0;
         if (failed.load()) throw std::runtime_error("spill pass 2: " + err);
         // free this bucket's backing store
@@ -980,6 +989,89 @@ inline void run_merge_shard_spill(
         std::fprintf(stderr, "spill-prof: pass2 cpu split — recread %.1fs | invbuild %.1fs | serialize %.1fs | compress %.1fs\n",
                      _t_recread.load()/1e9, _t_invbuild.load()/1e9, _t_ser.load()/1e9, _t_compress.load()/1e9);
     }
+}
+
+// Build a shard directly from a fused ingest spill dir (B buckets × N worker files, written by
+// ingest). No decode/scatter pass — ingest already produced the spill records. Per bucket, the
+// N workers' files are concatenated and each record's LOCAL hog idx is remapped in place to its
+// global id (via that worker's registry), then built. Peak RAM ≈ one bucket + per-HOG builds,
+// bounded by `budget` exactly like the spill path.
+inline void run_merge_shard_fused(
+        const std::string& spill_dir, uint32_t B, uint32_t N,
+        const std::vector<std::string>& global_names,
+        const std::vector<std::vector<uint32_t>>& worker_remap,
+        const std::vector<uint32_t>& acc_remap,
+        size_t n_accessions, size_t budget, size_t nt, int out_zstd_level,
+        bool do_profile, const std::function<void(ShardResult&&)>& emit) {
+    std::atomic<bool> failed{false}; std::string err; std::mutex err_mtx;
+    std::atomic<uint64_t> _t_recread{0}, _t_invbuild{0}, _t_ser{0}, _t_compress{0};
+    uint64_t _t_read = 0, _t_build = 0;
+    auto name_of = [&](uint32_t hidx) -> const std::string& { return global_names[hidx]; };
+
+    for (uint32_t b = 0; b < B; ++b) {
+        std::vector<uint8_t> data;
+        uint64_t _r0 = clock_ns();
+        for (uint32_t t = 0; t < N; ++t) {
+            std::string bp = spill_dir + "/t" + std::to_string(t) + ".bucket." + std::to_string(b);
+            int fd = ::open(bp.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+            off_t sz = lseek(fd, 0, SEEK_END);
+            if (sz > 0) {
+                // Read the compressed bucket, then decompress its frames into `data`.
+                // Frame layout (written by ingest drain): [u32 csz][u32 usz][csz zstd bytes].
+                std::vector<uint8_t> cfile(static_cast<size_t>(sz));
+                size_t got = 0;
+                while (got < size_t(sz)) {
+                    ssize_t r = ::pread(fd, cfile.data() + got, size_t(sz) - got, off_t(got));
+                    if (r <= 0) { ::close(fd); throw std::runtime_error("fused bucket read failed: " + bp); }
+                    got += size_t(r);
+                }
+                size_t base = data.size();
+                size_t co = 0;
+                while (co + 8 <= cfile.size()) {
+                    uint32_t csz = read_u32_le(&cfile[co]);
+                    uint32_t usz = read_u32_le(&cfile[co + 4]);
+                    co += 8;
+                    if (co + csz > cfile.size()) { ::close(fd); throw std::runtime_error("truncated spill frame: " + bp); }
+                    size_t dpos = data.size();
+                    data.resize(dpos + usz);
+                    size_t dn = ZSTD_decompress(data.data() + dpos, usz, &cfile[co], csz);
+                    if (ZSTD_isError(dn) || dn != usz) { ::close(fd); throw std::runtime_error("spill frame decompress failed: " + bp); }
+                    co += csz;
+                }
+                // Remap in place: this worker's local hog idx → global (record u32[0]), and
+                // the ingest acc id → sorted-rank acc id (record u32[1]) so the built block is
+                // acc-sorted, matching the partition path canonically.
+                const auto& rm = worker_remap[t];
+                size_t off = base;
+                while (off + 25 <= data.size()) {
+                    uint32_t loc  = read_u32_le(&data[off]);
+                    uint32_t glob = (loc < rm.size()) ? rm[loc] : loc;
+                    data[off+0]=uint8_t(glob); data[off+1]=uint8_t(glob>>8);
+                    data[off+2]=uint8_t(glob>>16); data[off+3]=uint8_t(glob>>24);
+                    uint32_t acc  = read_u32_le(&data[off+4]);
+                    uint32_t gacc = (acc < acc_remap.size()) ? acc_remap[acc] : acc;
+                    data[off+4]=uint8_t(gacc); data[off+5]=uint8_t(gacc>>8);
+                    data[off+6]=uint8_t(gacc>>16); data[off+7]=uint8_t(gacc>>24);
+                    off += 4 + 4 + 4 + 4 + 4 + 1;
+                    uint32_t nobs = read_u32_le(&data[off]); off += 4;
+                    off += size_t(nobs) * 5;
+                }
+            }
+            ::close(fd);
+        }
+        _t_read += clock_ns() - _r0;
+        if (data.empty()) continue;
+        uint64_t _b0 = clock_ns();
+        build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
+                     failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
+        _t_build += clock_ns() - _b0;
+        if (failed.load()) throw std::runtime_error("fused build: " + err);
+    }
+    if (do_profile)
+        std::fprintf(stderr, "fused-prof: read %.1fs | build %.1fs (wall) — recread %.1fs invbuild %.1fs serialize %.1fs compress %.1fs\n",
+                     _t_read/1e9, _t_build/1e9, _t_recread.load()/1e9, _t_invbuild.load()/1e9,
+                     _t_ser.load()/1e9, _t_compress.load()/1e9);
 }
 
 inline void merge_batches(const std::vector<std::string>& input_paths,

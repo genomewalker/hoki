@@ -117,221 +117,6 @@ inline size_t compute_flush_threshold(size_t explicit_bytes) {
     return flush;
 }
 
-// ── Single-threaded ingest (original code path, used when -t 1 or not set) ──
-
-inline void ingest_st(const std::string& tsv_path, const std::string& out_dir,
-                      ConvertOptions opts, size_t flush_threshold) {
-    std::filesystem::create_directories(out_dir);
-
-    struct AccState {
-        uint32_t acc_idx;
-        SvDict contig_dict;
-        std::vector<std::string> contig_strings;
-        std::unordered_map<uint32_t, std::vector<VarNTRecord>> batches;
-    };
-
-    bool auto_acc = (opts.acc_id == "auto");
-    std::unordered_map<std::string, AccState> acc_states;
-    SvDict hog_dict;
-    std::vector<std::string> hog_strings;
-
-    auto intern = [](SvDict& d, std::vector<std::string>& v, std::string_view s) -> uint32_t {
-        auto it = d.find(s);
-        if (it != d.end()) return it->second;
-        uint32_t idx = uint32_t(v.size());
-        v.emplace_back(s);
-        d.emplace(v.back(), idx);
-        return idx;
-    };
-
-    PartitionWriter pw(out_dir + "/t0.lhp", opts.zstd_level);
-    size_t mem_bytes = 0;
-    uint64_t n_flushes = 0;
-
-    auto flush_batches = [&]() {
-        for (auto& [acc, st] : acc_states) {
-            for (auto& [hog_idx, batch] : st.batches) {
-                if (batch.empty()) continue;
-                auto raw = serialize_shard_raw(st.contig_strings, batch);
-                pw.append_raw(hog_strings[hog_idx], st.acc_idx, uint32_t(batch.size()), raw.data(), uint32_t(raw.size()));
-            }
-            st.batches.clear();
-            st.contig_dict.clear();
-            st.contig_strings.clear();
-        }
-        // HOG dict stays — 166K names × ~15B = ~2.5MB, free to keep across flushes.
-        // Only VarNTRecord batches and per-acc contig dicts drive memory growth.
-        mem_bytes = 0;
-        ++n_flushes;
-        malloc_trim(0);
-    };
-
-    TsvReader reader(tsv_path);
-    std::string line;
-    uint64_t lineno = 0, n_written = 0, n_skipped = 0, n_obs_dropped = 0;
-    AlignedResult ar_buf;
-
-    while (reader.getline(line)) {
-        ++lineno;
-        if (line.empty() || line[0] == '#') continue;
-
-        std::array<std::string_view, 14> f{};
-        size_t fi = 0;
-        {
-            const char* lp = line.data(); size_t llen = line.size();
-            uint32_t tabs[13], n = 0;
-#ifdef __AVX2__
-            const __m256i vt = _mm256_set1_epi8('\t');
-            size_t i = 0;
-            for (; i + 32 <= llen && n < 13; i += 32) {
-                uint32_t m = (uint32_t)_mm256_movemask_epi8(
-                    _mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(lp+i)), vt));
-                while (m && n < 13) { tabs[n++] = uint32_t(i + __builtin_ctz(m)); m &= m-1; }
-            }
-            for (; i < llen && n < 13; ++i) if (lp[i] == '\t') tabs[n++] = uint32_t(i);
-#elif defined(__ARM_NEON)
-            const uint8x16_t vt = vdupq_n_u8('\t');
-            size_t i = 0;
-            for (; i + 16 <= llen && n < 13; i += 16) {
-                uint8x16_t chunk = vld1q_u8((const uint8_t*)(lp+i));
-                uint8x16_t eq    = vceqq_u8(chunk, vt);
-                if (vmaxvq_u8(eq))
-                    for (size_t j = i; j < i+16 && n < 13; ++j)
-                        if ((uint8_t)lp[j] == '\t') tabs[n++] = uint32_t(j);
-            }
-            for (; i < llen && n < 13; ++i) if ((uint8_t)lp[i] == '\t') tabs[n++] = uint32_t(i);
-#else
-            const char* fp = lp, *ep = lp + llen;
-            while (n < 13) {
-                const char* t = (const char*)memchr(fp, '\t', size_t(ep-fp));
-                if (!t) break;
-                tabs[n++] = uint32_t(t - lp); fp = t + 1;
-            }
-#endif
-            uint32_t prev = 0;
-            for (uint32_t t = 0; t < n; ++t) { f[fi++] = {lp+prev, tabs[t]-prev}; prev = tabs[t]+1; }
-            if (fi < 14) f[fi++] = {lp+prev, llen-prev};
-        }
-        if (fi < 13) { if (opts.verbose) std::cerr << "skip L" << lineno << ": " << fi << " fields\n"; ++n_skipped; continue; }
-        bool has_nt = (fi == 14 && !f[col::full_qseq].empty());
-
-        float pident = 0.0f; double ev = 0.0;
-        { auto [ptr,ec] = std::from_chars(f[col::pident].data(), f[col::pident].data()+f[col::pident].size(), pident);
-          if (ec != std::errc{}) { ++n_skipped; continue; } }
-        { auto [ptr,ec] = std::from_chars(f[col::evalue].data(),  f[col::evalue].data()+f[col::evalue].size(),  ev);
-          if (ec != std::errc{}) { ++n_skipped; continue; } }
-        if (pident < opts.min_pident) { ++n_skipped; continue; }
-        if (ev     > opts.max_evalue) { ++n_skipped; continue; }
-        if (pident == 100.0f)         { ++n_skipped; continue; }
-
-        uint32_t sstart=0, send=0, qstart=0, qend=0, qlen=0;
-        {
-            auto fc = [](std::string_view sv, uint32_t& out) -> bool {
-                auto [p,ec] = std::from_chars(sv.data(), sv.data()+sv.size(), out);
-                return ec == std::errc{};
-            };
-            if (!fc(f[col::sstart],sstart)||!fc(f[col::send],send)||
-                !fc(f[col::qstart],qstart)||!fc(f[col::qend],qend)||
-                !fc(f[col::qlen],qlen)) { if (opts.verbose) std::cerr << "parse error L" << lineno << "\n"; ++n_skipped; continue; }
-        }
-        if (sstart > send) { ++n_skipped; continue; }
-        if (!has_nt) continue;
-
-        std::string_view qseqid = f[col::qseqid];
-        std::string acc;
-        if (auto_acc) {
-            auto us = qseqid.find('_');
-            acc = std::string(us != std::string_view::npos ? qseqid.substr(0,us) : qseqid);
-        } else {
-            acc = opts.acc_id;
-        }
-
-        bool inserted = (acc_states.count(acc) == 0);
-        AccState& st = acc_states[acc];
-        if (inserted) st.acc_idx = uint32_t(acc_states.size() - 1);
-
-        size_t n_hogs_before = hog_strings.size();
-        uint32_t hog_idx    = intern(hog_dict, hog_strings, extract_hog(f[col::sseqid]));
-        if (hog_strings.size() > n_hogs_before) mem_bytes += hog_strings.back().size() + 64;
-
-        size_t n_contigs_before = st.contig_strings.size();
-        uint32_t contig_idx = intern(st.contig_dict, st.contig_strings, qseqid);
-        if (st.contig_strings.size() > n_contigs_before) mem_bytes += qseqid.size() + 64;
-
-        int8_t qframe = make_qframe(f[col::qstrand], qstart, qend, qlen);
-        cigar_parse_inplace(f[col::cigar], f[col::qseq_aa], sstart, send, ar_buf);
-
-        VarNTRecord vr;
-        vr.contig_idx = contig_idx; vr.sstart = sstart; vr.send = send;
-        vr.qframe = qframe; vr.pident = pident; vr.evalue = ev;
-
-        std::string_view full_nt = f[col::full_qseq];
-        uint32_t span = send - sstart + 1;
-        for (uint32_t i = 0; i < span; ++i) {
-            uint8_t obs_aa = ar_buf.aas[i];
-            if (obs_aa == AA_GAP || obs_aa == AA_UNK) { ++n_obs_dropped; continue; }
-            uint32_t q_off = ar_buf.qseq_offsets[i];
-            if (q_off == UINT32_MAX) { ++n_obs_dropped; continue; }
-            uint8_t c0,c1,c2;
-            if (qframe > 0) {
-                size_t cs = size_t(qstart-1) + size_t(q_off)*3;
-                if (cs+2 >= full_nt.size()) { ++n_obs_dropped; continue; }
-                c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
-            } else {
-                if (size_t(q_off)*3+3 > size_t(qstart)) { ++n_obs_dropped; continue; }
-                size_t cs = size_t(qstart-1) - size_t(q_off)*3 - 2;
-                if (cs+2 >= full_nt.size()) { ++n_obs_dropped; continue; }
-                c0=uint8_t(full_nt[cs]); c1=uint8_t(full_nt[cs+1]); c2=uint8_t(full_nt[cs+2]);
-                uint8_t tmp[3]={c0,c1,c2}; revcomp_codon(tmp); c0=tmp[0]; c1=tmp[1]; c2=tmp[2];
-            }
-            if (!(k_acgt_lut[c0] & k_acgt_lut[c1] & k_acgt_lut[c2])) { ++n_obs_dropped; continue; }
-            uint8_t raw3[3]={c0,c1,c2};
-            uint8_t packed = pack_codon(raw3);
-            if (codon_to_aa(packed) != obs_aa) {
-                if (opts.verbose) std::cerr << "codon/AA mismatch L" << lineno << "\n";
-                ++n_obs_dropped; continue;
-            }
-            vr.vars.push_back({i, packed});
-        }
-        if (!vr.vars.empty()) {
-            auto& bucket = st.batches[hog_idx];
-            if (bucket.empty()) mem_bytes += 64;
-            mem_bytes += sizeof(VarNTRecord) + vr.vars.capacity() * sizeof(vr.vars[0]) + 16;
-            bucket.push_back(std::move(vr));
-            ++n_written;
-        }
-
-        bool over = mem_bytes > flush_threshold;
-        if (!over && (lineno & 0x3FFFu) == 0) {
-            size_t rss = read_rss_bytes();
-            if (rss > flush_threshold) {
-                std::cerr << "ingest: RSS " << (rss>>20) << " MiB > threshold "
-                          << (flush_threshold>>20) << " MiB (estimated "
-                          << (mem_bytes>>20) << " MiB) — flushing\n";
-                over = true;
-            }
-        }
-        if (over) flush_batches();
-    }
-
-    if (mem_bytes > 0) flush_batches();
-    pw.flush_all();
-
-    std::vector<std::string> accessions(acc_states.size());
-    for (auto& [acc, st] : acc_states) accessions[st.acc_idx] = acc;
-    write_acc_registry(accessions, out_dir + "/acc.registry");
-
-    std::map<std::string, std::vector<PartitionIndexExtent>> global_idx;
-    for (const auto& [hog, extents] : pw.index())
-        for (auto e : extents) { e.thread_idx = 0u; global_idx[hog].push_back(e); }
-    write_partition_index(global_idx, 1u, out_dir + "/partition.idx");
-
-    std::cerr << "ingest: " << n_written << " records, " << n_skipped << " skipped, "
-              << n_obs_dropped << " obs dropped, "
-              << accessions.size() << " accessions, "
-              << global_idx.size() << " HOGs → " << out_dir << "\n";
-}
-
 // ── Multithreaded ingest ─────────────────────────────────────────────────────
 //
 // Reader thread dispatches lines to N workers by round-robin (acc_idx % N).
@@ -409,11 +194,25 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     std::vector<std::unique_ptr<WorkQueue>> queues(N);
     for (auto& q : queues) q = std::make_unique<WorkQueue>();
 
-    // ── Pre-create PartitionWriters so index() is accessible after join ──────
-    std::vector<std::unique_ptr<PartitionWriter>> writers(N);
-    for (size_t t = 0; t < N; ++t)
-        writers[t] = std::make_unique<PartitionWriter>(
-            out_dir + "/t" + std::to_string(t) + ".lhp", opts.zstd_level);
+    // ── Fused spill-bucket count B (shared by all workers; baked into the on-disk
+    // bucket each record lands in). Any B≥1 is correct — it only trades pass2 bucket
+    // size (memory) against bucket count (read overhead). Size buckets to ~1/3 of the
+    // flush budget, estimating total spill from the compressed input.
+    const size_t full_budget = (opts.flush_bytes != 0 ? opts.flush_bytes : flush_threshold);
+    size_t B;
+    if (opts.buckets) B = opts.buckets;
+    else {
+        size_t in_sz = 0;
+        std::error_code ec; auto fs = std::filesystem::file_size(tsv_path, ec);
+        if (!ec) in_sz = size_t(fs);
+        size_t bucket_budget = std::max<size_t>(full_budget / 3, size_t(64) << 20);
+        // Measured: spill ≈ 1.75× a .zst input (0.5× decompressed). Use ×4 to err toward MORE
+        // buckets (smaller pass2 `data` → memory-safe); cost of over-bucketing is only extra
+        // bucket reads. ceiling: assumes input compressed; a plain .tsv input over-buckets ~8×
+        // (still safe). Pass --buckets to size exactly.
+        size_t est_spill = std::max<size_t>(in_sz * 4, bucket_budget);
+        B = std::min<size_t>(4096, std::max<size_t>(1, (est_spill + bucket_budget - 1) / bucket_budget));
+    }
 
     // ── Per-worker aggregate counters ────────────────────────────────────────
     std::vector<uint64_t> w_written(N,0), w_skipped(N,0), w_obs_dropped(N,0);
@@ -445,7 +244,6 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         SvDict hog_dict;
         std::vector<std::string> hog_strings;
 
-        PartitionWriter& pw = *writers[tid];
         size_t mem_bytes    = 0;
         uint32_t rss_tick   = 0;
         // --flush is the total RSS budget. The flush is async double-buffered (one batch
@@ -468,7 +266,21 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
         // often data is flushed. (Measured: peak was 24.1 GB at 100% on a 24 GB budget.)
         const size_t rss_cap = flush_budget * 95 / 100;
 
-        // cctx is now owned by PartitionWriter; no per-worker CCtx needed here.
+        // This worker owns B spill-bucket files (tN.bucket.b). The async flush expands records
+        // into spill-record bytes, bucketed by hash(hog_name)%B (consistent across workers →
+        // every worker's records for a HOG co-locate in the same bucket index), and drains each
+        // bucket buffer once it reaches CHUNK.
+        std::vector<UniqueFd> bfd;
+        std::vector<int>      bfd_ints;
+        const size_t CHUNK = std::max<size_t>(size_t(64) << 10,
+                                              (flush_budget / 8) / std::max<size_t>(1, N * B));
+        bfd.reserve(B); bfd_ints.reserve(B);
+        for (size_t b = 0; b < B; ++b) {
+            std::string bp = out_dir + "/t" + std::to_string(tid) + ".bucket." + std::to_string(b);
+            int fd = ::open(bp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) throw std::runtime_error("cannot create spill bucket: " + bp);
+            bfd.emplace_back(fd); bfd_ints.push_back(fd);
+        }
 
         auto intern = [](SvDict& d, std::vector<std::string>& v, std::string_view s) -> uint32_t {
             auto it = d.find(s);
@@ -479,7 +291,6 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             return idx;
         };
 
-        std::vector<uint32_t>    sort_counts, sort_order, scatter_pos;  // reused across flushes
         std::future<void>        flush_future;
         uint64_t& n_stall_ns = w_stall_ns[tid];
         uint64_t& n_queue_ns = w_queue_ns[tid];
@@ -532,122 +343,59 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             // at this point, so the snapshot covers every name the async thread needs.
             auto hog_snap = hog_strings;
 
-            // Move sort buffers to async thread; worker gets fresh (empty) vectors.
-            auto sc  = std::move(sort_counts);
-            auto so  = std::move(sort_order);
-            auto sp  = std::move(scatter_pos);
-
+            // Expand each record into a spill record (the merge-shard pass2 contract) and
+            // append to this worker's bucket files, bucketed by hash(hog_name)%B (consistent
+            // across workers → a HOG's records co-locate in one bucket index). The record
+            // carries the LOCAL hog idx; merge-shard remaps it to global via this worker's
+            // hog registry. No sort/columnar/compress — that all moves to the single pass2.
             flush_future = std::async(std::launch::async,
                 [snaps = std::move(snaps), hog = std::move(hog_snap),
-                 sc = std::move(sc), so = std::move(so), sp = std::move(sp),
-                 &pw]() mutable {
-                    // Reusable buffers — grown to HWM across the entire async batch
-                    std::vector<uint32_t> present, sort_scratch;
-                    std::vector<uint64_t> sk;                       // Win 2: packed sort keys
-                    std::vector<uint32_t> g2l_slot, g2l_gen, local_gids;  // Win 1: flat g2l
-                    uint32_t              g2l_cur = 0;
-                    std::vector<uint8_t>  raw_buf, cc_col, ss_col, span_col,
-                                          qf_col,  pi_col, ev_col, bmp_col, cdn_col;
+                 B, CHUNK, bfds = bfd_ints]() mutable {
+                    std::vector<std::vector<uint8_t>> lbuf(B);
+                    std::vector<uint8_t> cbuf;
+                    // Each drain is one self-describing frame: [u32 csz][u32 usz][csz zstd bytes].
+                    // Ingest is decode-bound so the worker cores are idle — spend them compressing
+                    // the spill (level 3) to cut NFS write I/O and on-disk size ~6×. merge-shard
+                    // decompresses on read (cheap next to its serialize cost).
+                    auto drain = [&](size_t b) {
+                        size_t usz = lbuf[b].size();
+                        size_t bound = ZSTD_compressBound(usz);
+                        if (cbuf.size() < bound + 8) cbuf.resize(bound + 8);
+                        size_t csz = ZSTD_compress(cbuf.data() + 8, bound, lbuf[b].data(), usz, 3);
+                        if (ZSTD_isError(csz)) throw std::runtime_error(std::string("spill zstd: ") + ZSTD_getErrorName(csz));
+                        for (int i = 0; i < 4; ++i) cbuf[i]     = uint8_t(uint32_t(csz) >> (8*i));
+                        for (int i = 0; i < 4; ++i) cbuf[4 + i] = uint8_t(uint32_t(usz) >> (8*i));
+                        const uint8_t* d = cbuf.data(); size_t rem = csz + 8, done = 0;
+                        while (done < rem) {
+                            ssize_t w = ::write(bfds[b], d + done, rem - done);
+                            if (w <= 0) throw std::runtime_error("bucket write failed");
+                            done += size_t(w);
+                        }
+                        lbuf[b].clear();
+                    };
                     for (auto& s : snaps) {
-                        // Grow flat g2l arrays to cover all contig indices this snap
-                        if (g2l_slot.size() < s.contig_strings.size()) {
-                            g2l_slot.resize(s.contig_strings.size(), 0);
-                            g2l_gen.resize(s.contig_strings.size(), 0);
-                        }
-                        uint32_t cs_bound = s.max_hog_idx + 2;
-                        if (sc.size() < cs_bound) sc.resize(cs_bound);
-                        if (sp.size() < cs_bound) sp.resize(cs_bound);
-                        std::fill(sc.begin(), sc.begin() + cs_bound, 0);
-                        for (uint32_t h : s.rec_hog) ++sc[h + 1];
-                        present.clear();
-                        for (uint32_t i = 1; i < cs_bound; i++) {
-                            if (sc[i] > 0) present.push_back(i - 1);
-                            sc[i] += sc[i - 1];
-                        }
-                        std::copy_n(sc.begin(), cs_bound, sp.begin());
-                        so.resize(s.rec_hog.size());
-                        for (uint32_t r = 0; r < uint32_t(s.rec_hog.size()); r++)
-                            so[sp[s.rec_hog[r]]++] = r;
-
-                        for (uint32_t h : present) {
-                            uint32_t lo = sc[h], hi = sc[h + 1];
-                            uint32_t N  = hi - lo;
-
-                            // Generation-stamped flat g2l — assign local contig slots in
-                            // first-seen order. Must precede the sort below (the sort key and
-                            // the contig delta-encoding both read g2l_slot).
-                            if (++g2l_cur == 0) { std::fill(g2l_gen.begin(), g2l_gen.end(), 0); g2l_cur = 1; }
-                            local_gids.clear();
-                            for (uint32_t i = lo; i < hi; i++) {
-                                uint32_t ci = s.rec_hdr[so[i]].contig_idx;
-                                if (g2l_gen[ci] != g2l_cur) { g2l_gen[ci]=g2l_cur; g2l_slot[ci]=uint32_t(local_gids.size()); local_gids.push_back(ci); }
+                        for (uint32_t r = 0; r < uint32_t(s.rec_hog.size()); ++r) {
+                            uint32_t h = s.rec_hog[r];
+                            size_t b = std::hash<std::string_view>{}(std::string_view(hog[h])) % B;
+                            const auto& hdr = s.rec_hdr[r];
+                            uint32_t cnum = parse_cnum(s.contig_strings[hdr.contig_idx], hdr.contig_idx);
+                            auto& buf = lbuf[b];
+                            write_u32(buf, h);
+                            write_u32(buf, s.acc_idx);
+                            write_u32(buf, cnum);
+                            write_u32(buf, hdr.sstart);
+                            write_u32(buf, hdr.send);
+                            buf.push_back(uint8_t(std::min(100.0f, hdr.pident + 0.5f)));
+                            write_u32(buf, uint32_t(hdr.obs_n));
+                            for (uint16_t k = 0; k < hdr.obs_n; ++k) {
+                                uint16_t v = s.obs_pool[hdr.obs_off + k].v;
+                                write_u32(buf, uint32_t(v >> 6));
+                                buf.push_back(uint8_t(v & 0x3F));
                             }
-
-                            // Sort records by (contig slot, sstart) — the column format's
-                            // contract: contig grouped, sstart monotone within each contig run,
-                            // so contig deltas are non-negative and sstart resets per contig.
-                            sort_scratch.resize(N);
-                            for (uint32_t i = 0; i < N; i++) sort_scratch[i] = so[lo + i];
-                            std::stable_sort(sort_scratch.begin(), sort_scratch.end(),
-                                [&](uint32_t a, uint32_t b) {
-                                    uint32_t sa = g2l_slot[s.rec_hdr[a].contig_idx];
-                                    uint32_t sb = g2l_slot[s.rec_hdr[b].contig_idx];
-                                    if (sa != sb) return sa < sb;
-                                    return s.rec_hdr[a].sstart < s.rec_hdr[b].sstart;
-                                });
-
-                            // Columnar serialisation directly from SoA. contig is delta-encoded
-                            // against the previous slot; sstart resets to 0 at each contig boundary
-                            // (mirrors deserialize_varnt_block's accumulation).
-                            cc_col.clear(); ss_col.clear(); span_col.clear(); qf_col.clear();
-                            pi_col.clear(); ev_col.clear(); bmp_col.clear(); cdn_col.clear();
-                            uint32_t prev_ss = 0, prev_slot = 0;
-                            for (uint32_t idx : sort_scratch) {
-                                const auto& hdr = s.rec_hdr[idx];
-                                uint32_t slot = g2l_slot[hdr.contig_idx];
-                                uint32_t dc = slot - prev_slot;
-                                write_varint(cc_col,   dc);
-                                if (dc) { prev_ss = 0; prev_slot = slot; }
-                                write_varint(ss_col,   hdr.sstart - prev_ss); prev_ss = hdr.sstart;
-                                write_varint(span_col, hdr.send - hdr.sstart + 1);
-                                qf_col.push_back(uint8_t(hdr.qframe));
-                                write_u16(pi_col, encode_pident(hdr.pident));
-                                write_i16(ev_col, encode_evalue(hdr.evalue));
-                                uint32_t bmp_sz = (hdr.send - hdr.sstart + 8) / 8;
-                                size_t   bmp_off = bmp_col.size();
-                                bmp_col.resize(bmp_off + bmp_sz, 0);
-                                for (uint16_t k = 0; k < hdr.obs_n; k++) {
-                                    uint16_t v = s.obs_pool[hdr.obs_off + k].v;
-                                    uint16_t hog_off = v >> 6;
-                                    bmp_col[bmp_off + hog_off / 8] |= uint8_t(1u << (hog_off & 7));
-                                    cdn_col.push_back(uint8_t(v & 0x3F));
-                                }
-                            }
-
-                            size_t raw_est = 5;
-                            for (uint32_t gid : local_gids) raw_est += 5 + s.contig_strings[gid].size();
-                            raw_est += size_t(N) * 48;
-                            raw_buf.clear(); raw_buf.reserve(raw_est);
-                            write_varint(raw_buf, uint32_t(local_gids.size()));
-                            for (uint32_t gid : local_gids) { const auto& cs=s.contig_strings[gid]; write_varint(raw_buf, uint32_t(cs.size())); raw_buf.insert(raw_buf.end(), cs.begin(), cs.end()); }
-                            write_varint(raw_buf, N);
-                            write_varint(raw_buf, uint32_t(cc_col.size()));
-                            write_varint(raw_buf, uint32_t(ss_col.size()));
-                            write_varint(raw_buf, uint32_t(span_col.size()));
-                            write_varint(raw_buf, uint32_t(bmp_col.size()));
-                            write_varint(raw_buf, uint32_t(cdn_col.size()));
-                            raw_buf.insert(raw_buf.end(), cc_col.begin(),   cc_col.end());
-                            raw_buf.insert(raw_buf.end(), ss_col.begin(),   ss_col.end());
-                            raw_buf.insert(raw_buf.end(), span_col.begin(), span_col.end());
-                            raw_buf.insert(raw_buf.end(), qf_col.begin(),   qf_col.end());
-                            raw_buf.insert(raw_buf.end(), pi_col.begin(),   pi_col.end());
-                            raw_buf.insert(raw_buf.end(), ev_col.begin(),   ev_col.end());
-                            raw_buf.insert(raw_buf.end(), bmp_col.begin(),  bmp_col.end());
-                            raw_buf.insert(raw_buf.end(), cdn_col.begin(),  cdn_col.end());
-
-                            pw.append_raw(hog[h], s.acc_idx, N, raw_buf.data(), uint32_t(raw_buf.size()));
+                            if (buf.size() >= CHUNK) drain(b);
                         }
                     }
+                    for (size_t b = 0; b < B; ++b) if (!lbuf[b].empty()) drain(b);
                 });
         };
 
@@ -811,7 +559,9 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
         if (mem_bytes > 0) flush();
         if (flush_future.valid()) { auto _t0=std::chrono::steady_clock::now(); flush_future.get(); n_stall_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-_t0).count()); }
-        pw.flush_all();
+        // Persist this worker's local hog registry (local idx → name) so merge-shard can
+        // remap the local hog ids in this worker's buckets to global ids.
+        write_acc_registry(hog_strings, out_dir + "/t" + std::to_string(tid) + ".hog.registry");
     };
 
     // ── Launch workers ────────────────────────────────────────────────────────
@@ -873,15 +623,11 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
     for (auto& t : pool) t.join();
 
-    // ── Write partition.idx by streaming each worker's index directly ─────────
-    // The per-worker idx_ (one extent per (HOG,flush)) is the largest live structure at
-    // scale (~8.5 GB on disk for a big shard). Don't build a merged std::map copy + a full
-    // serialized buf — that doubled-then-tripled the index in RAM at finalization (the
-    // end-of-run spike). write_partition_index_streamed emits each worker's hogs in 32 MB
-    // chunks and frees each worker as it goes; load_partition_index re-groups across the
-    // per-thread entries. Peak at finalization ≈ one chunk, not the whole index.
-    uint64_t n_index_entries = write_partition_index_streamed(writers, uint32_t(N), out_dir + "/partition.idx");
+    // ── Finalize the fused spill dir: acc registry + spill meta (B, N). The per-worker
+    // hog registries and bucket files were already written by each worker on exit. There is
+    // no partition index — merge-shard reads buckets directly.
     write_acc_registry(acc_vec, out_dir + "/acc.registry");
+    write_spill_meta(out_dir + "/spill.meta", uint32_t(B), uint32_t(N));
 
     uint64_t tot_written=0, tot_skipped=0, tot_obs=0;
     uint64_t wmax=0, wmin=UINT64_MAX;
@@ -892,7 +638,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     std::cerr << "ingest: " << tot_written << " records, " << tot_skipped << " skipped, "
               << tot_obs << " obs dropped, "
               << acc_vec.size() << " accessions, "
-              << n_index_entries << " index entries → " << out_dir
+              << B << " buckets → " << out_dir
               << " (" << N << " threads)\n";
     std::cerr << "ingest: worker load [";
     for (size_t t=0;t<N;++t) std::cerr << (t?",":"") << "t" << t << ":" << w_written[t];
@@ -912,13 +658,8 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 inline void ingest(const std::string& tsv_path, const std::string& out_dir,
                    ConvertOptions opts, int n_threads_arg = 0) {
     size_t flush_threshold = compute_flush_threshold(opts.flush_bytes);
-    size_t N = (n_threads_arg > 0)
-               ? size_t(n_threads_arg)
-               : 1u; // default single-threaded; caller passes hardware_concurrency() if desired
-    if (N <= 1)
-        ingest_st(tsv_path, out_dir, opts, flush_threshold);
-    else
-        ingest_mt(tsv_path, out_dir, opts, N, flush_threshold);
+    size_t N = (n_threads_arg > 0) ? size_t(n_threads_arg) : 1u;
+    ingest_mt(tsv_path, out_dir, opts, N, flush_threshold);
 }
 
 } // namespace lhi

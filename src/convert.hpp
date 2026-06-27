@@ -25,6 +25,7 @@ struct ConvertOptions {
     double max_evalue = 1.0;
     bool   verbose    = false;
     size_t flush_bytes = 0; // 0 = auto-detect from cgroup; else explicit threshold in bytes
+    size_t buckets    = 0;  // spill bucket count B (0 = auto from input size + flush budget)
 };
 
 // diamond blastx outfmt 6 columns (0-based):
@@ -39,6 +40,23 @@ namespace col {
 inline std::string_view extract_hog(std::string_view sv) {
     auto p = sv.rfind('|');
     return p != std::string_view::npos ? sv.substr(p + 1) : sv;
+}
+
+// Contig unitig-id → numeric cnum: the integer field after the first '_' (e.g.
+// "chr2H_18749_..." → 18749). Returns `fallback` when no parseable field is present.
+// Shared by the merge-shard spill encoder (spill_extent_into) and the fused ingest
+// flush so the two paths produce identical cnum for parseable contigs.
+inline uint32_t parse_cnum(std::string_view uid, uint32_t fallback) {
+    auto fs = uid.find('_');
+    if (fs != std::string_view::npos && fs + 1 < uid.size()) {
+        auto fe = uid.find('_', fs + 1);
+        auto part = (fe != std::string_view::npos) ? uid.substr(fs + 1, fe - fs - 1)
+                                                   : uid.substr(fs + 1);
+        uint32_t v = 0;
+        auto cr = std::from_chars(part.data(), part.data() + part.size(), v);
+        if (cr.ec == std::errc{}) return v;
+    }
+    return fallback;
 }
 
 // Transparent hash/equality so unordered_map<std::string,...> can be looked up

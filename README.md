@@ -19,27 +19,36 @@ hoki convert -a ACC in.tsv out.lhb     # one per accession, fully parallel
 hoki merge out.lhg out.lhgi *.lhb      # single inversion pass
 ```
 
-### Large-scale (S3 / NFS — `ingest` path, no intermediate .lhb)
+### Large-scale (S3 / NFS — fused `ingest` path, no intermediate .lhb)
 
-One job per input file; each writes its own isolated partition dir.
-`merge-shard` then accepts all dirs at once and merges their acc registries automatically.
+`ingest` decodes the TSV **once** and writes a self-contained *spill dir*: per-worker
+compressed spill buckets plus the HOG and accession registries. `merge-shard` detects the
+spill dir and builds the `.lhg` straight from the buckets — it does **not** re-decode or
+re-scatter (the old partition path's pass 1). The input is decoded a single time across the
+whole pipeline.
 
 ```bash
-# Phase 1: one ingest job per TSV (parallelise with GNU parallel, Slurm, AWS Batch, …)
-parallel -j 32 'hoki ingest -a auto {} parts/{/.}/' ::: inputs/*.tsv
+# Phase 1: one ingest job per shard's TSV (GNU parallel, Slurm, AWS Batch, …).
+# Each writes an isolated spill dir.
+parallel -j 32 'hoki ingest -a auto -t 24 {} spill/{/.}/' ::: inputs/*.tsv
 
 # S3 example (stdin supported):
 aws s3 cp s3://serratus-rayan/beetles/logan_jun9_26_run/diamond/DRR000001/DRR000001.diamond.jun9_26.txt - \
-    | hoki ingest -a auto - parts/DRR000001/
+    | hoki ingest -a auto - spill/DRR000001/
 
-# Phase 2: per-batch merge — pass the partition dir; opendir internally, no ARG_MAX
-hoki merge-shard -t 192 out.lhg out.lhgi parts/
+# Phase 2: build each shard's .lhg from its spill dir (no decode/scatter pass)
+hoki merge-shard -t 24 shard.lhg shard.lhgi spill/DRR000001/
 
-# Phase 3: global merge across all batch .lhg files — pass the dir, same convention
-hoki merge -t 192 global.lhg global.lhgi batch_outputs/
+# Phase 3: combine shards. Prefer one cross-shard index over N per-shard .lhg:
+hoki merge-index global.lhgx shard1.lhgi shard2.lhgi …
 ```
 
-`--hog-range START END` restricts HOGs processed (for cluster jobs splitting the HOG list across nodes).
+Peak RSS for both `ingest` and `merge-shard` is bounded by `--flush` (default = 70% of the
+cgroup/SLURM memory limit) regardless of shard size. `--hog-range START END` (partition
+path only) restricts HOGs processed for cluster jobs splitting the HOG list across nodes.
+
+The legacy `convert | partition | merge-shard` path (below) still exists and `merge-shard`
+still accepts old partition dirs; only `ingest`'s own output changed to the fused spill dir.
 
 ### Two-phase path (via .lhb — retained for compatibility)
 
@@ -96,64 +105,65 @@ file-per-HOG metadata storm (catastrophic on NFS/EFS at scale).
 ## `hoki ingest`
 
 ```
-hoki ingest -a ACC|auto [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] \
-            [--flush N[KMGT]] in.tsv out_dir/
+hoki ingest -a ACC|auto [-t N] [-z LVL=3] [-p MINPID=0] [-e MAXEV=1.0] [-v] \
+            [--flush N[KMGT]] [--buckets B] in.tsv out_dir/
 ```
 
-TSV → partition dir in a single pass — no intermediate `.lhb`. Equivalent to
-`convert | partition` but without the intermediate file and with no ARG\_MAX risk.
+TSV → fused **spill dir** in a single decode pass — no intermediate `.lhb`, no partition.
+`-t N` runs N parallel workers. `-a auto` extracts the accession from the `qseqid` prefix
+(before the first `_`), so one TSV containing many accessions produces a correctly keyed dir.
 
-`-a auto` extracts the accession from the `qseqid` prefix (before the first `_`), so one
-TSV containing many accessions produces a correctly partitioned output dir.
+Each worker emits its observations as spill records bucketed by `hash(hog_name) % B` and
+zstd-compresses them on the (otherwise decode-idle) worker cores. The dir contains:
 
-Writes `out_dir/t0.lhp`, `out_dir/partition.idx` (v2 format), and `out_dir/acc.registry`.
-Each parallel job writes to its own isolated output dir; `merge-shard` accepts
-multiple dirs and reconciles accession registries automatically.
+- `tN.bucket.b` — worker `N`'s compressed spill for bucket `b` (`B` buckets per worker)
+- `tN.hog.registry` — worker `N`'s local-HOG-id → name table
+- `acc.registry` — global accession registry (LHGA)
+- `spill.meta` — bucket count `B` and worker count `N`
 
-**Memory management** — ingest flushes in-memory batches to disk when RAM usage
-exceeds a threshold, keeping peak RSS bounded regardless of input size.
-The threshold is auto-detected from the job's cgroup memory limit (SLURM `--mem`,
-AWS Batch `MEMORY`, etc.) and set to 70% of that limit. Override with `--flush`:
+`B` is auto-sized from the input size and the flush budget so each bucket fits `merge-shard`'s
+per-bucket working set; override with `--buckets`. The spill is the only intermediate and is
+consumed by `merge-shard`.
+
+**Memory management** — peak RSS is bounded by `--flush` regardless of input size. The
+threshold is auto-detected from the cgroup/SLURM memory limit and set to 70% of it; override
+with `--flush`:
 
 ```bash
-hoki ingest -a auto in.tsv out/          # auto: 70% of cgroup/SLURM limit
-hoki ingest -a auto --flush 8G in.tsv out/   # explicit 8 GiB
-hoki ingest -a auto --flush 500M in.tsv out/ # explicit 500 MiB
+hoki ingest -a auto -t 24 in.tsv out/             # auto: 70% of cgroup/SLURM limit
+hoki ingest -a auto -t 24 --flush 24G in.tsv out/ # explicit 24 GiB
 ```
-
-**Note:** `partition.idx` uses format v2 (n\_extents stored as uint32). Dirs produced
-by older hoki builds (v1, uint16) must be re-ingested before `merge-shard` will accept them.
 
 ## `hoki merge-shard`
 
 ```
-hoki merge-shard [-t N=nproc] [--hog-range START END] \
-                 out.lhg out.lhgi part_dir/ [part_dir2/ ...|-]
+hoki merge-shard [-t N=nproc] [--flush N[KMGT]] [--hog-range START END] \
+                 out.lhg out.lhgi dir/ [dir2/ ...|-]
 ```
 
-Accepts one or more partition dirs (from `ingest` or `partition`).
-Three calling conventions, all avoiding shell ARG\_MAX:
+Builds a shard `.lhg` from `ingest` (fused spill dir) or `partition`/`convert` (partition dir).
+The path is chosen by the input dir:
+
+- **Fused spill dir** (has `spill.meta`): reads the per-worker compressed buckets, unions the
+  worker HOG registries into global ids, and builds each HOG's inverted block directly — **no
+  decode/scatter pass**, since `ingest` already produced the spill. This is the fast path
+  (~15–28% faster and lighter on memory than the partition path: the uncompressed-spill
+  round-trip the partition path does internally is gone).
+- **Partition dir(s)** (have `partition.idx`): the legacy path — decode each `tN.lhp` frame
+  once, scatter records to bucket files (pass 1), then build (pass 2). Accepts one or more
+  dirs and reconciles their accession registries.
+
+Calling conventions (partition path, all avoiding shell ARG\_MAX):
 
 ```bash
-# 1. Parent dir (recommended) — merge-shard calls opendir internally, no shell expansion
-hoki merge-shard -t 192 out.lhg out.lhgi parts/
-
-# 2. Stdin — one dir path per line
-cat manifest.txt | hoki merge-shard -t 192 out.lhg out.lhgi -
-
-# 3. Explicit list — fine for small N
-hoki merge-shard -t 4 out.lhg out.lhgi parts/A/ parts/B/
+hoki merge-shard -t 192 out.lhg out.lhgi parts/        # parent dir — opendir internally
+cat manifest.txt | hoki merge-shard -t 192 out.lhg out.lhgi -   # stdin, one dir per line
+hoki merge-shard -t 4 out.lhg out.lhgi parts/A/ parts/B/        # explicit list
 ```
 
-Loads all `acc.registry` files, builds a merged sorted global accession list,
-remaps per-dir local acc indices to global indices on the fly while reading extents.
-
-Opens all `tN.lhp` files across all dirs (flat fd list), then inverts in parallel
-(`N` threads, default = hardware concurrency). HOG payloads written in completion order;
-final sort pass orders index entries by HOG ID before writing LHGI.
-
-`--hog-range START END` restricts processing to HOGs in `[START, END]` (for parallel
-cluster jobs splitting the HOG list across nodes).
+Both paths bound peak RSS by `--flush`. HOG payloads are written in completion order; a final
+sort orders index entries by HOG ID before writing LHGI. `--hog-range START END` (partition
+path) restricts processing to `[START, END]` for cluster jobs splitting the HOG list.
 
 ## `hoki merge`
 
@@ -296,8 +306,53 @@ per HOG (sorted lex by hog_id):
 ```
 [4]  "LHGA"
 [4]  n_accs  uint32 LE
-per accession (sorted; position = acc_idx):
+per accession (position = acc_idx):
   varint(len) + acc_id
+```
+
+Written by `partition`/`convert` with accessions sorted; written by `ingest` in
+first-seen order (`merge-shard` sorts on load for a canonical global acc id).
+
+### Fused spill dir — `ingest` output consumed by `merge-shard`
+
+A spill dir holds `B` buckets × `N` workers plus registries and `spill.meta`. No
+partition index — `merge-shard` builds straight from the buckets.
+
+`spill.meta` — bucket/worker counts:
+
+```
+[4]  "LHGM"
+[4]  B  uint32 LE     // bucket count
+[4]  N  uint32 LE     // worker count
+[4]  adler32(prev 12 bytes)
+```
+
+`tN.hog.registry` — worker `N`'s local-HOG-id → name table (LHGA byte layout; position =
+local hog id). `merge-shard` unions the `N` tables into global ids and a per-worker remap.
+
+`tN.bucket.b` — worker `N`'s spill for bucket `b`, a sequence of independently
+decompressable zstd frames (one per ingest flush-drain):
+
+```
+Repeated until EOF:
+  [4]  csz  uint32 LE          // compressed frame size
+  [4]  usz  uint32 LE          // uncompressed size
+  [csz]  zstd frame
+```
+
+Each decompressed frame concatenates spill records (a HOG appears in exactly one bucket
+across all workers, since `b = hash(hog_name) % B`):
+
+```
+Repeated:
+  [4]  hog_id   uint32 LE      // WORKER-LOCAL hog id (→ global via tN.hog.registry)
+  [4]  acc_idx  uint32 LE      // global accession index
+  [4]  cnum     uint32 LE      // unitig number (field after first '_' in qseqid)
+  [4]  sstart   uint32 LE
+  [4]  send     uint32 LE
+  [1]  pident_u8                // min(100, pident + 0.5)
+  [4]  n_obs    uint32 LE
+  n_obs × (uint32 hog_offset, uint8 codon_idx)   // offset from sstart; codon 0-63
 ```
 
 ### `.lhg` — global inverted index (LHG_VERSION 8)

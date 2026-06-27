@@ -29,8 +29,8 @@ static void usage(const char* prog) {
         << "                  [--profile] [--hot-threshold N=100]\n"
         << "                  <out.lhg> <out.lhgi> <input1> [input2 ...]\n"
         << "                  inputs may be .lhb or .lhg, mixed; single dir arg scans for *.lhg\n"
-        << "  " << prog << " ingest  -a ACC|auto [-t N] [-z LVL] [-p MINPID] [-e MAXEV] [-v] [--flush N[KMGT]] <in.tsv> <out_part_dir/>\n"
-        << "                  TSV → partition dir directly (no intermediate .lhb). -t N enables N parallel workers (default 1).\n"
+        << "  " << prog << " ingest  -a ACC|auto [-t N] [-z LVL] [-p MINPID] [-e MAXEV] [-v] [--flush N[KMGT]] [--buckets B] <in.tsv> <out_spill_dir/>\n"
+        << "                  TSV → merge-shard spill dir directly (buckets + registries; no partition). -t N enables N parallel workers (default 1).\n"
         << "  " << prog << " partition   [-t N] <out_dir> <input1.lhb> [input2.lhb ...]\n"
         << "  " << prog << " merge-shard [-t N] [--hog-range START END] <out.lhg> <out.lhgi> <part_dir>...|<parent_dir>|-\n"
         << "                  parent_dir (no partition.idx at root): scanned via opendir — no shell, no ARG_MAX\n"
@@ -78,6 +78,7 @@ int main(int argc, char* argv[]) {
             else if (a == "-e" && i+1 < argc) opts.max_evalue = std::stod(argv[++i]);
             else if (a == "-t" && i+1 < argc) n_threads       = std::stoi(argv[++i]);
             else if (a == "-v")               opts.verbose     = true;
+            else if (a == "--buckets" && i+1 < argc) opts.buckets = std::stoull(argv[++i]);
             else if (a == "--flush" && i+1 < argc) {
                 std::string sv = argv[++i];
                 size_t mul = 1;
@@ -244,6 +245,98 @@ int main(int argc, char* argv[]) {
         if (pos.size() < 3) { usage(argv[0]); return 1; }
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
+
+        // ── Fused spill dir: ingest already produced the spill buckets, so build the .lhg
+        // directly (no decode/scatter pass). --hog-range is not supported here (the slice
+        // validation diffs full builds). ──
+        uint32_t fB = 0, fN = 0;
+        if (pos.size() == 3 && lhi::load_spill_meta(pos[2] + "/spill.meta", fB, fN)) {
+            const std::string sdir = pos[2];
+            // acc.registry is in ingest-encounter order; sort it for a canonical global acc id
+            // (matches the partition path), and remap encounter-id → sorted-rank for the build.
+            std::vector<std::string> acc_reg =
+                lhi::load_partition_acc_registry(sdir + "/acc.registry");
+            std::vector<std::string> accessions = acc_reg;
+            std::sort(accessions.begin(), accessions.end());
+            std::vector<uint32_t> acc_remap(acc_reg.size());
+            for (uint32_t i = 0; i < uint32_t(acc_reg.size()); ++i) {
+                auto it = std::lower_bound(accessions.begin(), accessions.end(), acc_reg[i]);
+                acc_remap[i] = uint32_t(it - accessions.begin());
+            }
+            // Union the N per-worker hog registries → global names + per-worker local→global remap.
+            std::vector<std::vector<std::string>> wnames(fN);
+            for (uint32_t t = 0; t < fN; ++t)
+                wnames[t] = lhi::load_partition_acc_registry(sdir + "/t" + std::to_string(t) + ".hog.registry");
+            std::vector<std::string> global_names;
+            { std::set<std::string> uniq;
+              for (auto& v : wnames) for (auto& s : v) uniq.insert(s);
+              global_names.assign(uniq.begin(), uniq.end()); }
+            std::unordered_map<std::string, uint32_t> name2idx;
+            name2idx.reserve(global_names.size() * 2);
+            for (uint32_t i = 0; i < uint32_t(global_names.size()); ++i) name2idx[global_names[i]] = i;
+            std::vector<std::vector<uint32_t>> worker_remap(fN);
+            for (uint32_t t = 0; t < fN; ++t) {
+                worker_remap[t].resize(wnames[t].size());
+                for (uint32_t li = 0; li < uint32_t(wnames[t].size()); ++li)
+                    worker_remap[t][li] = name2idx[wnames[t][li]];
+            }
+            size_t nt = std::max<size_t>(1, n_threads > 0 ? size_t(n_threads)
+                                                          : size_t(std::thread::hardware_concurrency()));
+            std::cerr << "merge-shard: fused spill dir — " << fN << " workers, " << fB
+                      << " buckets, " << global_names.size() << " HOGs, "
+                      << accessions.size() << " accessions (-t " << nt << ")\n";
+
+            lhi::UniqueFd fd_out(open(out_lhg.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+            if (fd_out < 0) { std::cerr << "cannot create: " << out_lhg << "\n"; return 1; }
+            uint8_t fhdr[lhi::LHG_HEADER_SZ] = {};
+            memcpy(fhdr, lhi::LHG_FILE_MAGIC, 4); fhdr[4] = lhi::LHG_VERSION;
+            if (::write(fd_out, fhdr, lhi::LHG_HEADER_SZ) != ssize_t(lhi::LHG_HEADER_SZ)) {
+                std::cerr << "write header failed\n"; return 1; }
+            lhi::GlobalIndex gi; gi.accessions = accessions;
+            uint64_t data_pos = lhi::LHG_HEADER_SZ;
+            lhi::WriteBuffer wb; std::mutex emit_mtx; std::string emit_err;
+            auto emit = [&](lhi::ShardResult&& r) {
+                std::lock_guard<std::mutex> lk(emit_mtx);
+                if (!emit_err.empty()) return;
+                try {
+                    uint8_t hdr8[8];
+                    memcpy(hdr8, r.is_v9 ? lhi::LHG_HOG_ENTRY_MAGIC_V2 : lhi::LHG_HOG_ENTRY_MAGIC, 4);
+                    for (int i = 0; i < 4; ++i) hdr8[4+i] = uint8_t(r.stored_sz >> (8*i));
+                    lhi::HogIndexEntry e;
+                    e.hog_id = std::move(r.hog_id); e.data_offset = data_pos;
+                    e.data_length = uint64_t(8) + r.payload.size(); e.n_accessions = r.n_accs;
+                    gi.entries.push_back(std::move(e));
+                    wb.append(fd_out, out_lhg, hdr8, 8);
+                    wb.append(fd_out, out_lhg, r.payload.data(), r.payload.size());
+                    data_pos += uint64_t(8) + r.payload.size();
+                } catch (const std::exception& ex) { emit_err = ex.what(); }
+            };
+            try {
+                lhi::run_merge_shard_fused(sdir, fB, fN, global_names, worker_remap, acc_remap,
+                                           accessions.size(), spill_budget, nt, out_zstd_level,
+                                           do_profile, emit);
+            } catch (const std::exception& e) { std::cerr << "error: " << e.what() << "\n"; return 1; }
+            wb.flush_to(fd_out, out_lhg);
+            if (!emit_err.empty()) { std::cerr << "error: " << emit_err << "\n"; return 1; }
+            std::sort(gi.entries.begin(), gi.entries.end(),
+                      [](const lhi::HogIndexEntry& a, const lhi::HogIndexEntry& b){ return a.hog_id < b.hog_id; });
+            uint64_t index_offset = data_pos;
+            auto idx_bytes = lhi::build_index_bytes(gi.entries, gi.accessions);
+            { lhi::WriteBuffer w2; w2.append(fd_out, out_lhg, idx_bytes.data(), idx_bytes.size()); w2.flush_to(fd_out, out_lhg); }
+            uint8_t final_hdr[lhi::LHG_HEADER_SZ] = {};
+            memcpy(final_hdr, lhi::LHG_FILE_MAGIC, 4); final_hdr[4] = lhi::LHG_VERSION;
+            for (int i = 0; i < 8; ++i) final_hdr[8+i] = uint8_t(index_offset >> (8*i));
+            if (::pwrite(fd_out, final_hdr, lhi::LHG_HEADER_SZ, 0) != ssize_t(lhi::LHG_HEADER_SZ)) {
+                std::cerr << "pwrite header failed\n"; return 1; }
+            lhi::UniqueFd fi(open(out_lhgi.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+            if (fi < 0) { std::cerr << "cannot create: " << out_lhgi << "\n"; return 1; }
+            { lhi::WriteBuffer w3; w3.append(fi, out_lhgi, idx_bytes.data(), idx_bytes.size()); w3.flush_to(fi, out_lhgi); }
+            std::cerr << "merge-shard done (fused): " << gi.entries.size() << " HOGs, "
+                      << gi.accessions.size() << " accessions, " << fB << " buckets → "
+                      << out_lhg << " (-t " << nt << ")\n";
+            return 0;
+        }
+
         // Resolve part_dirs from args, stdin, or parent-dir scan.
         // A single arg that is a directory without partition.idx is treated as a
         // parent dir: its immediate children are enumerated via opendir (no shell,

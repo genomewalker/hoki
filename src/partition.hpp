@@ -418,6 +418,41 @@ inline std::vector<std::string> load_partition_acc_registry(const std::string& p
     return accs;
 }
 
+// ── Fused spill meta ──────────────────────────────────────────────────────────
+// A fused ingest dir carries no partition.idx; instead it holds B spill
+// buckets per worker (tN.bucket.b), one hog registry per worker (tN.hog.registry), and
+// this meta naming B and the worker count N. merge-shard detects spill.meta to pick the
+// fused path (build directly from buckets, skip the decode+scatter pass).
+constexpr uint8_t LHG_SPILLMETA_MAGIC[4] = {'L','H','G','M'};
+
+inline void write_spill_meta(const std::string& path, uint32_t B, uint32_t N) {
+    std::vector<uint8_t> buf;
+    buf.insert(buf.end(), LHG_SPILLMETA_MAGIC, LHG_SPILLMETA_MAGIC + 4);
+    write_u32(buf, B);
+    write_u32(buf, N);
+    write_u32(buf, adler32(buf.data(), buf.size()));
+    UniqueFd fd(open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    if (fd < 0) throw std::runtime_error("cannot create: " + path);
+    const uint8_t* p = buf.data(); size_t rem = buf.size(), done = 0;
+    while (done < rem) {
+        ssize_t r = ::write(fd, p + done, rem - done);
+        if (r <= 0) throw std::runtime_error("write failed: " + path);
+        done += size_t(r);
+    }
+}
+
+inline bool load_spill_meta(const std::string& path, uint32_t& B, uint32_t& N) {
+    UniqueFd fd(open(path.c_str(), O_RDONLY));
+    if (fd < 0) return false;
+    uint8_t buf[16];
+    if (!fd_read_exact(fd, buf, sizeof buf)) return false;
+    if (memcmp(buf, LHG_SPILLMETA_MAGIC, 4) != 0) return false;
+    if (adler32(buf, 12) != read_u32_le(buf + 12)) return false;
+    B = read_u32_le(buf + 4);
+    N = read_u32_le(buf + 8);
+    return true;
+}
+
 // Scatter all .lhb inputs into out_dir/t{N}.lhp + out_dir/partition.idx + out_dir/acc.registry.
 // No per-HOG files; one FD open per thread throughout; no concat step.
 inline void partition_lhbs(const std::vector<std::string>& input_paths,
