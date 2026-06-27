@@ -578,7 +578,7 @@ inline void serialize_inverted_block_v9(
         std::vector<uint8_t>& raw,
         const std::vector<uint32_t>& local_accs, const std::vector<uint8_t>& local_acc_pident,
         const std::vector<InvPosition>& positions, uint32_t hog_length,
-        const std::vector<uint32_t>& covered_aa, int n_threads = 1) {
+        const std::vector<uint32_t>& covered_aa) {
     raw.clear();
     uint32_t n_local = uint32_t(local_accs.size());
     write_varint(raw, n_local);
@@ -650,36 +650,15 @@ inline void serialize_inverted_block_v9(
         }
     };
 
-    size_t total_obs = 0; for (const auto& pos : positions) total_obs += pos.obs.size();
-    size_t nt = size_t(std::max(1, n_threads));
-    // Only the super-HOG (the LPT lone-runner with idle cores) is worth threading; small blocks
-    // keep the serial path so the thread-spawn cost never dominates.
-    if (nt > 1 && total_obs > 4'000'000 && positions.size() >= nt) {
-        // Split into nt CONTIGUOUS position ranges of ~equal obs (prefix-sum) — balances the deep
-        // positions while keeping ranges ordered so concatenation needs no reordering.
-        std::vector<size_t> bnd(nt + 1, 0); bnd[nt] = positions.size();
-        size_t acc = 0, target = (total_obs + nt - 1) / nt, k = 1;
-        for (size_t pi = 0; pi < positions.size() && k < nt; ++pi) {
-            acc += positions[pi].obs.size();
-            if (acc >= target * k) bnd[k++] = pi + 1;
-        }
-        for (; k < nt; ++k) bnd[k] = positions.size();
-        std::vector<std::vector<uint8_t>> ucs(nt), kcs(nt);
-        std::vector<std::thread> pool;
-        for (size_t t = 1; t < nt; ++t)
-            pool.emplace_back([&, t]{ encode_range(bnd[t], bnd[t+1], ucs[t], kcs[t]); });
-        encode_range(bnd[0], bnd[1], ucs[0], kcs[0]);
-        for (auto& th : pool) th.join();
-        raw.insert(raw.end(), ph.begin(), ph.end());
-        for (size_t t = 0; t < nt; ++t) raw.insert(raw.end(), ucs[t].begin(), ucs[t].end());
-        for (size_t t = 0; t < nt; ++t) raw.insert(raw.end(), kcs[t].begin(), kcs[t].end());
-    } else {
-        std::vector<uint8_t> uc, kc;
-        encode_range(0, positions.size(), uc, kc);
-        raw.insert(raw.end(), ph.begin(), ph.end());
-        raw.insert(raw.end(), uc.begin(), uc.end());
-        raw.insert(raw.end(), kc.begin(), kc.end());
-    }
+    // Encoding is serial: profiling showed the serialize cost is distributed across ALL ~80K
+    // HOGs (the per-obs work, already cut by the g2l O(1) map), not concentrated in one block —
+    // and LPT runs the super-HOG first so it is never the lone tail. Parallelizing one block's
+    // per-position encoding therefore did not help (measured), so it was dropped for simplicity.
+    std::vector<uint8_t> uc, kc;
+    encode_range(0, positions.size(), uc, kc);
+    raw.insert(raw.end(), ph.begin(), ph.end());
+    raw.insert(raw.end(), uc.begin(), uc.end());
+    raw.insert(raw.end(), kc.begin(), kc.end());
 }
 
 // Always emits a v9 block (uid trailer + Δ-uid column). The caller writes the LHH2 magic.
@@ -690,34 +669,17 @@ inline void finalize_inverted_payload(
         std::vector<uint8_t>& inv_raw, std::vector<uint8_t>& hog_cbuf,
         std::vector<uint8_t>& sb_hdr, std::vector<uint8_t>& sb_acc,
         std::vector<uint8_t>& sb_cnum, std::vector<uint8_t>& sb_codon,
-        ZSTD_CCtx* cctx, int level, int zstd_workers, uint64_t* ser_done_ns,
+        ZSTD_CCtx* cctx, int level, uint64_t* ser_done_ns,
         uint32_t& stored_sz, const uint8_t*& payload, size_t& payload_sz) {
     (void)sb_hdr; (void)sb_acc; (void)sb_cnum; (void)sb_codon;
     inv_raw.clear();
-    // zstd_workers carries the available core count (nt) — reuse it to parallelize the per-position
-    // serialize for the super-HOG (gated on obs count inside), the merge-shard Amdahl tail.
-    serialize_inverted_block_v9(inv_raw, local_accs, local_acc_pident, positions, hog_length,
-                                covered_aa_v, zstd_workers);
+    serialize_inverted_block_v9(inv_raw, local_accs, local_acc_pident, positions, hog_length, covered_aa_v);
     if (ser_done_ns) *ser_done_ns = clock_ns();
     size_t raw_sz = inv_raw.size();
     size_t bound = ZSTD_compressBound(raw_sz);
     hog_cbuf.resize(bound);
-    size_t csz;
-    if (cctx) {
-        csz = ZSTD_compress2(cctx, hog_cbuf.data(), bound, inv_raw.data(), raw_sz);
-    } else if (zstd_workers > 1 && raw_sz > (size_t(128) << 20)) {
-        // Pass2 wall is dominated (~60%) by compressing the one super-HOG block single-threaded
-        // while the other build threads idle (LPT runs it first; it finishes last, alone). Give
-        // that lone giant block the idle cores via multi-threaded zstd. Gated on raw_sz so only
-        // the super-HOG (≫128 MiB) qualifies — small blocks stay single-threaded, no oversubscribe.
-        ZSTD_CCtx* mt = ZSTD_createCCtx();
-        ZSTD_CCtx_setParameter(mt, ZSTD_c_compressionLevel, level);
-        ZSTD_CCtx_setParameter(mt, ZSTD_c_nbWorkers, zstd_workers);
-        csz = ZSTD_compress2(mt, hog_cbuf.data(), bound, inv_raw.data(), raw_sz);
-        ZSTD_freeCCtx(mt);
-    } else {
-        csz = ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, level);
-    }
+    size_t csz = cctx ? ZSTD_compress2(cctx, hog_cbuf.data(), bound, inv_raw.data(), raw_sz)
+                      : ZSTD_compress(hog_cbuf.data(), bound, inv_raw.data(), raw_sz, level);
     bool use_raw = ZSTD_isError(csz) || csz >= raw_sz;
     // Inline word carries flags only; the true (uint64) length lives in the index, so
     // blocks may exceed the old 30-bit inline size limit (merged super-HOGs hit ~2 GiB).
@@ -727,11 +689,10 @@ inline void finalize_inverted_payload(
 
 inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardScratch& sc,
                                                uint32_t n_accs, uint32_t hog_length,
-                                               int out_zstd_level, int zstd_workers = 0,
+                                               int out_zstd_level,
                                                uint64_t* build_ns = nullptr,
                                                uint64_t* ser_ns = nullptr,
-                                               uint64_t* comp_ns = nullptr,
-                                               const std::atomic<int>* active_builds = nullptr) {
+                                               uint64_t* comp_ns = nullptr) {
     uint64_t _bt0 = clock_ns();
     ShardResult res; res.hog_id = hog_id;
     auto& flat_inv = sc.flat_inv;
@@ -763,14 +724,9 @@ inline ShardResult build_inverted_from_scratch(const std::string& hog_id, ShardS
     }
     uint32_t stored_sz; const uint8_t* payload; size_t payload_sz;
     uint64_t _bt1 = clock_ns(), _ser_done = 0;
-    // Only thread the heavy serialize/compress when this is the lone active build (the LPT
-    // tail) — else nt sub-threads oversubscribe against the other build threads. active==1
-    // means just us; >1 means siblings are running, so stay single-threaded.
-    int eff_workers = (active_builds && active_builds->load(std::memory_order_relaxed) > 1)
-                      ? 1 : zstd_workers;
     finalize_inverted_payload(local_accs, local_acc_pident, positions, hog_length, covered_aa_v,
                               sc.inv_raw, sc.hog_cbuf, sc.hdr_buf, sc.acc_b, sc.cnum_b, sc.codon_b,
-                              nullptr, out_zstd_level, eff_workers, &_ser_done, stored_sz, payload, payload_sz);
+                              nullptr, out_zstd_level, &_ser_done, stored_sz, payload, payload_sz);
     uint64_t _bt2 = clock_ns();
     if (build_ns) *build_ns = _bt1 - _bt0;            // positions construction + sort
     if (ser_ns)   *ser_ns   = _ser_done - _bt1;       // serialize_inverted_block_v9
@@ -946,10 +902,6 @@ inline void run_merge_shard_spill(
         BuildMemGuard guard; guard.init(budget, &failed);
 
         std::atomic<size_t> gnext{0};
-        // Live count of builds in their heavy phase. The super-HOG's per-position serialize /
-        // MT-zstd may only thread when it's the LONE runner (the LPT tail) — otherwise its nt
-        // threads oversubscribe against the other 15 build threads still doing small HOGs.
-        std::atomic<int> active_heavy{0};
         auto p2 = [&]() {
             ShardScratch sc(n_accessions);
             try {
@@ -963,7 +915,6 @@ inline void run_merge_shard_spill(
                     sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
                     size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
                     guard.acquire(est);
-                    active_heavy.fetch_add(1, std::memory_order_relaxed);
                     uint64_t _rr0 = clock_ns();
                     for (uint64_t ro : groups[hidx]) {
                         const uint8_t* q = &data[ro];
@@ -989,12 +940,11 @@ inline void run_merge_shard_spill(
                     // idle cores; finalize gates it on block size so only the giant block uses it.
                     uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
                     ShardResult r = build_inverted_from_scratch(hog_list[hidx]->first, sc,
-                                                                n_accs, hog_length, out_zstd_level, int(nt),
-                                                                &_b_ns, &_s_ns, &_c_ns, &active_heavy);
+                                                                n_accs, hog_length, out_zstd_level,
+                                                                &_b_ns, &_s_ns, &_c_ns);
                     _t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
                     _t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
                     _t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
-                    active_heavy.fetch_sub(1, std::memory_order_relaxed);
                     emit(std::move(r));
                     release_if_big(sc.flat_inv, size_t(32) << 20);
                     release_if_big(sc.inv_raw,  size_t(32) << 20);
@@ -1764,7 +1714,7 @@ inline void merge_batches(const std::vector<std::string>& input_paths,
         } else {
             finalize_inverted_payload(local_accs, local_acc_pident, positions, sc.hog_length, covered_aa_v,
                                       inv_raw, hog_cbuf, sc.ser_hdr_buf, sc.ser_acc_buf, sc.ser_cnum_buf,
-                                      sc.ser_codon_buf, cctx, 0, 0, &t_build_end, stored_sz, payload, payload_sz);
+                                      sc.ser_codon_buf, cctx, 0, &t_build_end, stored_sz, payload, payload_sz);
         }
         tl_decode   += t_dec_end - t0;
         tl_build    += t_build_end - t_dec_end;
