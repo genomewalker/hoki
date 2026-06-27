@@ -40,7 +40,7 @@ aws s3 cp s3://serratus-rayan/beetles/logan_jun9_26_run/diamond/DRR000001/DRR000
 hoki merge-shard -t 24 shard.lhg shard.lhgi spill/DRR000001/
 
 # Phase 3: combine shards. Prefer one cross-shard index over N per-shard .lhg:
-hoki merge-index global.lhgx shard1.lhgi shard2.lhgi …
+hoki merge-index global.lhgx shards/      # dir of per-shard .lhg (or list them)
 ```
 
 Peak RSS for both `ingest` and `merge-shard` is bounded by `--flush` (default = 70% of the
@@ -165,7 +165,27 @@ Both paths bound peak RSS by `--flush`. HOG payloads are written in completion o
 sort orders index entries by HOG ID before writing LHGI. `--hog-range START END` (partition
 path) restricts processing to `[START, END]` for cluster jobs splitting the HOG list.
 
-## `hoki merge`
+## `hoki merge-index`
+
+```
+hoki merge-index out.lhgx shard1.lhg [shard2.lhg ...|shard_dir/]
+```
+
+Combines N per-shard `.lhg` indexes into one `.lhgx` — **the recommended way to query across
+shards.** It reads only each shard's index (not the data), so it is fast and cheap regardless
+of shard size. `saav`/`freq` on the `.lhgx` read blocks from each shard's `.lhg` directly and
+union the results; accessions are disjoint across shards, so the union is a concat. This
+replaces materializing one giant merged `.lhg` with `merge`.
+
+```bash
+hoki merge-index global.lhgx shards/        # dir of per-shard .lhg
+hoki freq global.lhgx N0.HOG0001527         # query across all shards
+```
+
+## `hoki merge` (deprecated — prefer `merge-index`)
+
+Materializes one merged `.lhg` from N inputs. At scale prefer `merge-index` (no data merge).
+Retained for `.lhb` consolidation and small-N cases.
 
 ```
 hoki merge [-t N] [-z LVL=3] [-zo LVL=3] [--buckets N=1]
@@ -174,31 +194,16 @@ hoki merge [-t N] [-z LVL=3] [-zo LVL=3] [--buckets N=1]
            out.lhg out.lhgi input1 [input2 ...]
 ```
 
-Inputs may be `.lhb` or `.lhg`, mixed. If a single directory is given, all `*.lhg`
-files in it are collected via `opendir` (no shell expansion, no ARG\_MAX):
-
-```bash
-hoki merge -t 192 global.lhg global.lhgi parts/
-```
-
-Scan: all inputs scanned in parallel across `-t` threads (worker-stealing). Each input
-produces a sorted list of `(hog_id, block_ref)` entries; `.lhb` files are buffered in
-RAM (≤ 64 MB each).
-
-Merge: K-way heap merge of the per-file sorted lists into a single HOG-ordered sequence.
-
-Invert + write: for each HOG group — decompress blocks, accumulate observations,
-counting-sort by position, serialize column-oriented inverted block, compress, write
-`LHHE` entry. Groups are dispatched largest-first to balance threads. A dedicated
-writer thread serializes output in HOG-ID order.
-
-`--buckets N` writes N sharded `.lhg`/`.lhgi` pairs.
-`--hot-threshold N` sets the minimum block count for parallel decode of a single HOG.
+Inputs may be `.lhb` or `.lhg`, mixed (a single dir arg scans for `*.lhg`). K-way heap-merges
+the per-input sorted HOG lists, re-inverts each HOG group, and writes v9 blocks largest-first.
+`--buckets N` writes N sharded `.lhg`/`.lhgi` pairs; `--hot-threshold N` sets the min block
+count for parallel decode of one HOG. Peak RSS bounded by `--flush`.
 
 ## `hoki saav`
 
 ```
-hoki saav lhg lhgi HOG_ID POS [AA] [--min-pident N]
+hoki saav lhg lhgi HOG_ID POS [AA] [--min-pident N]   # single index
+hoki saav index.lhgx HOG_ID POS [AA] [--min-pident N] # cross-shard (union over shards)
 ```
 
 TSV stdout: `acc_id \t unitig_id \t hog_pos \t obs_aa \t codon \t pident`
@@ -211,7 +216,8 @@ TSV stdout: `acc_id \t unitig_id \t hog_pos \t obs_aa \t codon \t pident`
 ## `hoki freq`
 
 ```
-hoki freq lhg lhgi HOG_ID [--min-pident N]
+hoki freq lhg lhgi HOG_ID [--min-pident N]    # single index
+hoki freq index.lhgx HOG_ID [--min-pident N]  # cross-shard (union over shards)
 ```
 
 TSV stdout: `hog_pos \t codon \t obs_aa \t n_accessions`
@@ -355,7 +361,7 @@ Repeated:
   n_obs × (uint32 hog_offset, uint8 codon_idx)   // offset from sstart; codon 0-63
 ```
 
-### `.lhg` — global inverted index (LHG_VERSION 8)
+### `.lhg` — global inverted index (LHG_VERSION 8; v9 blocks)
 
 ```
 File header (16 bytes):
@@ -366,40 +372,46 @@ File header (16 bytes):
   [8]  index_offset   uint64 LE  // byte offset of LHGI section from file start
 
 Per-HOG entry (sorted lex by HOG ID):
-  [4]  "LHHE"
+  [4]  block magic   "LHH2" = v9 (current writer) | "LHHE" = v8 (legacy; reader handles both)
   [4]  stored_sz  uint32 LE
          bit 31 = 1  → raw (uncompressed); payload = stored_sz & 0x7FFFFFFF bytes
          bit 30 = 1  → zstd frame
-  payload (stored_sz & 0x3FFFFFFF bytes)
+  payload          // true byte length is data_length in the index (may exceed 30 bits)
+```
 
-Decompressed HOG payload:
+A unitig — one assembly contig `(acc_idx, cnum)` — is constant across its ~150 positions, so
+v9 replaces the v8 per-observation acc and cnum columns with a **unitig trailer** + a single
+**Δ-uid column** (the uid is an ordinal into the trailer). ~60% smaller blocks, lossless.
+
+```
+Decompressed v9 payload:
   [local acc dict]
     varint n_local
-    n_local × (varint delta_gacc, uint8 pident_u8)  // sorted global acc_idx; min pident
+    n_local × (varint delta_gacc, uint8 pident_u8)   // sorted global acc_idx; min pident
 
-  [coverage dict]
+  [coverage]
     varint hog_length                // protein length in AA (0 = unknown)
     n_local × varint covered_aa      // AA positions covered per local acc
+
+  [unitig trailer]                   // distinct (local_acc, cnum), sorted
+    varint n_uids
+    n_uids × (varint delta_local_acc, varint cnum)   // delta on local_acc; cnum = unitig number
 
   [position headers]
     varint n_positions
     n_positions × (varint pos_delta, varint n_obs)   // pos_delta from previous; first absolute
 
-  [acc column — all positions concatenated]
-    total_obs × varint delta_local_acc_idx   // delta from previous within each position; first absolute
-
-  [cnum column — all positions concatenated]
-    total_obs × varint cnum          // numeric field after first '_' in qseqid (unitig number)
+  [uid column — all positions concatenated]
+    total_obs × varint delta_uid_ordinal   // ordinal into the trailer; delta within each
+                                            // position (sorted by uid), reset at each position
 
   [codon column — per position]
     for each position:
-      uint8 consensus_codon_idx      // 0-63; 0xFF = no consensus (all explicit)
-      if consensus != 0xFF:
-        varint n_var
-        n_var × varint delta_obs_ordinal   // ordinal of variant obs within this position
-        n_var × uint8 codon_idx
-      else:
-        n_obs × uint8 codon_idx
+      uint8 consensus_codon_idx        // 0-63, the most frequent codon
+      varint n_var                     // count of observations differing from consensus
+      n_var × varint delta_ordinal     // ordinals (within the position) of the differing obs
+      n_var × uint8 codon_idx          // their codons
+```
 
 Index section (at index_offset; also written standalone as .lhgi):
   [4]  "LHGI"
@@ -419,6 +431,22 @@ Index section (at index_offset; also written standalone as .lhgi):
 
 Same bytes as the LHGI section embedded at `index_offset` in `.lhg`. Load once;
 range-GET `.lhg[data_offset : data_offset+data_length]` per HOG.
+
+### `.lhgx` — cross-shard combined index (LHGX_VERSION 1)
+
+Maps a HOG to whichever shards contain it, so queries read blocks from each shard's `.lhg`
+directly and union the results (accessions are disjoint across shards → union = concat). No
+merged `.lhg` is materialized. Written by `merge-index`.
+
+```
+[4]  "LHGX"
+[1]  version = 1
+[4]  n_shards  uint32 LE
+per shard:
+  [4]  path_len  uint32 LE
+  [path_len]  shard .lhg path (string)
+  [index bytes]  // that shard's full LHGI section (the same bytes as its .lhgi)
+```
 
 ---
 
