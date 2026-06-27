@@ -216,7 +216,7 @@ position count once).
 
 ## Wire formats
 
-### `.lhb` batch file (LHB_VERSION 1, SHARD_BLOCK_VERSION 4)
+### `.lhb` batch file
 
 ```
 File header:
@@ -260,7 +260,7 @@ Repeated until EOF:
 
 Codon encoding: A=0 C=1 G=2 T=3; `codon_idx = (nt0 << 4) | (nt1 << 2) | nt2`.
 
-### `tN.lhp` per-thread partition file (LHP_VERSION 4, no file header)
+### `tN.lhp` per-thread partition file (no file header)
 
 One file per worker thread (`partition`/`convert`). A sequence of zstd frames; each frame
 batches many records column-major. Frame boundaries and per-HOG extents live in `partition.idx`
@@ -279,7 +279,7 @@ Decompressed frame (column-major):
   [remainder]      codon section
 ```
 
-### `partition.idx` HOG-to-extent index (LHPI_VERSION 4)
+### `partition.idx` HOG-to-extent index
 
 ```
 [4]  "LHPI"
@@ -433,7 +433,7 @@ per accession (sorted; position = acc_idx):
 Same bytes as the index section embedded at `index_offset` in `.lhg`. Load once; range-GET
 `.lhg[data_offset : data_offset+data_length]` per HOG.
 
-### `.lhgx` cross-shard combined index (LHGX_VERSION 1)
+### `.lhgx` cross-shard combined index
 
 Maps a HOG to whichever shards contain it, so queries read blocks from each shard's `.lhg` and
 union the results (accessions are disjoint across shards, so union = concat). No merged `.lhg`
