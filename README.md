@@ -273,38 +273,47 @@ Repeated until EOF:
 
 Codon encoding: A=0 C=1 G=2 T=3; `codon_idx = (nt0 << 4) | (nt1 << 2) | nt2`.
 
-### `tN.lhp` — per-thread partition file (LHP_VERSION 2, no file header)
+### `tN.lhp` — per-thread partition file (LHP_VERSION 4, no file header)
 
-One file per worker thread. Records are appended in arrival order (no HOG sorting
-within the file; the index handles lookup).
+One file per worker thread (`partition`/`convert`). A sequence of zstd frames; each frame
+batches many records column-major. Frame boundaries and per-HOG extents live in
+`partition.idx` (a HOG's records may span the file).
 
 ```
 Repeated until EOF:
-  [2]  hog_id_len  uint16 LE
-  [hog_id_len bytes]  hog_id string
-  PartitionEntry (16 bytes, packed):
-    [4]  acc_idx        uint32 LE   // global accession index
-    [4]  compressed_sz  uint32 LE
-    [4]  raw_sz         uint32 LE
-    [4]  n_records      uint32 LE
-  [compressed_sz bytes]  zstd-compressed ShardBlock payload
+  [4]  csz  uint32 LE             // compressed frame size
+  [csz]  zstd frame
+
+Decompressed frame (column-major):
+  [4]  other_sec_len  uint32 LE
+  [4]  bmp_sec_len    uint32 LE
+  [other_sec_len]  other section   // contig dict + VarNT header + non-bitmap/codon columns
+  [bmp_sec_len]    bitmap section
+  [remainder]      codon section
 ```
 
-### `partition.idx` — sorted HOG→extent index (LHPI_VERSION 1)
+### `partition.idx` — HOG→extent index (LHPI_VERSION 4)
 
 ```
 [4]  "LHPI"
-[1]  version = 1
-[3]  pad
+[1]  version = 4
 [4]  n_threads  uint32 LE
-[4]  n_hogs     uint32 LE
-per HOG (sorted lex by hog_id):
-  varint(len) + hog_id
-  varint n_extents
-  n_extents × PartitionIndexExtent (16 bytes):
-    [4]  thread_idx    uint32 LE
-    [8]  entry_offset  uint64 LE   // byte offset of PartitionEntry within tN.lhp
-    [4]  entry_len     uint32 LE   // sizeof(PartitionEntry) + compressed_sz
+[4]  n_hogs     uint32 LE         // total (thread, hog) entries (a HOG appears once per
+                                  // thread that holds it; load accumulates extents per HOG)
+per entry:
+  [2]  hog_id_len  uint16 LE
+  [hog_id_len]  hog_id
+  [4]  n_extents   uint32 LE
+  n_extents × PartitionIndexExtent (40 bytes):
+    [4]  thread_idx   uint32 LE
+    [8]  frame_off    uint64 LE    // compressed frame offset in tN.lhp (after its 4-byte csz)
+    [4]  frame_csz    uint32 LE
+    [4]  other_off    uint32 LE    // byte offsets into the decompressed frame's sections
+    [4]  other_len    uint32 LE
+    [4]  bmp_off      uint32 LE
+    [4]  cdn_off      uint32 LE
+    [4]  acc_idx      uint32 LE
+    [4]  n_records    uint32 LE
 ```
 
 ### `acc.registry` — standalone accession registry
@@ -314,10 +323,12 @@ per HOG (sorted lex by hog_id):
 [4]  n_accs  uint32 LE
 per accession (position = acc_idx):
   varint(len) + acc_id
+[4]  adler32  uint32 LE          // over all preceding bytes; checked on load
 ```
 
 Written by `partition`/`convert` with accessions sorted; written by `ingest` in
-first-seen order (`merge-shard` sorts on load for a canonical global acc id).
+first-seen order (`merge-shard` sorts on load for a canonical global acc id). The
+per-worker `tN.hog.registry` in a spill dir uses this exact layout (position = local hog id).
 
 ### Fused spill dir — `ingest` output consumed by `merge-shard`
 
@@ -416,15 +427,16 @@ Decompressed v9 payload:
 Index section (at index_offset; also written standalone as .lhgi):
   [4]  "LHGI"
   [4]  n_hogs  uint32 LE
-  per HOG (sorted):
+  per HOG (sorted lex by hog_id):
     varint(len) + hog_id
     [8]  data_offset   uint64 LE
-    [8]  data_length   uint64 LE
+    [8]  data_length   uint64 LE   // true on-disk block length (8 + payload)
     [4]  n_accessions  uint32 LE
   [4]  "LHGA"
   [4]  n_accs  uint32 LE
   per accession (sorted; position = acc_idx):
     varint(len) + acc_id
+  [4]  adler32  uint32 LE          // over the whole index section; checked on load
 ```
 
 ### `.lhgi` — standalone index
