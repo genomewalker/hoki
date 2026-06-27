@@ -354,9 +354,8 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
                     std::vector<std::vector<uint8_t>> lbuf(B);
                     std::vector<uint8_t> cbuf;
                     // Each drain is one self-describing frame: [u32 csz][u32 usz][csz zstd bytes].
-                    // Ingest is decode-bound so the worker cores are idle — spend them compressing
-                    // the spill (level 3) to cut NFS write I/O and on-disk size ~6×. merge-shard
-                    // decompresses on read (cheap next to its serialize cost).
+                    // Compress (level 3) on the decode-bound worker cores; merge-shard decompresses
+                    // on read.
                     auto drain = [&](size_t b) {
                         size_t usz = lbuf[b].size();
                         size_t bound = ZSTD_compressBound(usz);

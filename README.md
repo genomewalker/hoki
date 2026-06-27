@@ -21,11 +21,9 @@ hoki merge out.lhg out.lhgi *.lhb      # single inversion pass
 
 ### Large-scale (S3 / NFS — fused `ingest` path, no intermediate .lhb)
 
-`ingest` decodes the TSV **once** and writes a self-contained *spill dir*: per-worker
-compressed spill buckets plus the HOG and accession registries. `merge-shard` detects the
-spill dir and builds the `.lhg` straight from the buckets — it does **not** re-decode or
-re-scatter (the old partition path's pass 1). The input is decoded a single time across the
-whole pipeline.
+`ingest` decodes the TSV once and writes a spill dir: per-worker compressed spill buckets plus
+the HOG and accession registries. `merge-shard` reads the spill dir and builds the `.lhg`
+directly — no second decode/scatter pass (the old partition path's pass 1).
 
 ```bash
 # Phase 1: one ingest job per shard's TSV (GNU parallel, Slurm, AWS Batch, …).
@@ -44,8 +42,8 @@ hoki merge-index global.lhgx shards/      # dir of per-shard .lhg (or list them)
 ```
 
 Peak RSS for both `ingest` and `merge-shard` is bounded by `--flush` (default = 70% of the
-cgroup/SLURM memory limit) regardless of shard size. `--hog-range START END` (partition
-path only) restricts HOGs processed for cluster jobs splitting the HOG list across nodes.
+cgroup/SLURM memory limit). `--hog-range START END` (partition path only) restricts HOGs
+processed for cluster jobs splitting the HOG list across nodes.
 
 The legacy `convert | partition | merge-shard` path (below) still exists and `merge-shard`
 still accepts old partition dirs; only `ingest`'s own output changed to the fused spill dir.
@@ -114,7 +112,7 @@ TSV → fused **spill dir** in a single decode pass — no intermediate `.lhb`, 
 (before the first `_`), so one TSV containing many accessions produces a correctly keyed dir.
 
 Each worker emits its observations as spill records bucketed by `hash(hog_name) % B` and
-zstd-compresses them on the (otherwise decode-idle) worker cores. The dir contains:
+zstd-compresses them on the worker cores. The dir contains:
 
 - `tN.bucket.b` — worker `N`'s compressed spill for bucket `b` (`B` buckets per worker)
 - `tN.hog.registry` — worker `N`'s local-HOG-id → name table
@@ -145,10 +143,8 @@ Builds a shard `.lhg` from `ingest` (fused spill dir) or `partition`/`convert` (
 The path is chosen by the input dir:
 
 - **Fused spill dir** (has `spill.meta`): reads the per-worker compressed buckets, unions the
-  worker HOG registries into global ids, and builds each HOG's inverted block directly — **no
-  decode/scatter pass**, since `ingest` already produced the spill. This is the fast path
-  (~15–28% faster and lighter on memory than the partition path: the uncompressed-spill
-  round-trip the partition path does internally is gone).
+  worker HOG registries into global ids, and builds each HOG's inverted block directly. No
+  decode/scatter pass — `ingest` already produced the spill.
 - **Partition dir(s)** (have `partition.idx`): the legacy path — decode each `tN.lhp` frame
   once, scatter records to bucket files (pass 1), then build (pass 2). Accepts one or more
   dirs and reconciles their accession registries.
@@ -171,11 +167,10 @@ path) restricts processing to `[START, END]` for cluster jobs splitting the HOG 
 hoki merge-index out.lhgx shard1.lhg [shard2.lhg ...|shard_dir/]
 ```
 
-Combines N per-shard `.lhg` indexes into one `.lhgx` — **the recommended way to query across
-shards.** It reads only each shard's index (not the data), so it is fast and cheap regardless
-of shard size. `saav`/`freq` on the `.lhgx` read blocks from each shard's `.lhg` directly and
-union the results; accessions are disjoint across shards, so the union is a concat. This
-replaces materializing one giant merged `.lhg` with `merge`.
+Combines N per-shard `.lhg` indexes into one `.lhgx` for cross-shard queries. Reads only each
+shard's index, not the data. `saav`/`freq` on the `.lhgx` read blocks from each shard's `.lhg`
+and union the results; accessions are disjoint across shards, so the union is a concat.
+Replaces materializing one merged `.lhg` with `merge`.
 
 ```bash
 hoki merge-index global.lhgx shards/        # dir of per-shard .lhg
@@ -390,9 +385,9 @@ Per-HOG entry (sorted lex by HOG ID):
   payload          // true byte length is data_length in the index (may exceed 30 bits)
 ```
 
-A unitig — one assembly contig `(acc_idx, cnum)` — is constant across its ~150 positions, so
-v9 replaces the v8 per-observation acc and cnum columns with a **unitig trailer** + a single
-**Δ-uid column** (the uid is an ordinal into the trailer). ~60% smaller blocks, lossless.
+A unitig — one assembly contig `(acc_idx, cnum)` — is constant across its positions, so v9
+replaces the v8 per-observation acc and cnum columns with a unitig trailer + a single Δ-uid
+column (the uid is an ordinal into the trailer). Lossless.
 
 ```
 Decompressed v9 payload:

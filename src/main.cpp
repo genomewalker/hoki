@@ -246,9 +246,8 @@ int main(int argc, char* argv[]) {
         std::string out_lhg  = pos[0];
         std::string out_lhgi = pos[1];
 
-        // ── Fused spill dir: ingest already produced the spill buckets, so build the .lhg
-        // directly (no decode/scatter pass). --hog-range is not supported here (the slice
-        // validation diffs full builds). ──
+        // Fused spill dir: ingest already produced the spill buckets, so build the .lhg
+        // directly (no decode/scatter pass). --hog-range is not supported on this path.
         uint32_t fB = 0, fN = 0;
         if (pos.size() == 3 && lhi::load_spill_meta(pos[2] + "/spill.meta", fB, fN)) {
             const std::string sdir = pos[2];
