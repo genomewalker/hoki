@@ -1108,29 +1108,53 @@ inline void run_merge_shard_fused(
         // Exact decompressed size of this bucket straight from the frame headers — no estimate.
         // ingest may have under-bucketed (its B is a guess); here we own the on-disk format, so we
         // measure and re-split as needed to make --flush a hard ceiling regardless of that B.
+        std::vector<size_t> wusz(N, 0);
         size_t usz_total = 0;
         for (uint32_t t = 0; t < N; ++t) {
             std::string bp = spill_dir + "/t" + std::to_string(t) + ".bucket." + std::to_string(b);
             int fd = ::open(bp.c_str(), O_RDONLY);
             if (fd < 0) continue;
-            uint8_t hdr[8]; off_t pos = 0;
+            uint8_t hdr[8]; off_t pos = 0; size_t wu = 0;
             for (;;) {
                 ssize_t hr = ::pread(fd, hdr, 8, pos);
                 if (hr == 0) break;
                 if (hr != 8) { ::close(fd); throw std::runtime_error("short frame header (measure): " + bp); }
                 uint32_t csz = read_u32_le(hdr), usz = read_u32_le(hdr + 4);
-                usz_total += usz; pos += 8 + off_t(csz);
+                wu += usz; pos += 8 + off_t(csz);
             }
             ::close(fd);
+            wusz[t] = wu; usz_total += wu;
         }
         if (usz_total == 0) { _t_read += clock_ns() - _r0; continue; }
 
         size_t K = std::max<size_t>(1, (usz_total + bucket_budget - 1) / bucket_budget);
         if (K == 1) {
-            // Fits the budget: decompress+remap straight into one buffer and build.
-            std::vector<uint8_t> data; data.reserve(usz_total);
-            for (uint32_t t = 0; t < N; ++t)
-                walk_worker(t, b, [&](const uint8_t* p, size_t n, uint32_t){ data.insert(data.end(), p, p + n); });
+            // Fits the budget: decode the N worker files CONCURRENTLY into disjoint regions of
+            // `data` (sized from the measured per-worker usz), then build. The per-bucket read was
+            // the serial bottleneck (--profile: read >> build); the worker files are independent.
+            std::vector<uint8_t> data(usz_total);
+            std::vector<size_t> off(N + 1, 0);
+            for (uint32_t t = 0; t < N; ++t) off[t + 1] = off[t] + wusz[t];
+            std::atomic<uint32_t> tnext{0};
+            auto rd = [&]() {
+                for (;;) {
+                    uint32_t t = tnext.fetch_add(1, std::memory_order_relaxed);
+                    if (t >= N || failed.load(std::memory_order_relaxed)) break;
+                    size_t cur = off[t];
+                    try {
+                        walk_worker(t, b, [&](const uint8_t* p, size_t n, uint32_t){
+                            std::memcpy(data.data() + cur, p, n); cur += n; });
+                    } catch (const std::exception& e) {
+                        std::lock_guard<std::mutex> lk(err_mtx); if (!failed.exchange(true)) err = e.what();
+                    }
+                }
+            };
+            size_t rt = std::max<size_t>(1, std::min(nt, size_t(N)));
+            std::vector<std::thread> rpool;
+            for (size_t i = 1; i < rt; ++i) rpool.emplace_back(rd);
+            rd();
+            for (auto& th : rpool) th.join();
+            if (failed.load()) throw std::runtime_error("fused parallel read: " + err);
             _t_read += clock_ns() - _r0;
             if (data.empty()) continue;
             uint64_t _b0 = clock_ns();
