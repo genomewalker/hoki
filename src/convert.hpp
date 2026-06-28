@@ -105,9 +105,12 @@ struct ParZstd {
     std::mutex m;
     std::condition_variable cv_job, cv_ready, cv_room;
     std::deque<Job> jobq;
-    std::map<size_t, std::vector<char>> ready;   // idx -> decoded
-    std::vector<char> tail_carry_;               // partial line carried across frame boundaries
-    size_t comp_inflight = 0, dec_inflight = 0, next_consume = 0, decoding = 0;
+    static constexpr size_t CHUNK = size_t(16) << 20;     // decode piece size (flat-memory granularity)
+    struct Piece { std::vector<char> b; bool last; };
+    std::map<std::pair<size_t, uint32_t>, Piece> ready;  // (frame_idx, seq) -> decoded piece
+    std::vector<char> tail_carry_;               // partial line carried across pieces/frames
+    size_t comp_inflight = 0, dec_inflight = 0, decoding = 0;
+    size_t cur_frame = 0; uint32_t cur_seq = 0;  // consumer cursor (in-order delivery)
     bool reader_done = false, stop_ = false, err = false;
     std::string emsg;
     std::thread reader;
@@ -196,106 +199,101 @@ struct ParZstd {
         } catch (const std::exception& e) { set_err(e.what()); }
     }
 
+    // STREAMING decode: each frame is decoded in CHUNK-sized pieces (never the whole frame), so
+    // peak decoded memory is bounded by cap_dec regardless of frame size → flat memory. Pieces are
+    // tagged (frame_idx, seq, last) and consumed in order. Admission bounds in-flight decoded bytes;
+    // the piece the consumer is blocked on is always allowed (deadlock guard).
     void decode_loop() {
+        ZSTD_DStream* ds = ZSTD_createDStream();
+        if (!ds) { set_err("ZSTD_createDStream"); return; }
         for (;;) {
             Job job;
             {
                 std::unique_lock<std::mutex> l(m);
-                for (;;) {                       // re-check everything after each wake
-                    if (stop_ || err) return;
+                for (;;) {
+                    if (stop_ || err) { ZSTD_freeDStream(ds); return; }
                     if (!jobq.empty()) {
-                        // admit if decompressed inflight is under budget, OR this is the exact
-                        // frame the consumer is blocked on (deadlock guard; jobq is FIFO by idx).
-                        if (dec_inflight <= cap_dec || jobq.front().idx == next_consume) {
-                            job = std::move(jobq.front()); jobq.pop_front();
-                            comp_inflight -= job.comp.size();
-                            ++decoding;
-                            cv_room.notify_all();
-                            break;
-                        }
-                        cv_room.wait(l);         // inflight full, front not urgent → wait for room
-                        continue;
+                        job = std::move(jobq.front()); jobq.pop_front();
+                        comp_inflight -= job.comp.size(); ++decoding;
+                        cv_room.notify_all();
+                        break;
                     }
-                    if (reader_done) return;
+                    if (reader_done) { ZSTD_freeDStream(ds); return; }
                     cv_job.wait(l);
                 }
             }
             try {
-                unsigned long long usz = ZSTD_getFrameContentSize(job.comp.data(), job.comp.size());
-                std::vector<char> out;
-                if (usz != ZSTD_CONTENTSIZE_UNKNOWN && usz != ZSTD_CONTENTSIZE_ERROR) {
-                    out.resize(size_t(usz));
-                    size_t r = ZSTD_decompress(out.data(), out.size(), job.comp.data(), job.comp.size());
-                    if (ZSTD_isError(r) || r != usz) throw std::runtime_error("zstd: frame decompress");
-                } else {
-                    // unknown size: stream-grow
-                    ZSTD_DStream* ds = ZSTD_createDStream(); ZSTD_initDStream(ds);
-                    ZSTD_inBuffer in{job.comp.data(), job.comp.size(), 0};
-                    std::vector<char> buf(size_t(4) << 20);
-                    for (;;) {
-                        ZSTD_outBuffer ob{buf.data(), buf.size(), 0};
-                        size_t rc = ZSTD_decompressStream(ds, &ob, &in);
-                        if (ZSTD_isError(rc)) { ZSTD_freeDStream(ds); throw std::runtime_error("zstd: stream frame"); }
-                        out.insert(out.end(), buf.data(), buf.data() + ob.pos);
-                        if (in.pos >= in.size) break;
+                ZSTD_initDStream(ds);
+                ZSTD_inBuffer in{job.comp.data(), job.comp.size(), 0};
+                uint32_t seq = 0;
+                for (;;) {
+                    std::vector<char> piece(CHUNK);
+                    ZSTD_outBuffer ob{piece.data(), piece.size(), 0};
+                    size_t r = ZSTD_decompressStream(ds, &ob, &in);
+                    if (ZSTD_isError(r)) throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(r));
+                    bool last = (r == 0);
+                    if (!last && in.pos >= in.size) throw std::runtime_error("zstd: truncated frame");
+                    if (ob.pos > 0 || last) {
+                        piece.resize(ob.pos);
+                        std::unique_lock<std::mutex> l(m);
+                        while (!stop_ && !err && dec_inflight + piece.size() > cap_dec
+                               && !(job.idx == cur_frame && seq == cur_seq))
+                            cv_room.wait(l);
+                        if (stop_ || err) { ZSTD_freeDStream(ds); return; }
+                        dec_inflight += piece.size();
+                        ready.emplace(std::make_pair(job.idx, seq), Piece{std::move(piece), last});
+                        cv_ready.notify_all();
+                        ++seq;
                     }
-                    ZSTD_freeDStream(ds);
+                    if (last) break;
                 }
-                std::lock_guard<std::mutex> l(m);
-                dec_inflight += out.size();
-                --decoding;
-                ready.emplace(job.idx, std::move(out));
-                cv_ready.notify_all();
-            } catch (const std::exception& e) { set_err(e.what()); return; }
+                std::lock_guard<std::mutex> l(m); --decoding; cv_ready.notify_all();
+            } catch (const std::exception& e) { set_err(e.what()); ZSTD_freeDStream(ds); return; }
         }
     }
 
-    // Pull the next decoded frame in order. Returns false at clean end.
-    bool next(std::vector<char>& out) {
-        std::unique_lock<std::mutex> l(m);
+    // Advance the consumer cursor over decoded pieces in order; returns the next piece's bytes and
+    // its `last` flag, or false at clean end. Caller holds `l`.
+    bool take_piece(std::unique_lock<std::mutex>& l, std::vector<char>& b, bool& last) {
         for (;;) {
             if (err) throw std::runtime_error("parallel zstd: " + emsg);
-            auto it = ready.find(next_consume);
+            auto it = ready.find({cur_frame, cur_seq});
             if (it != ready.end()) {
-                out = std::move(it->second); ready.erase(it);
-                dec_inflight -= out.size(); ++next_consume;
-                cv_room.notify_all();
+                b = std::move(it->second.b); last = it->second.last; ready.erase(it);
+                dec_inflight -= b.size(); cv_room.notify_all();
+                if (last) { ++cur_frame; cur_seq = 0; } else ++cur_seq;
                 return true;
             }
-            // Clean end: reader finished, no queued jobs, none being decoded → frame can't appear.
             if (reader_done && jobq.empty() && decoding == 0) return false;
             cv_ready.wait(l);
         }
     }
 
-    // Line-aligned pull for parallel dispatch: returns a chunk ending exactly at the last '\n'
-    // (whole lines), plus `prefix` = the partial line carried from the previous frame (the start
-    // of the chunk's first line). The final call may return a chunk with no trailing '\n' (the
-    // last line). Thread-safe; frames are consumed in order so the carry is correct for concurrent
-    // callers, each getting a self-contained (chunk, prefix) pair.
+    // Raw ordered pieces (for the single-consumer getline path; it splits lines itself).
+    bool next(std::vector<char>& out) {
+        std::unique_lock<std::mutex> l(m);
+        bool last; return take_piece(l, out, last);
+    }
+
+    // Line-aligned pull for parallel dispatch: a chunk ending at the last '\n' (whole lines) plus
+    // `prefix` = the partial line carried over from the previous piece/frame. The carry spans pieces
+    // AND frames (it's a continuous byte stream). Final call may return a chunk with no trailing '\n'.
     bool next(std::vector<char>& out, std::vector<char>& prefix) {
         std::unique_lock<std::mutex> l(m);
         for (;;) {
-            if (err) throw std::runtime_error("parallel zstd: " + emsg);
-            auto it = ready.find(next_consume);
-            if (it != ready.end()) {
-                std::vector<char> b = std::move(it->second);
-                ready.erase(it); dec_inflight -= b.size(); ++next_consume;
-                cv_room.notify_all();
-                size_t L = b.size();
-                while (L > 0 && b[L - 1] != '\n') --L;   // L = one past the last '\n' (0 if none)
-                if (L == 0) { tail_carry_.insert(tail_carry_.end(), b.begin(), b.end()); continue; }
-                prefix = std::move(tail_carry_);
-                tail_carry_.assign(b.begin() + L, b.end());
-                b.resize(L);
-                out = std::move(b);
-                return true;
-            }
-            if (reader_done && jobq.empty() && decoding == 0) {
+            std::vector<char> b; bool last;
+            if (!take_piece(l, b, last)) {
                 if (!tail_carry_.empty()) { prefix.clear(); out = std::move(tail_carry_); tail_carry_.clear(); return true; }
                 return false;
             }
-            cv_ready.wait(l);
+            size_t L = b.size();
+            while (L > 0 && b[L - 1] != '\n') --L;     // one past the last '\n' (0 if none)
+            if (L == 0) { tail_carry_.insert(tail_carry_.end(), b.begin(), b.end()); continue; }
+            prefix = std::move(tail_carry_);
+            tail_carry_.assign(b.begin() + L, b.end());
+            b.resize(L);
+            out = std::move(b);
+            return true;
         }
     }
 };

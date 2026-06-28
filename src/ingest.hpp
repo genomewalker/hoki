@@ -620,7 +620,11 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
 
         if (parallel) {
             size_t dthreads = std::max<size_t>(2, N / 2);                 // decode pool
-            ParZstd pz(zfd, dthreads, size_t(512) << 20, size_t(1) << 30);
+            // Flat, flush-bounded decode footprint: streamed decoded pieces (never whole frames),
+            // with the compressed-queue and decoded-inflight caps tied to a fraction of --flush so
+            // peak scales with the budget instead of the frame/input size.
+            size_t dcap = std::max<size_t>(size_t(128) << 20, flush_threshold / 16);
+            ParZstd pz(zfd, dthreads, dcap, dcap);
             std::vector<std::thread> disp;
             bool derr = false; std::string derrmsg; std::mutex demtx;
             for (size_t i = 0; i < N; ++i) disp.emplace_back([&] {
