@@ -106,6 +106,7 @@ struct ParZstd {
     std::condition_variable cv_job, cv_ready, cv_room;
     std::deque<Job> jobq;
     std::map<size_t, std::vector<char>> ready;   // idx -> decoded
+    std::vector<char> tail_carry_;               // partial line carried across frame boundaries
     size_t comp_inflight = 0, dec_inflight = 0, next_consume = 0, decoding = 0;
     bool reader_done = false, stop_ = false, err = false;
     std::string emsg;
@@ -266,6 +267,37 @@ struct ParZstd {
             cv_ready.wait(l);
         }
     }
+
+    // Line-aligned pull for parallel dispatch: returns a chunk ending exactly at the last '\n'
+    // (whole lines), plus `prefix` = the partial line carried from the previous frame (the start
+    // of the chunk's first line). The final call may return a chunk with no trailing '\n' (the
+    // last line). Thread-safe; frames are consumed in order so the carry is correct for concurrent
+    // callers, each getting a self-contained (chunk, prefix) pair.
+    bool next(std::vector<char>& out, std::vector<char>& prefix) {
+        std::unique_lock<std::mutex> l(m);
+        for (;;) {
+            if (err) throw std::runtime_error("parallel zstd: " + emsg);
+            auto it = ready.find(next_consume);
+            if (it != ready.end()) {
+                std::vector<char> b = std::move(it->second);
+                ready.erase(it); dec_inflight -= b.size(); ++next_consume;
+                cv_room.notify_all();
+                size_t L = b.size();
+                while (L > 0 && b[L - 1] != '\n') --L;   // L = one past the last '\n' (0 if none)
+                if (L == 0) { tail_carry_.insert(tail_carry_.end(), b.begin(), b.end()); continue; }
+                prefix = std::move(tail_carry_);
+                tail_carry_.assign(b.begin() + L, b.end());
+                b.resize(L);
+                out = std::move(b);
+                return true;
+            }
+            if (reader_done && jobq.empty() && decoding == 0) {
+                if (!tail_carry_.empty()) { prefix.clear(); out = std::move(tail_carry_); tail_carry_.clear(); return true; }
+                return false;
+            }
+            cv_ready.wait(l);
+        }
+    }
 };
 
 // Transparent line reader: plain file, .gz file, .zst file, or stdin ("-").
@@ -289,6 +321,7 @@ struct TsvReader {
     bool   zst_eof     = false; // no more compressed bytes
     std::unique_ptr<ParZstd> par;   // set iff multi-frame .zst → parallel decode
     bool   zst_par = false;
+    std::string view_carry_;        // holds a line only when it spans a decode window
 
     explicit TsvReader(const std::string& path, size_t threads = 1) {
         if (path == "-") {
@@ -372,6 +405,45 @@ struct TsvReader {
             return true;
         }
         return zst_refill();
+    }
+
+    // Zero-copy line read for the hot .zst path: returns a string_view into the decode buffer
+    // (valid until the next call). A line that straddles a decode window is assembled into
+    // view_carry_ and a view to that is returned (rare). Caller must consume before next call.
+    bool next_view(std::string_view& out) {
+        if (kind != Kind::Zst) { if (!getline(view_carry_)) return false; out = view_carry_; return true; }
+        view_carry_.clear();
+        bool carrying = false;
+        for (;;) {
+            if (zst_out_pos < zst_out_end) {
+                const char* base = zst_out.data() + zst_out_pos;
+                size_t avail = zst_out_end - zst_out_pos;
+                const char* nl = static_cast<const char*>(memchr(base, '\n', avail));
+                if (nl) {
+                    size_t len = size_t(nl - base);
+                    zst_out_pos += len + 1;
+                    if (!carrying) {
+                        if (len && base[len - 1] == '\r') --len;
+                        out = std::string_view(base, len);
+                    } else {
+                        view_carry_.append(base, len);
+                        if (!view_carry_.empty() && view_carry_.back() == '\r') view_carry_.pop_back();
+                        out = view_carry_;
+                    }
+                    return true;
+                }
+                view_carry_.append(base, avail);   // no newline in window → carry remainder
+                carrying = true;
+                zst_out_pos = zst_out_end = 0;
+            }
+            if (!zst_next_window()) {
+                if (carrying && !view_carry_.empty()) {
+                    if (view_carry_.back() == '\r') view_carry_.pop_back();
+                    out = view_carry_; return true;
+                }
+                return false;
+            }
+        }
     }
 
     bool getline(std::string& line) {

@@ -568,55 +568,105 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
     pool.reserve(N);
     for (size_t t = 0; t < N; ++t) pool.emplace_back(do_worker, t);
 
-    // ── Reader / dispatcher (main thread) ─────────────────────────────────────
+    // ── Reader / dispatcher ───────────────────────────────────────────────────
+    // Multi-frame .zst → parallel decode + N dispatcher threads (decode no longer the cap, and
+    // the per-line acc-extract/route is spread across threads). Else → single reader thread.
     {
         bool auto_acc = (opts.acc_id == "auto");
+        if (!auto_acc) { acc_vec.push_back(opts.acc_id); acc_map.emplace(acc_vec.back(), 0u); }
+        std::mutex acc_mtx;   // guards the shared accession registry across parallel dispatchers
 
-        if (!auto_acc) {
-            acc_vec.push_back(opts.acc_id);
-            acc_map.emplace(acc_vec.back(), 0u);
-        }
-
-        std::vector<Batch> pending(N);
-
-        auto flush_pending = [&](size_t tid) {
-            if (!pending[tid].items.empty()) {
-                queues[tid]->push(std::move(pending[tid]));
-                // moved-from Batch has empty arena+items; no explicit reset needed
+        // Resolve a line's accession to a global id (per-dispatcher local cache → no lock on hit;
+        // shared registry under acc_mtx on miss) and route it to queue[acc%N] via the dispatcher's
+        // own pending batches (WorkQueue::push is multi-producer-safe). Shared by both paths.
+        auto dispatch_line = [&](std::string_view line, SvDict& lcache, std::vector<Batch>& pend) {
+            if (line.empty() || line[0] == '#') return;
+            uint32_t acc_idx = 0;
+            if (auto_acc) {
+                const char* p = line.data();
+                const char* tab = static_cast<const char*>(memchr(p, '\t', line.size()));
+                const char* qend = tab ? tab : p + line.size();
+                const char* us = static_cast<const char*>(memchr(p, '_', size_t(qend - p)));
+                std::string_view acc_sv(p, us ? size_t(us - p) : size_t(qend - p));
+                auto it = lcache.find(acc_sv);
+                if (it != lcache.end()) acc_idx = it->second;
+                else {
+                    std::lock_guard<std::mutex> lk(acc_mtx);
+                    auto git = acc_map.find(acc_sv);
+                    if (git != acc_map.end()) acc_idx = git->second;
+                    else { acc_idx = uint32_t(acc_vec.size()); acc_vec.emplace_back(acc_sv);
+                           acc_map.emplace(acc_vec.back(), acc_idx); }
+                    lcache.emplace(std::string(acc_sv), acc_idx);
+                }
             }
+            size_t tid = size_t(acc_idx) % N;
+            pend[tid].push(acc_idx, line.data(), line.size());
+            if (pend[tid].full()) queues[tid]->push(std::move(pend[tid]));
         };
 
-        TsvReader reader(tsv_path, N);   // N decode threads for multi-frame .zst (serial otherwise)
-        std::string line;
-        while (reader.getline(line)) {
-            if (line.empty() || line[0] == '#') continue;
-
-            uint32_t acc_idx;
-            if (auto_acc) {
-                const char* p    = line.data();
-                const char* tab  = static_cast<const char*>(memchr(p, '\t', line.size()));
-                const char* qend = tab ? tab : p + line.size();
-                const char* us   = static_cast<const char*>(memchr(p, '_', size_t(qend - p)));
-                std::string_view acc_sv(p, us ? size_t(us - p) : size_t(qend - p));
-
-                auto it = acc_map.find(acc_sv);
-                if (it != acc_map.end()) {
-                    acc_idx = it->second;
-                } else {
-                    acc_idx = uint32_t(acc_vec.size());
-                    acc_vec.emplace_back(acc_sv);
-                    acc_map.emplace(acc_vec.back(), acc_idx);
-                }
-            } else {
-                acc_idx = 0;
+        // Detect multi-frame .zst via a capped peek of frame 0.
+        bool parallel = false; int zfd = -1;
+        if (N > 1 && tsv_path.size() > 4 && tsv_path.compare(tsv_path.size()-4, 4, ".zst") == 0) {
+            zfd = ::open(tsv_path.c_str(), O_RDONLY);
+            if (zfd >= 0) {
+                posix_fadvise(zfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+                struct stat st{}; uint64_t fsz = (fstat(zfd, &st) == 0) ? uint64_t(st.st_size) : 0;
+                uint64_t f0 = 0;
+                try { f0 = ParZstd::frame_len(zfd, 0, fsz, uint64_t(256) << 20); } catch (...) { f0 = 0; }
+                parallel = (f0 != 0 && f0 != ParZstd::CAP_EXCEEDED && f0 < fsz);
+                if (!parallel) { ::close(zfd); zfd = -1; }
             }
-
-            size_t tid = size_t(acc_idx) % N;
-            pending[tid].push(acc_idx, line.data(), line.size());
-            if (pending[tid].full()) flush_pending(tid);
         }
 
-        for (size_t t = 0; t < N; ++t) flush_pending(t);
+        if (parallel) {
+            size_t dthreads = std::max<size_t>(2, N / 2);                 // decode pool
+            ParZstd pz(zfd, dthreads, size_t(512) << 20, size_t(1) << 30);
+            std::vector<std::thread> disp;
+            bool derr = false; std::string derrmsg; std::mutex demtx;
+            for (size_t i = 0; i < N; ++i) disp.emplace_back([&] {
+                try {
+                    SvDict lcache; std::vector<Batch> pend(N);
+                    std::vector<char> chunk, prefix; std::string bl;
+                    while (pz.next(chunk, prefix)) {
+                        const char* base = chunk.data(); size_t sz = chunk.size();
+                        const char* nl = static_cast<const char*>(memchr(base, '\n', sz));
+                        if (nl) {
+                            bl.assign(prefix.data(), prefix.size());
+                            bl.append(base, size_t(nl - base));
+                            if (!bl.empty() && bl.back() == '\r') bl.pop_back();
+                            dispatch_line(bl, lcache, pend);
+                            size_t pos = size_t(nl - base) + 1;
+                            while (pos < sz) {
+                                const char* nl2 = static_cast<const char*>(memchr(base + pos, '\n', sz - pos));
+                                size_t len = nl2 ? size_t(nl2 - (base + pos)) : (sz - pos);
+                                std::string_view lv(base + pos, len);
+                                if (!lv.empty() && lv.back() == '\r') lv.remove_suffix(1);
+                                dispatch_line(lv, lcache, pend);
+                                if (!nl2) break;
+                                pos += len + 1;
+                            }
+                        } else {
+                            bl.assign(prefix.data(), prefix.size());
+                            bl.append(base, sz);
+                            if (!bl.empty() && bl.back() == '\r') bl.pop_back();
+                            dispatch_line(bl, lcache, pend);
+                        }
+                    }
+                    for (size_t t = 0; t < N; ++t) if (!pend[t].items.empty()) queues[t]->push(std::move(pend[t]));
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(demtx); if (!derr) { derr = true; derrmsg = e.what(); }
+                }
+            });
+            for (auto& t : disp) t.join();
+            ::close(zfd);
+            if (derr) throw std::runtime_error("ingest dispatch: " + derrmsg);
+        } else {
+            SvDict lcache; std::vector<Batch> pend(N);
+            TsvReader reader(tsv_path, 1);   // serial decode (single/huge frame, .gz, plain, stdin)
+            std::string_view line;
+            while (reader.next_view(line)) dispatch_line(line, lcache, pend);
+            for (size_t t = 0; t < N; ++t) if (!pend[t].items.empty()) queues[t]->push(std::move(pend[t]));
+        }
         for (auto& q : queues) q->finish();
     }
 
