@@ -13,6 +13,11 @@
 #include <cstring>
 #include <charconv>
 #include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <map>
 #include <sys/stat.h>
 #include <zlib.h>
 
@@ -86,6 +91,183 @@ inline void revcomp_codon(uint8_t c[3]) {
 
 using SvDict = std::unordered_map<std::string, uint32_t, SvHash, std::equal_to<>>;
 
+// Parallel multi-frame zstd decoder. A zstd stream made of >1 independent frames can be
+// decoded concurrently (one frame per thread). One reader thread streams the compressed
+// file once, locates frame boundaries by walking block headers (no decompression), and
+// hands each frame's compressed bytes to a decoder pool; decoded frames are delivered to
+// the consumer IN ORDER, so a line spanning a frame boundary is reassembled by the caller's
+// getline. Memory is bounded by compressed- and decompressed-inflight byte caps.
+// Single-frame .zst can't be split → TsvReader uses its serial path instead.
+struct ParZstd {
+    struct Job { size_t idx; std::vector<char> comp; };
+    int fd;
+    size_t nthreads, cap_comp, cap_dec;
+    std::mutex m;
+    std::condition_variable cv_job, cv_ready, cv_room;
+    std::deque<Job> jobq;
+    std::map<size_t, std::vector<char>> ready;   // idx -> decoded
+    size_t comp_inflight = 0, dec_inflight = 0, next_consume = 0, decoding = 0;
+    bool reader_done = false, stop_ = false, err = false;
+    std::string emsg;
+    std::thread reader;
+    std::vector<std::thread> decs;
+
+    ParZstd(int fd_, size_t nt, size_t cap_comp_, size_t cap_dec_)
+        : fd(fd_), nthreads(std::max<size_t>(1, nt)),
+          cap_comp(std::max<size_t>(cap_comp_, size_t(64) << 20)),
+          cap_dec(std::max<size_t>(cap_dec_, size_t(64) << 20)) {
+        reader = std::thread([this] { read_loop(); });
+        for (size_t i = 0; i < nthreads; ++i) decs.emplace_back([this] { decode_loop(); });
+    }
+    ~ParZstd() {
+        { std::lock_guard<std::mutex> l(m); stop_ = true; }
+        cv_job.notify_all(); cv_ready.notify_all(); cv_room.notify_all();
+        if (reader.joinable()) reader.join();
+        for (auto& t : decs) if (t.joinable()) t.join();
+    }
+    ParZstd(const ParZstd&) = delete; ParZstd& operator=(const ParZstd&) = delete;
+
+    void set_err(const std::string& e) {
+        std::lock_guard<std::mutex> l(m);
+        if (!err) { err = true; emsg = e; }
+        cv_job.notify_all(); cv_ready.notify_all(); cv_room.notify_all();
+    }
+
+    static ssize_t pread_all(int fd, void* buf, size_t n, uint64_t off) {
+        char* p = static_cast<char*>(buf); size_t done = 0;
+        while (done < n) { ssize_t r = ::pread(fd, p + done, n - done, off_t(off + done));
+                           if (r < 0) return r; if (r == 0) break; done += size_t(r); }
+        return ssize_t(done);
+    }
+
+    static constexpr uint64_t CAP_EXCEEDED = ~uint64_t(0);
+    // Length of the zstd frame at `off` (compressed bytes), via block-header walk. 0 = no frame.
+    // If cap>0 and the frame exceeds `cap` bytes, returns CAP_EXCEEDED early (used by the peek).
+    static uint64_t frame_len(int fd, uint64_t off, uint64_t fsize, uint64_t cap = 0) {
+        uint8_t h[18];
+        if (pread_all(fd, h, 4, off) != 4) return 0;
+        // Skippable frame: magic 0x184D2A50..5F → size in next 4 bytes.
+        if (h[3] == 0x18 && h[2] == 0x4d && (h[1] & 0xf0) == 0x20 && (h[0] & 0xf0) == 0x50) {
+            uint8_t s[4]; if (pread_all(fd, s, 4, off + 4) != 4) return 0;
+            return 8 + (uint64_t(s[0]) | s[1] << 8 | s[2] << 16 | uint64_t(s[3]) << 24);
+        }
+        if (!(h[0] == 0x28 && h[1] == 0xb5 && h[2] == 0x2f && h[3] == 0xfd))
+            throw std::runtime_error("zstd: bad frame magic");
+        ssize_t hn = pread_all(fd, h, 18, off); if (hn < 6) throw std::runtime_error("zstd: short frame header");
+        uint8_t fhd = h[4];
+        int fcs = fhd >> 6, ss = (fhd >> 5) & 1, cc = (fhd >> 2) & 1, did = fhd & 3;
+        uint64_t p = off + 5;
+        if (!ss) p += 1;
+        p += (did == 0 ? 0 : did == 1 ? 1 : did == 2 ? 2 : 4);
+        p += (fcs == 0 ? (ss ? 1 : 0) : fcs == 1 ? 2 : fcs == 2 ? 4 : 8);
+        for (;;) {
+            uint8_t b[3]; if (pread_all(fd, b, 3, p) != 3) throw std::runtime_error("zstd: truncated block header");
+            uint32_t v = uint32_t(b[0]) | b[1] << 8 | b[2] << 16;
+            uint32_t last = v & 1, bt = (v >> 1) & 3, bsz = v >> 3;
+            p += 3 + (bt == 1 ? 1 : bsz);
+            if (p > fsize) throw std::runtime_error("zstd: block overruns file");
+            if (cap && p - off > cap) return CAP_EXCEEDED;
+            if (last) break;
+        }
+        if (cc) p += 4;
+        return p - off;
+    }
+
+    void read_loop() {
+        try {
+            struct stat st{}; if (fstat(fd, &st) != 0) throw std::runtime_error("zstd: fstat");
+            uint64_t fsize = uint64_t(st.st_size), off = 0; size_t idx = 0;
+            while (off < fsize) {
+                uint64_t flen = frame_len(fd, off, fsize);
+                if (flen == 0) break;
+                std::vector<char> comp(static_cast<size_t>(flen));
+                if (pread_all(fd, comp.data(), size_t(flen), off) != ssize_t(flen))
+                    throw std::runtime_error("zstd: short frame read");
+                off += flen;
+                std::unique_lock<std::mutex> l(m);
+                cv_room.wait(l, [&] { return stop_ || err || comp_inflight + comp.size() <= cap_comp || jobq.empty(); });
+                if (stop_ || err) return;
+                comp_inflight += comp.size();
+                jobq.push_back({idx++, std::move(comp)});
+                cv_job.notify_one();
+            }
+            std::lock_guard<std::mutex> l(m); reader_done = true; cv_job.notify_all(); cv_ready.notify_all();
+        } catch (const std::exception& e) { set_err(e.what()); }
+    }
+
+    void decode_loop() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> l(m);
+                for (;;) {                       // re-check everything after each wake
+                    if (stop_ || err) return;
+                    if (!jobq.empty()) {
+                        // admit if decompressed inflight is under budget, OR this is the exact
+                        // frame the consumer is blocked on (deadlock guard; jobq is FIFO by idx).
+                        if (dec_inflight <= cap_dec || jobq.front().idx == next_consume) {
+                            job = std::move(jobq.front()); jobq.pop_front();
+                            comp_inflight -= job.comp.size();
+                            ++decoding;
+                            cv_room.notify_all();
+                            break;
+                        }
+                        cv_room.wait(l);         // inflight full, front not urgent → wait for room
+                        continue;
+                    }
+                    if (reader_done) return;
+                    cv_job.wait(l);
+                }
+            }
+            try {
+                unsigned long long usz = ZSTD_getFrameContentSize(job.comp.data(), job.comp.size());
+                std::vector<char> out;
+                if (usz != ZSTD_CONTENTSIZE_UNKNOWN && usz != ZSTD_CONTENTSIZE_ERROR) {
+                    out.resize(size_t(usz));
+                    size_t r = ZSTD_decompress(out.data(), out.size(), job.comp.data(), job.comp.size());
+                    if (ZSTD_isError(r) || r != usz) throw std::runtime_error("zstd: frame decompress");
+                } else {
+                    // unknown size: stream-grow
+                    ZSTD_DStream* ds = ZSTD_createDStream(); ZSTD_initDStream(ds);
+                    ZSTD_inBuffer in{job.comp.data(), job.comp.size(), 0};
+                    std::vector<char> buf(size_t(4) << 20);
+                    for (;;) {
+                        ZSTD_outBuffer ob{buf.data(), buf.size(), 0};
+                        size_t rc = ZSTD_decompressStream(ds, &ob, &in);
+                        if (ZSTD_isError(rc)) { ZSTD_freeDStream(ds); throw std::runtime_error("zstd: stream frame"); }
+                        out.insert(out.end(), buf.data(), buf.data() + ob.pos);
+                        if (in.pos >= in.size) break;
+                    }
+                    ZSTD_freeDStream(ds);
+                }
+                std::lock_guard<std::mutex> l(m);
+                dec_inflight += out.size();
+                --decoding;
+                ready.emplace(job.idx, std::move(out));
+                cv_ready.notify_all();
+            } catch (const std::exception& e) { set_err(e.what()); return; }
+        }
+    }
+
+    // Pull the next decoded frame in order. Returns false at clean end.
+    bool next(std::vector<char>& out) {
+        std::unique_lock<std::mutex> l(m);
+        for (;;) {
+            if (err) throw std::runtime_error("parallel zstd: " + emsg);
+            auto it = ready.find(next_consume);
+            if (it != ready.end()) {
+                out = std::move(it->second); ready.erase(it);
+                dec_inflight -= out.size(); ++next_consume;
+                cv_room.notify_all();
+                return true;
+            }
+            // Clean end: reader finished, no queued jobs, none being decoded → frame can't appear.
+            if (reader_done && jobq.empty() && decoding == 0) return false;
+            cv_ready.wait(l);
+        }
+    }
+};
+
 // Transparent line reader: plain file, .gz file, .zst file, or stdin ("-").
 // Provides getline(std::string&) → bool.
 struct TsvReader {
@@ -99,14 +281,16 @@ struct TsvReader {
     int          zst_fd  = -1;
     ZSTD_DStream* zst_dctx = nullptr;
     std::vector<char> zst_in;   // compressed input buffer
-    std::vector<char> zst_out;  // decompressed output buffer
+    std::vector<char> zst_out;  // decompressed output buffer (also holds a parallel frame)
     size_t zst_in_pos  = 0;
     size_t zst_in_end  = 0;
     size_t zst_out_pos = 0;
     size_t zst_out_end = 0;
     bool   zst_eof     = false; // no more compressed bytes
+    std::unique_ptr<ParZstd> par;   // set iff multi-frame .zst → parallel decode
+    bool   zst_par = false;
 
-    explicit TsvReader(const std::string& path) {
+    explicit TsvReader(const std::string& path, size_t threads = 1) {
         if (path == "-") {
             kind = Kind::Stdin;
         } else if (path.size() > 4 && path.compare(path.size()-4, 4, ".zst") == 0) {
@@ -114,10 +298,23 @@ struct TsvReader {
             zst_fd = ::open(path.c_str(), O_RDONLY);
             if (zst_fd < 0) throw std::runtime_error("cannot open: " + path);
             posix_fadvise(zst_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-            zst_dctx = ZSTD_createDStream();
-            if (!zst_dctx) throw std::runtime_error("ZSTD_createDStream failed");
-            zst_in.resize(ZSTD_DStreamInSize());
-            zst_out.resize(ZSTD_DStreamOutSize() * 4); // 4× recommended for fewer refills
+            // Peek frame 0 (cap the walk so a huge single frame bails fast). If it ends well
+            // before EOF, the stream is multi-frame → decode frames in parallel. Otherwise
+            // (single/huge frame) → serial streaming (can't split one frame).
+            struct stat st{}; uint64_t fsize = (fstat(zst_fd, &st) == 0) ? uint64_t(st.st_size) : 0;
+            uint64_t f0 = 0;
+            try { f0 = ParZstd::frame_len(zst_fd, 0, fsize, uint64_t(256) << 20); } catch (...) { f0 = 0; }
+            if (threads > 1 && f0 != 0 && f0 != ParZstd::CAP_EXCEEDED && f0 < fsize) {
+                zst_par = true;
+                size_t cap_comp = std::max<size_t>(size_t(256) << 20, threads * (size_t(32) << 20));
+                size_t cap_dec  = std::max<size_t>(size_t(512) << 20, threads * (size_t(64) << 20));
+                par = std::make_unique<ParZstd>(zst_fd, threads, cap_comp, cap_dec);
+            } else {
+                zst_dctx = ZSTD_createDStream();
+                if (!zst_dctx) throw std::runtime_error("ZSTD_createDStream failed");
+                zst_in.resize(ZSTD_DStreamInSize());
+                zst_out.resize(ZSTD_DStreamOutSize() * 4); // 4× recommended for fewer refills
+            }
         } else if (path.size() > 3 && path.compare(path.size()-3, 3, ".gz") == 0) {
             kind = Kind::Gz;
             gz = gzopen(path.c_str(), "r");
@@ -131,6 +328,7 @@ struct TsvReader {
         }
     }
     ~TsvReader() {
+        par.reset();   // join decode threads (they pread zst_fd) BEFORE closing it
         if (gz) gzclose(gz);
         if (zst_dctx) ZSTD_freeDStream(zst_dctx);
         if (zst_fd >= 0) ::close(zst_fd);
@@ -138,27 +336,42 @@ struct TsvReader {
     TsvReader(const TsvReader&) = delete;
     TsvReader& operator=(const TsvReader&) = delete;
 
-    // Decompress more bytes into zst_out[0..zst_out_end).
-    // Returns false when no more data.
+    // Decompress more bytes into zst_out[0..zst_out_end). Returns false only at real EOF.
+    // Loops over frame boundaries so a multi-frame stream is read in full (a frame ending with
+    // no new output and input still available must NOT be mistaken for EOF — that was a bug that
+    // silently truncated multi-frame .zst at the first frame).
     bool zst_refill() {
-        if (zst_eof && zst_in_pos >= zst_in_end) return false;
-        // Fill input buffer if empty
-        if (zst_in_pos >= zst_in_end && !zst_eof) {
-            ssize_t r = ::read(zst_fd, zst_in.data(), zst_in.size());
-            if (r <= 0) { zst_eof = true; return false; }
-            zst_in_pos = 0;
-            zst_in_end = size_t(r);
+        for (;;) {
+            if (zst_eof && zst_in_pos >= zst_in_end) return false;
+            if (zst_in_pos >= zst_in_end && !zst_eof) {
+                ssize_t r = ::read(zst_fd, zst_in.data(), zst_in.size());
+                if (r <= 0) { zst_eof = true; return false; }
+                zst_in_pos = 0; zst_in_end = size_t(r);
+            }
+            ZSTD_inBuffer  in  = {zst_in.data() + zst_in_pos, zst_in_end - zst_in_pos, 0};
+            ZSTD_outBuffer out = {zst_out.data(), zst_out.size(), 0};
+            size_t ret = ZSTD_decompressStream(zst_dctx, &out, &in);
+            if (ZSTD_isError(ret))
+                throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(ret));
+            zst_in_pos  += in.pos;
+            zst_out_pos  = 0;
+            zst_out_end  = out.pos;
+            if (zst_out_end > 0) return true;
+            // No output this round (frame boundary / needs more input) — loop and continue.
         }
-        ZSTD_inBuffer  in  = {zst_in.data() + zst_in_pos, zst_in_end - zst_in_pos, 0};
-        ZSTD_outBuffer out = {zst_out.data(), zst_out.size(), 0};
-        size_t ret = ZSTD_decompressStream(zst_dctx, &out, &in);
-        if (ZSTD_isError(ret))
-            throw std::runtime_error(std::string("zstd decompress: ") + ZSTD_getErrorName(ret));
-        zst_in_pos  += in.pos;
-        zst_out_pos  = 0;
-        zst_out_end  = out.pos;
-        if (zst_in_pos >= zst_in_end && ret == 0) zst_eof = true;
-        return zst_out_end > 0;
+    }
+
+    // Get the next decompressed window into zst_out[0..zst_out_end). Parallel path pulls the next
+    // whole frame (in order); serial path streams. Returns false at end.
+    bool zst_next_window() {
+        if (zst_par) {
+            std::vector<char> b;
+            if (!par->next(b)) return false;
+            zst_out = std::move(b);
+            zst_out_pos = 0; zst_out_end = zst_out.size();
+            return true;
+        }
+        return zst_refill();
     }
 
     bool getline(std::string& line) {
@@ -181,7 +394,7 @@ struct TsvReader {
                     zst_out_pos = zst_out_end = 0;
                 }
                 // Need more decompressed data
-                if (!zst_refill()) return !line.empty();
+                if (!zst_next_window()) return !line.empty();
             }
         }
         if (kind == Kind::Gz) {

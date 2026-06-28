@@ -586,7 +586,7 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             }
         };
 
-        TsvReader reader(tsv_path);
+        TsvReader reader(tsv_path, N);   // N decode threads for multi-frame .zst (serial otherwise)
         std::string line;
         while (reader.getline(line)) {
             if (line.empty() || line[0] == '#') continue;
