@@ -124,6 +124,14 @@ hoki ingest -a auto -t 24 in.tsv out/             # auto: 70% of cgroup/SLURM li
 hoki ingest -a auto -t 24 --flush 24G in.tsv out/ # explicit 24 GiB
 ```
 
+Decode parallelism depends on input framing. A multi-frame `.zst` (independent frames) is decoded
+concurrently and lines are dispatched by `N` threads, so decode is not the bottleneck. A
+single-frame `.zst` is one zstd frame, which cannot be split, so it is decoded serially on one core
+(~760 MB/s floor); to parallelize ingest, write the input as multi-frame (`zstd -T0`, `pzstd`, or
+compress in chunks and concatenate). `.gz`, plain text, and stdin are read serially. Decode is
+streamed in fixed pieces with in-flight caps tied to `--flush`, so peak RSS stays bounded by
+`--flush` for any frame size (a single 100 GB frame is never held whole).
+
 ## `hoki merge-shard`
 
 ```
@@ -134,9 +142,10 @@ hoki merge-shard [-t N=nproc] [--flush N[KMGT]] [--hog-range START END] \
 Builds a shard `.lhg` from `ingest` (fused spill dir) or `partition`/`convert` (partition dir),
 chosen by the input dir:
 
-- Fused spill dir (has `spill.meta`): reads the per-worker compressed buckets, unions the
-  worker HOG registries into global ids, and builds each HOG's inverted block directly. No
-  decode/scatter pass; `ingest` already produced the spill.
+- Fused spill dir (has `spill.meta`): reads the per-worker compressed buckets in parallel, unions
+  the worker HOG registries into global ids, and builds each HOG's inverted block directly. The
+  spill is multi-frame per worker, so this read is always parallel regardless of how the input
+  `.zst` was framed. No decode/scatter pass; `ingest` already produced the spill.
 - Partition dir(s) (have `partition.idx`), from `partition`/`convert`: decode each `tN.lhp`
   frame, scatter records to bucket files (pass 1), then build (pass 2). Accepts one or more
   dirs and reconciles their accession registries.
@@ -149,9 +158,11 @@ cat manifest.txt | hoki merge-shard -t 192 out.lhg out.lhgi -   # stdin, one dir
 hoki merge-shard -t 4 out.lhg out.lhgi parts/A/ parts/B/        # explicit list
 ```
 
-Both paths bound peak RSS by `--flush`. HOG payloads are written in completion order; a final
-sort orders index entries by HOG ID before writing LHGI. `--hog-range START END` (partition
-path) restricts processing to `[START, END]`.
+Both paths bound peak RSS by `--flush`, including a bucket or a single HOG larger than the budget:
+an oversized bucket is re-split by `hog % K` and an oversized HOG is split by accession into
+multiple blocks, merged at query time. HOG payloads are written in completion order; a final sort
+orders index entries by HOG ID before writing LHGI. `--hog-range START END` (partition path)
+restricts processing to `[START, END]`.
 
 ## `hoki merge-index`
 
