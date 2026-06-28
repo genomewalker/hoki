@@ -778,49 +778,89 @@ inline void build_bucket(
                 size_t gi = gnext.fetch_add(1, std::memory_order_relaxed);
                 if (gi >= hkeys.size() || failed.load(std::memory_order_relaxed)) break;
                 uint32_t hidx = hkeys[gi];
-                if (++sc.epoch == 0) { std::fill(sc.seen_epoch.begin(), sc.seen_epoch.end(), 0); sc.epoch = 1; }
-                uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
-                sc.seen_accs.clear(); sc.flat_inv.clear();
-                sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
-                size_t est = std::max<size_t>(group_bytes[hidx] * MS_BUILD_FACTOR, size_t(1) << 20);
-                guard.acquire(est);
-                uint64_t _rr0 = clock_ns();
-                for (uint64_t ro : groups[hidx]) {
-                    const uint8_t* q = &data[ro];
-                    q += 4;                              // skip hog_idx
-                    uint32_t acc  = read_u32_le(q); q += 4;
-                    uint32_t cnum = read_u32_le(q); q += 4;
-                    uint32_t ss   = read_u32_le(q); q += 4;
-                    uint32_t se   = read_u32_le(q); q += 4;
-                    uint8_t  pu8  = *q++;
-                    uint32_t nobs = read_u32_le(q); q += 4;
-                    if (sc.seen_epoch[acc] != epoch) { sc.seen_epoch[acc] = epoch; ++n_accs; sc.seen_accs.push_back(acc); }
-                    hog_length = std::max(hog_length, se + 1);
-                    sc.acc_intervals_map[acc].emplace_back(ss, se);
-                    { auto [it2, ins] = sc.acc_pident_map.emplace(acc, pu8); if (!ins && pu8 < it2->second) it2->second = pu8; }
-                    for (uint32_t k = 0; k < nobs; ++k) {
-                        uint32_t hoff = read_u32_le(q); q += 4;
-                        uint8_t cod = *q++;
-                        sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
+
+                // Build one chunk of this HOG's records (a subset of its record offsets) and emit
+                // it. The whole HOG is one chunk unless it exceeds split_limit, in which case it's
+                // split by accession into several emitted blocks (merged at query via find_all).
+                auto build_chunk = [&](const std::vector<uint64_t>& chunk_offs, size_t chunk_bytes) {
+                    if (++sc.epoch == 0) { std::fill(sc.seen_epoch.begin(), sc.seen_epoch.end(), 0); sc.epoch = 1; }
+                    uint32_t epoch = sc.epoch, n_accs = 0, hog_length = 0;
+                    sc.seen_accs.clear(); sc.flat_inv.clear();
+                    sc.acc_intervals_map.clear(); sc.acc_pident_map.clear();
+                    size_t est = std::max<size_t>(chunk_bytes * MS_BUILD_FACTOR, size_t(1) << 20);
+                    guard.acquire(est);
+                    uint64_t _rr0 = clock_ns();
+                    for (uint64_t ro : chunk_offs) {
+                        const uint8_t* q = &data[ro];
+                        q += 4;                              // skip hog_idx
+                        uint32_t acc  = read_u32_le(q); q += 4;
+                        uint32_t cnum = read_u32_le(q); q += 4;
+                        uint32_t ss   = read_u32_le(q); q += 4;
+                        uint32_t se   = read_u32_le(q); q += 4;
+                        uint8_t  pu8  = *q++;
+                        uint32_t nobs = read_u32_le(q); q += 4;
+                        if (sc.seen_epoch[acc] != epoch) { sc.seen_epoch[acc] = epoch; ++n_accs; sc.seen_accs.push_back(acc); }
+                        hog_length = std::max(hog_length, se + 1);
+                        sc.acc_intervals_map[acc].emplace_back(ss, se);
+                        { auto [it2, ins] = sc.acc_pident_map.emplace(acc, pu8); if (!ins && pu8 < it2->second) it2->second = pu8; }
+                        for (uint32_t k = 0; k < nobs; ++k) {
+                            uint32_t hoff = read_u32_le(q); q += 4;
+                            uint8_t cod = *q++;
+                            sc.flat_inv.emplace_back(ss + hoff, InvObs{acc, cod, cnum});
+                        }
                     }
+                    t_recread.fetch_add(clock_ns() - _rr0, std::memory_order_relaxed);
+                    uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
+                    ShardResult r = build_inverted_from_scratch(name_of(hidx), sc,
+                                                                n_accs, hog_length, out_zstd_level,
+                                                                &_b_ns, &_s_ns, &_c_ns);
+                    t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
+                    t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
+                    t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
+                    emit(std::move(r));
+                    release_if_big(sc.flat_inv, size_t(32) << 20);
+                    release_if_big(sc.inv_raw,  size_t(32) << 20);
+                    release_if_big(sc.hog_cbuf, size_t(32) << 20);
+                    // Big builds (the super-HOG) leave large freed slabs that glibc keeps in the
+                    // worker arena — RSS then overshoots --flush by the slab size. Return it to the
+                    // OS. Gated on est so small builds skip the syscall.
+                    if (est > (size_t(256) << 20)) malloc_trim(0);
+                    guard.release(est);
+                };
+
+                // Keep per-HOG build scratch (~chunk_bytes × FACTOR) within --flush. A HOG over
+                // this splits by accession into pieces that each fit; pieces carry disjoint
+                // accessions so query (find_all + accumulate) merges them, exactly like the same
+                // HOG appearing across shards.
+                size_t split_limit = std::max<size_t>(budget / MS_BUILD_FACTOR, size_t(64) << 20);
+                if (group_bytes[hidx] <= split_limit) {
+                    build_chunk(groups[hidx], group_bytes[hidx]);
+                } else {
+                    std::cerr << "merge-shard: HOG " << name_of(hidx) << " = "
+                              << (group_bytes[hidx] >> 20) << " MiB > split_limit "
+                              << (split_limit >> 20) << " MiB — splitting by accession\n";
+                    // Bin-pack this HOG's accessions into chunks ≤ split_limit. An accession is
+                    // atomic: distinct-acc freq counts require all its records in one piece.
+                    std::unordered_map<uint32_t, std::vector<uint64_t>> by_acc;
+                    std::unordered_map<uint32_t, size_t> acc_bytes;
+                    for (uint64_t ro : groups[hidx]) {
+                        const uint8_t* q = &data[ro];
+                        uint32_t acc  = read_u32_le(q + 4);
+                        uint32_t nobs = read_u32_le(q + 21);
+                        by_acc[acc].push_back(ro);
+                        acc_bytes[acc] += 25 + size_t(nobs) * 5;
+                    }
+                    std::vector<uint64_t> chunk; size_t cb = 0;
+                    for (auto& kv : by_acc) {
+                        size_t ab = acc_bytes[kv.first];
+                        if (cb > 0 && cb + ab > split_limit) { build_chunk(chunk, cb); chunk.clear(); cb = 0; }
+                        chunk.insert(chunk.end(), kv.second.begin(), kv.second.end());
+                        cb += ab;
+                    }
+                    if (!chunk.empty()) build_chunk(chunk, cb);
+                    // ceiling: a single accession×HOG exceeding split_limit can't be split further
+                    // (acc is atomic); upgrade: not needed — implausible at GB scale.
                 }
-                t_recread.fetch_add(clock_ns() - _rr0, std::memory_order_relaxed);
-                uint64_t _b_ns = 0, _s_ns = 0, _c_ns = 0;
-                ShardResult r = build_inverted_from_scratch(name_of(hidx), sc,
-                                                            n_accs, hog_length, out_zstd_level,
-                                                            &_b_ns, &_s_ns, &_c_ns);
-                t_invbuild.fetch_add(_b_ns, std::memory_order_relaxed);
-                t_ser.fetch_add(_s_ns, std::memory_order_relaxed);
-                t_compress.fetch_add(_c_ns, std::memory_order_relaxed);
-                emit(std::move(r));
-                release_if_big(sc.flat_inv, size_t(32) << 20);
-                release_if_big(sc.inv_raw,  size_t(32) << 20);
-                release_if_big(sc.hog_cbuf, size_t(32) << 20);
-                // Big builds (the super-HOG) leave large freed slabs that glibc keeps in the
-                // worker arena — RSS then overshoots --flush by the slab size. Return it to the
-                // OS. Gated on est so small builds skip the syscall.
-                if (est > (size_t(256) << 20)) malloc_trim(0);
-                guard.release(est);
             }
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(err_mtx);
@@ -1008,65 +1048,155 @@ inline void run_merge_shard_fused(
     uint64_t _t_read = 0, _t_build = 0;
     auto name_of = [&](uint32_t hidx) -> const std::string& { return global_names[hidx]; };
 
+    // Pass-2 `data` (the bucket read whole) + groups map + per-HOG build scratch are resident
+    // together; reserve ~2/3 of --flush for those, leaving ~1/3 for `data`. Same split the spill
+    // path uses. Spill record (little-endian): [u32 hog][u32 acc][9 bytes][u32 nobs][nobs*5].
+    size_t bucket_budget = std::max<size_t>(budget / 3, size_t(64) << 20);
+
+    // Decompress worker t's bucket-b file frame-by-frame (peak = one frame), remap each record in
+    // place (local hog→global, ingest acc→sorted-rank), and hand each remapped record to sink as
+    // (ptr, len, global_hog). Frame layout (ingest drain): [u32 csz][u32 usz][csz zstd bytes].
+    auto walk_worker = [&](uint32_t t, uint32_t b,
+                           const std::function<void(const uint8_t*, size_t, uint32_t)>& sink) {
+        std::string bp = spill_dir + "/t" + std::to_string(t) + ".bucket." + std::to_string(b);
+        int fd = ::open(bp.c_str(), O_RDONLY);
+        if (fd < 0) return;
+        const auto& rm = worker_remap[t];
+        std::vector<uint8_t> cbuf, frame;
+        uint8_t hdr[8];
+        off_t pos = 0;
+        for (;;) {
+            ssize_t hr = ::pread(fd, hdr, 8, pos);
+            if (hr == 0) break;
+            if (hr != 8) { ::close(fd); throw std::runtime_error("short frame header: " + bp); }
+            uint32_t csz = read_u32_le(hdr), usz = read_u32_le(hdr + 4);
+            pos += 8;
+            cbuf.resize(csz);
+            size_t got = 0;
+            while (got < csz) {
+                ssize_t r = ::pread(fd, cbuf.data() + got, csz - got, pos + off_t(got));
+                if (r <= 0) { ::close(fd); throw std::runtime_error("fused bucket read failed: " + bp); }
+                got += size_t(r);
+            }
+            pos += csz;
+            frame.resize(usz);
+            size_t dn = ZSTD_decompress(frame.data(), usz, cbuf.data(), csz);
+            if (ZSTD_isError(dn) || dn != usz) { ::close(fd); throw std::runtime_error("spill frame decompress failed: " + bp); }
+            size_t off = 0;
+            while (off + 25 <= frame.size()) {
+                size_t rec0 = off;
+                uint32_t loc  = read_u32_le(&frame[off]);
+                uint32_t glob = (loc < rm.size()) ? rm[loc] : loc;
+                frame[off+0]=uint8_t(glob); frame[off+1]=uint8_t(glob>>8);
+                frame[off+2]=uint8_t(glob>>16); frame[off+3]=uint8_t(glob>>24);
+                uint32_t acc  = read_u32_le(&frame[off+4]);
+                uint32_t gacc = (acc < acc_remap.size()) ? acc_remap[acc] : acc;
+                frame[off+4]=uint8_t(gacc); frame[off+5]=uint8_t(gacc>>8);
+                frame[off+6]=uint8_t(gacc>>16); frame[off+7]=uint8_t(gacc>>24);
+                off += 4 + 4 + 4 + 4 + 4 + 1;
+                uint32_t nobs = read_u32_le(&frame[off]); off += 4;
+                off += size_t(nobs) * 5;
+                if (off > frame.size()) { ::close(fd); throw std::runtime_error("truncated record: " + bp); }
+                sink(&frame[rec0], off - rec0, glob);
+            }
+        }
+        ::close(fd);
+    };
+
     for (uint32_t b = 0; b < B; ++b) {
-        std::vector<uint8_t> data;
         uint64_t _r0 = clock_ns();
+        // Exact decompressed size of this bucket straight from the frame headers — no estimate.
+        // ingest may have under-bucketed (its B is a guess); here we own the on-disk format, so we
+        // measure and re-split as needed to make --flush a hard ceiling regardless of that B.
+        size_t usz_total = 0;
         for (uint32_t t = 0; t < N; ++t) {
             std::string bp = spill_dir + "/t" + std::to_string(t) + ".bucket." + std::to_string(b);
             int fd = ::open(bp.c_str(), O_RDONLY);
             if (fd < 0) continue;
-            off_t sz = lseek(fd, 0, SEEK_END);
-            if (sz > 0) {
-                // Read the compressed bucket, then decompress its frames into `data`.
-                // Frame layout (written by ingest drain): [u32 csz][u32 usz][csz zstd bytes].
-                std::vector<uint8_t> cfile(static_cast<size_t>(sz));
-                size_t got = 0;
-                while (got < size_t(sz)) {
-                    ssize_t r = ::pread(fd, cfile.data() + got, size_t(sz) - got, off_t(got));
-                    if (r <= 0) { ::close(fd); throw std::runtime_error("fused bucket read failed: " + bp); }
-                    got += size_t(r);
-                }
-                size_t base = data.size();
-                size_t co = 0;
-                while (co + 8 <= cfile.size()) {
-                    uint32_t csz = read_u32_le(&cfile[co]);
-                    uint32_t usz = read_u32_le(&cfile[co + 4]);
-                    co += 8;
-                    if (co + csz > cfile.size()) { ::close(fd); throw std::runtime_error("truncated spill frame: " + bp); }
-                    size_t dpos = data.size();
-                    data.resize(dpos + usz);
-                    size_t dn = ZSTD_decompress(data.data() + dpos, usz, &cfile[co], csz);
-                    if (ZSTD_isError(dn) || dn != usz) { ::close(fd); throw std::runtime_error("spill frame decompress failed: " + bp); }
-                    co += csz;
-                }
-                // Remap in place: this worker's local hog idx → global (record u32[0]), and
-                // the ingest acc id → sorted-rank acc id (record u32[1]) so the built block is
-                // acc-sorted, matching the partition path canonically.
-                const auto& rm = worker_remap[t];
-                size_t off = base;
-                while (off + 25 <= data.size()) {
-                    uint32_t loc  = read_u32_le(&data[off]);
-                    uint32_t glob = (loc < rm.size()) ? rm[loc] : loc;
-                    data[off+0]=uint8_t(glob); data[off+1]=uint8_t(glob>>8);
-                    data[off+2]=uint8_t(glob>>16); data[off+3]=uint8_t(glob>>24);
-                    uint32_t acc  = read_u32_le(&data[off+4]);
-                    uint32_t gacc = (acc < acc_remap.size()) ? acc_remap[acc] : acc;
-                    data[off+4]=uint8_t(gacc); data[off+5]=uint8_t(gacc>>8);
-                    data[off+6]=uint8_t(gacc>>16); data[off+7]=uint8_t(gacc>>24);
-                    off += 4 + 4 + 4 + 4 + 4 + 1;
-                    uint32_t nobs = read_u32_le(&data[off]); off += 4;
-                    off += size_t(nobs) * 5;
-                }
+            uint8_t hdr[8]; off_t pos = 0;
+            for (;;) {
+                ssize_t hr = ::pread(fd, hdr, 8, pos);
+                if (hr == 0) break;
+                if (hr != 8) { ::close(fd); throw std::runtime_error("short frame header (measure): " + bp); }
+                uint32_t csz = read_u32_le(hdr), usz = read_u32_le(hdr + 4);
+                usz_total += usz; pos += 8 + off_t(csz);
             }
             ::close(fd);
         }
+        if (usz_total == 0) { _t_read += clock_ns() - _r0; continue; }
+
+        size_t K = std::max<size_t>(1, (usz_total + bucket_budget - 1) / bucket_budget);
+        if (K == 1) {
+            // Fits the budget: decompress+remap straight into one buffer and build.
+            std::vector<uint8_t> data; data.reserve(usz_total);
+            for (uint32_t t = 0; t < N; ++t)
+                walk_worker(t, b, [&](const uint8_t* p, size_t n, uint32_t){ data.insert(data.end(), p, p + n); });
+            _t_read += clock_ns() - _r0;
+            if (data.empty()) continue;
+            uint64_t _b0 = clock_ns();
+            build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
+                         failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
+            _t_build += clock_ns() - _b0;
+            if (failed.load()) throw std::runtime_error("fused build: " + err);
+            continue;
+        }
+
+        // Oversized bucket: re-scatter its records by hog%K into K on-disk sub-buckets (records
+        // carry their global hog id and are self-delimited), so each sub-bucket fits the budget.
+        // Build each, then unlink. Peak RAM = one frame (scatter) + one sub-bucket (build).
+        std::cerr << "merge-shard: bucket " << b << " = " << (usz_total >> 20)
+                  << " MiB > budget — re-splitting into " << K << " sub-buckets\n";
+        std::vector<UniqueFd> sfd; sfd.reserve(K);
+        std::vector<std::vector<uint8_t>> swb(K);
+        std::vector<std::string> spath(K);
+        // Cap total scatter-buffer memory at ~budget/8 across all K, so a large K (huge shard)
+        // can't itself blow RSS: the per-buffer flush threshold shrinks as K grows.
+        size_t buf_cap = std::max<size_t>(size_t(64) << 10, (budget / 8) / K);
+        for (size_t k = 0; k < K; ++k) {
+            spath[k] = spill_dir + "/resplit.b" + std::to_string(b) + ".k" + std::to_string(k);
+            int fd = ::open(spath[k].c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) throw std::runtime_error("cannot create resplit sub-bucket: " + spath[k]);
+            sfd.emplace_back(fd);
+        }
+        auto flush_sub = [&](size_t k) {
+            auto& buf = swb[k]; size_t rem = buf.size(), done = 0;
+            while (done < rem) {
+                ssize_t w = ::write(sfd[k], buf.data() + done, rem - done);
+                if (w <= 0) throw std::runtime_error("resplit write failed: " + spath[k]);
+                done += size_t(w);
+            }
+            buf.clear();
+        };
+        for (uint32_t t = 0; t < N; ++t)
+            walk_worker(t, b, [&](const uint8_t* p, size_t n, uint32_t glob) {
+                size_t k = size_t(glob) % K;
+                swb[k].insert(swb[k].end(), p, p + n);
+                if (swb[k].size() >= buf_cap) flush_sub(k);
+            });
+        for (size_t k = 0; k < K; ++k) flush_sub(k);
         _t_read += clock_ns() - _r0;
-        if (data.empty()) continue;
-        uint64_t _b0 = clock_ns();
-        build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
-                     failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
-        _t_build += clock_ns() - _b0;
-        if (failed.load()) throw std::runtime_error("fused build: " + err);
+
+        for (size_t k = 0; k < K; ++k) {
+            off_t sz = lseek(sfd[k], 0, SEEK_END);
+            if (sz > 0) {
+                std::vector<uint8_t> data(static_cast<size_t>(sz));
+                size_t got = 0;
+                while (got < size_t(sz)) {
+                    ssize_t r = ::pread(sfd[k], data.data() + got, size_t(sz) - got, off_t(got));
+                    if (r <= 0) throw std::runtime_error("resplit read failed: " + spath[k]);
+                    got += size_t(r);
+                }
+                uint64_t _b0 = clock_ns();
+                build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
+                             failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
+                _t_build += clock_ns() - _b0;
+                if (failed.load()) throw std::runtime_error("fused build: " + err);
+            }
+            ::unlink(spath[k].c_str());
+        }
+        // ceiling: a single hog whose records exceed bucket_budget all hash to one sub-bucket and
+        // won't split; upgrade: spread that hog's obs across sub-buckets (build already merges per
+        // hog across buckets, so per-hog splitting is safe).
     }
     if (do_profile)
         std::fprintf(stderr, "fused-prof: read %.1fs | build %.1fs (wall) — recread %.1fs invbuild %.1fs serialize %.1fs compress %.1fs\n",

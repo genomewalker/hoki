@@ -102,6 +102,16 @@ struct GlobalIndex {
             [](const HogIndexEntry& e, const std::string& k) { return e.hog_id < k; });
         return (it != entries.end() && it->hog_id == hog_id) ? &*it : nullptr;
     }
+    // A HOG too large for --flush is split into multiple blocks (disjoint accessions) by
+    // merge-shard, so it can have >1 entry. Entries are sorted by hog_id → matches are
+    // contiguous. Callers must read+merge ALL of them (same as the cross-shard path).
+    std::vector<const HogIndexEntry*> find_all(const std::string& hog_id) const {
+        std::vector<const HogIndexEntry*> out;
+        auto it = std::lower_bound(entries.begin(), entries.end(), hog_id,
+            [](const HogIndexEntry& e, const std::string& k) { return e.hog_id < k; });
+        for (; it != entries.end() && it->hog_id == hog_id; ++it) out.push_back(&*it);
+        return out;
+    }
 
     bool load(const std::string& path) {
         UniqueFd fd(open(path.c_str(), O_RDONLY));
@@ -680,22 +690,26 @@ inline void print_freq(const std::map<uint32_t, std::array<uint32_t, 64>>& agg) 
 inline void query_saav(const std::string& lhg_path, const GlobalIndex& idx,
                        const std::string& hog_id, uint32_t pos,
                        std::optional<uint8_t> aa_filter, uint8_t min_pident) {
-    const auto* entry = idx.find(hog_id);
-    if (!entry) { std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str()); return; }
-    InvBlock blk;
-    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+    auto entries = idx.find_all(hog_id);
+    if (entries.empty()) { std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str()); return; }
     std::printf("acc_id\tunitig_id\thog_pos\tobs_aa\tcodon\tpident\n");
-    emit_saav_block(blk, idx.accessions, pos, aa_filter, min_pident);
+    for (const auto* entry : entries) {
+        InvBlock blk;
+        if (!read_hog_inverted(lhg_path, *entry, blk)) continue;
+        emit_saav_block(blk, idx.accessions, pos, aa_filter, min_pident);
+    }
 }
 
 inline void query_freq(const std::string& lhg_path, const GlobalIndex& idx,
                        const std::string& hog_id, uint8_t min_pident) {
-    const auto* entry = idx.find(hog_id);
-    if (!entry) { std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str()); return; }
-    InvBlock blk;
-    if (!read_hog_inverted(lhg_path, *entry, blk)) return;
+    auto entries = idx.find_all(hog_id);
+    if (entries.empty()) { std::fprintf(stderr, "HOG %s not found in index\n", hog_id.c_str()); return; }
     std::map<uint32_t, std::array<uint32_t, 64>> agg;
-    accumulate_freq_block(blk, min_pident, agg);
+    for (const auto* entry : entries) {
+        InvBlock blk;
+        if (!read_hog_inverted(lhg_path, *entry, blk)) continue;
+        accumulate_freq_block(blk, min_pident, agg);
+    }
     print_freq(agg);
 }
 
@@ -802,22 +816,22 @@ inline void query_saav_multi(const MultiIndex& mi, const std::string& hog_id, ui
                              std::optional<uint8_t> aa_filter, uint8_t min_pident) {
     std::printf("acc_id\tunitig_id\thog_pos\tobs_aa\tcodon\tpident\n");
     for (size_t s = 0; s < mi.indexes.size(); ++s) {
-        const auto* e = mi.indexes[s].find(hog_id);
-        if (!e) continue;
-        InvBlock blk;
-        if (!read_hog_inverted(mi.lhg_paths[s], *e, blk)) continue;
-        emit_saav_block(blk, mi.indexes[s].accessions, pos, aa_filter, min_pident);
+        for (const auto* e : mi.indexes[s].find_all(hog_id)) {
+            InvBlock blk;
+            if (!read_hog_inverted(mi.lhg_paths[s], *e, blk)) continue;
+            emit_saav_block(blk, mi.indexes[s].accessions, pos, aa_filter, min_pident);
+        }
     }
 }
 
 inline void query_freq_multi(const MultiIndex& mi, const std::string& hog_id, uint8_t min_pident) {
     std::map<uint32_t, std::array<uint32_t, 64>> agg;
     for (size_t s = 0; s < mi.indexes.size(); ++s) {
-        const auto* e = mi.indexes[s].find(hog_id);
-        if (!e) continue;
-        InvBlock blk;
-        if (!read_hog_inverted(mi.lhg_paths[s], *e, blk)) continue;
-        accumulate_freq_block(blk, min_pident, agg);
+        for (const auto* e : mi.indexes[s].find_all(hog_id)) {
+            InvBlock blk;
+            if (!read_hog_inverted(mi.lhg_paths[s], *e, blk)) continue;
+            accumulate_freq_block(blk, min_pident, agg);
+        }
     }
     print_freq(agg);
 }
