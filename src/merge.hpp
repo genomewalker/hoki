@@ -1200,27 +1200,84 @@ inline void run_merge_shard_fused(
         for (size_t k = 0; k < K; ++k) flush_sub(k);
         _t_read += clock_ns() - _r0;
 
+        // Read a raw sub-bucket whole and build it. Used when a sub-bucket fits the budget.
+        auto build_subbucket = [&](int fd, const std::string& path, off_t sz) {
+            std::vector<uint8_t> data(static_cast<size_t>(sz));
+            size_t got = 0;
+            while (got < size_t(sz)) {
+                ssize_t r = ::pread(fd, data.data() + got, size_t(sz) - got, off_t(got));
+                if (r <= 0) throw std::runtime_error("resplit read failed: " + path);
+                got += size_t(r);
+            }
+            uint64_t _b0 = clock_ns();
+            build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
+                         failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
+            _t_build += clock_ns() - _b0;
+            if (failed.load()) throw std::runtime_error("fused build: " + err);
+        };
+
         for (size_t k = 0; k < K; ++k) {
             off_t sz = lseek(sfd[k], 0, SEEK_END);
-            if (sz > 0) {
-                std::vector<uint8_t> data(static_cast<size_t>(sz));
-                size_t got = 0;
-                while (got < size_t(sz)) {
-                    ssize_t r = ::pread(sfd[k], data.data() + got, size_t(sz) - got, off_t(got));
-                    if (r <= 0) throw std::runtime_error("resplit read failed: " + spath[k]);
-                    got += size_t(r);
-                }
-                uint64_t _b0 = clock_ns();
-                build_bucket(data, n_accessions, budget, nt, out_zstd_level, name_of, emit,
-                             failed, err, err_mtx, _t_recread, _t_invbuild, _t_ser, _t_compress);
-                _t_build += clock_ns() - _b0;
-                if (failed.load()) throw std::runtime_error("fused build: " + err);
+            if (sz <= 0) { ::unlink(spath[k].c_str()); continue; }
+            if (size_t(sz) <= bucket_budget) { build_subbucket(sfd[k], spath[k], sz); ::unlink(spath[k].c_str()); continue; }
+
+            // Oversized sub-bucket: a single HOG larger than the budget hashed entirely here and
+            // hog%K could not split it. The records are raw and self-delimited, so re-scatter them
+            // by ACCESSION into K2 sub-sub-buckets (no decode, no whole-read) so each fits the
+            // budget. The HOG then spans K2 blocks with disjoint accessions, merged at query
+            // (find_all). This makes peak RSS bounded by --flush for ANY HOG distribution.
+            size_t K2 = (size_t(sz) + bucket_budget - 1) / bucket_budget;
+            std::cerr << "merge-shard: sub-bucket " << k << " = " << (size_t(sz) >> 20)
+                      << " MiB > budget (dominant HOG) — re-splitting by accession into " << K2 << "\n";
+            std::vector<UniqueFd> s2fd; std::vector<std::string> s2path(K2);
+            std::vector<std::vector<uint8_t>> s2buf(K2);
+            size_t b2cap = std::max<size_t>(size_t(64) << 10, (budget / 8) / K2);
+            for (size_t j = 0; j < K2; ++j) {
+                s2path[j] = spill_dir + "/resplit2.b" + std::to_string(b) + ".k" + std::to_string(k) + "." + std::to_string(j);
+                int fd = ::open(s2path[j].c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) throw std::runtime_error("cannot create resplit2 sub-bucket: " + s2path[j]);
+                s2fd.emplace_back(fd);
             }
+            auto flush2 = [&](size_t j) {
+                auto& bf = s2buf[j]; size_t rem = bf.size(), done = 0;
+                while (done < rem) { ssize_t w = ::write(s2fd[j], bf.data() + done, rem - done);
+                                     if (w <= 0) throw std::runtime_error("resplit2 write failed: " + s2path[j]); done += size_t(w); }
+                bf.clear();
+            };
+            // Stream the raw sub-bucket, parse self-delimited records (25B header + nobs*5), route
+            // each by acc%K2. `carry` holds at most one partial record across read boundaries.
+            std::vector<uint8_t> rbuf(size_t(8) << 20), carry; carry.reserve(size_t(8) << 20);
+            off_t roff = 0;
+            while (roff < sz) {
+                size_t want = std::min<size_t>(rbuf.size(), size_t(sz - roff));
+                ssize_t got = ::pread(sfd[k], rbuf.data(), want, roff);
+                if (got <= 0) throw std::runtime_error("resplit2 read failed: " + spath[k]);
+                roff += got;
+                carry.insert(carry.end(), rbuf.begin(), rbuf.begin() + got);
+                size_t off = 0;
+                while (off + 25 <= carry.size()) {
+                    uint32_t acc = read_u32_le(&carry[off + 4]);
+                    uint32_t nobs = read_u32_le(&carry[off + 21]);
+                    size_t rlen = 25 + size_t(nobs) * 5;
+                    if (off + rlen > carry.size()) break;            // partial record → need more bytes
+                    size_t j = size_t(acc) % K2;
+                    s2buf[j].insert(s2buf[j].end(), &carry[off], &carry[off] + rlen);
+                    if (s2buf[j].size() >= b2cap) flush2(j);
+                    off += rlen;
+                }
+                carry.erase(carry.begin(), carry.begin() + off);     // keep only the partial tail
+            }
+            for (size_t j = 0; j < K2; ++j) flush2(j);
             ::unlink(spath[k].c_str());
+            for (size_t j = 0; j < K2; ++j) {
+                off_t s2 = lseek(s2fd[j], 0, SEEK_END);
+                if (s2 > 0) build_subbucket(s2fd[j], s2path[j], s2);
+                ::unlink(s2path[j].c_str());
+            }
         }
-        // ceiling: a single hog whose records exceed bucket_budget all hash to one sub-bucket and
-        // won't split; upgrade: spread that hog's obs across sub-buckets (build already merges per
-        // hog across buckets, so per-hog splitting is safe).
+        // ceiling: only a single (accession × HOG) pair whose records alone exceed bucket_budget
+        // can't be split further (accession is atomic for distinct-acc counting). Implausible at
+        // GB scale; everything else is now bounded by --flush.
     }
     if (do_profile)
         std::fprintf(stderr, "fused-prof: read %.1fs | build %.1fs (wall) — recread %.1fs invbuild %.1fs serialize %.1fs compress %.1fs\n",
