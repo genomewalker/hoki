@@ -40,6 +40,7 @@ static void usage(const char* prog) {
         << "  " << prog << " saav    <index.lhgx> <HOG_ID> <POS> [AA] [--min-pident N]   (cross-shard)\n"
         << "  " << prog << " freq    <global.lhg> <global.lhgi> <HOG_ID> [--min-pident N]\n"
         << "  " << prog << " freq    <index.lhgx> <HOG_ID> [--min-pident N]              (cross-shard)\n"
+        << "  " << prog << " dump    <global.lhg> <global.lhgi> [--min-pident N]   freq for ALL HOGs, one pass\n"
         << "  " << prog << " stat    <file.lhb | global.lhg [global.lhgi]>\n";
 }
 
@@ -612,6 +613,31 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         lhi::query_freq(lhg_path, idx, hog_id, min_pident);
+        return 0;
+    }
+
+    if (mode == "dump") {
+        // Freq for ALL HOGs in a single process pass (no per-HOG spawn). Entries are sorted by
+        // hog_id, so iterating unique ids emits a deterministic, directly-diffable dump. Each HOG
+        // is prefixed ">HOG\t<id>"; query_freq merges any split-HOG blocks via find_all.
+        if (argc < 4) { usage(argv[0]); return 1; }
+        std::string lhg_path = argv[2], lhgi_path = argv[3];
+        uint8_t min_pident = 0;
+        for (int i = 4; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--min-pident" && i+1 < argc) min_pident = uint8_t(std::stoul(argv[++i]));
+        }
+        lhi::GlobalIndex idx;
+        if (!idx.load(lhgi_path) && !idx.load_from_lhg(lhg_path)) {
+            std::cerr << "cannot load index from " << lhgi_path << "\n"; return 1;
+        }
+        const std::string* prev = nullptr;
+        for (const auto& e : idx.entries) {
+            if (prev && *prev == e.hog_id) continue;   // skip split-HOG duplicate entries
+            prev = &e.hog_id;
+            std::printf(">HOG\t%s\n", e.hog_id.c_str());
+            lhi::query_freq(lhg_path, idx, e.hog_id, min_pident);
+        }
         return 0;
     }
 

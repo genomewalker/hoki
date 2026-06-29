@@ -618,6 +618,22 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             }
         }
 
+        // Plain (uncompressed, seekable) TSV → mmap + N threads over disjoint byte ranges, each
+        // snapped to line starts. Zero-copy: lines are string_views into the mapping, no decode and
+        // no allocation. Peak RSS stays flush-bounded (mapped pages are file-backed/reclaimable).
+        bool plain_par = false; int pfd = -1; size_t pfsz = 0;
+        if (N > 1 && !parallel && tsv_path != "-"
+            && !(tsv_path.size() > 4 && tsv_path.compare(tsv_path.size()-4, 4, ".zst") == 0)
+            && !(tsv_path.size() > 3 && tsv_path.compare(tsv_path.size()-3, 3, ".gz") == 0)) {
+            pfd = ::open(tsv_path.c_str(), O_RDONLY);
+            if (pfd >= 0) {
+                struct stat st{};
+                if (fstat(pfd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                    pfsz = size_t(st.st_size); plain_par = true;
+                } else { ::close(pfd); pfd = -1; }
+            }
+        }
+
         if (parallel) {
             size_t dthreads = std::max<size_t>(2, N / 2);                 // decode pool
             // Flat, flush-bounded decode footprint: streamed decoded pieces (never whole frames),
@@ -664,6 +680,74 @@ inline void ingest_mt(const std::string& tsv_path, const std::string& out_dir,
             for (auto& t : disp) t.join();
             ::close(zfd);
             if (derr) throw std::runtime_error("ingest dispatch: " + derrmsg);
+        } else if (plain_par) {
+            // First line start at/after byte x: pread a small window and scan for '\n'. A partition
+            // point lands mid-line; advance to the next line so every line is owned by exactly one
+            // thread (no split, no duplicate). mmap is avoided on purpose: on NFS its page faults
+            // are slow and the whole file becomes resident (RSS ≈ file size). pread keeps RSS flat.
+            auto find_nl_after = [&](size_t x) -> size_t {
+                if (x == 0) return 0;
+                if (x >= pfsz) return pfsz;
+                char b[size_t(64) << 10]; size_t off = x;
+                while (off < pfsz) {
+                    size_t want = std::min(sizeof(b), pfsz - off);
+                    ssize_t got = ::pread(pfd, b, want, off_t(off));
+                    if (got <= 0) return pfsz;
+                    const char* nl = static_cast<const char*>(memchr(b, '\n', size_t(got)));
+                    if (nl) return off + size_t(nl - b) + 1;
+                    off += size_t(got);
+                }
+                return pfsz;
+            };
+            std::vector<std::thread> disp;
+            bool derr = false; std::string derrmsg; std::mutex demtx;
+            for (size_t i = 0; i < N; ++i) disp.emplace_back([&, i] {
+                try {
+                    size_t lo = find_nl_after((pfsz / N) * i);
+                    size_t hi = (i + 1 == N) ? pfsz : find_nl_after((pfsz / N) * (i + 1));
+                    SvDict lcache; std::vector<Batch> pend(N);
+                    // Each thread streams its own [lo,hi) via pread into a reusable buffer, carrying
+                    // one partial line across chunk reads. lo and hi sit on line starts, so only the
+                    // last thread (hi==pfsz) can see a final line without a trailing newline.
+                    std::vector<char> buf(size_t(4) << 20); std::string carry;
+                    size_t off = lo;
+                    while (off < hi) {
+                        size_t want = std::min(buf.size(), hi - off);
+                        ssize_t got = ::pread(pfd, buf.data(), want, off_t(off));
+                        if (got <= 0) throw std::runtime_error("pread failed: " + tsv_path);
+                        off += size_t(got);
+                        const char* base = buf.data(); size_t sz = size_t(got), pos = 0;
+                        if (!carry.empty()) {
+                            const char* nl = static_cast<const char*>(memchr(base, '\n', sz));
+                            if (!nl) { carry.append(base, sz); continue; }
+                            carry.append(base, size_t(nl - base));
+                            std::string_view lv(carry);
+                            if (!lv.empty() && lv.back() == '\r') lv.remove_suffix(1);
+                            dispatch_line(lv, lcache, pend);
+                            carry.clear(); pos = size_t(nl - base) + 1;
+                        }
+                        while (pos < sz) {
+                            const char* nl = static_cast<const char*>(memchr(base + pos, '\n', sz - pos));
+                            if (!nl) { carry.assign(base + pos, sz - pos); break; }
+                            std::string_view lv(base + pos, size_t(nl - (base + pos)));
+                            if (!lv.empty() && lv.back() == '\r') lv.remove_suffix(1);
+                            dispatch_line(lv, lcache, pend);
+                            pos = size_t(nl - base) + 1;
+                        }
+                    }
+                    if (!carry.empty()) {
+                        std::string_view lv(carry);
+                        if (!lv.empty() && lv.back() == '\r') lv.remove_suffix(1);
+                        dispatch_line(lv, lcache, pend);
+                    }
+                    for (size_t t = 0; t < N; ++t) if (!pend[t].items.empty()) queues[t]->push(std::move(pend[t]));
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(demtx); if (!derr) { derr = true; derrmsg = e.what(); }
+                }
+            });
+            for (auto& t : disp) t.join();
+            ::close(pfd);
+            if (derr) throw std::runtime_error("ingest dispatch (plain): " + derrmsg);
         } else {
             SvDict lcache; std::vector<Batch> pend(N);
             TsvReader reader(tsv_path, 1);   // serial decode (single/huge frame, .gz, plain, stdin)
